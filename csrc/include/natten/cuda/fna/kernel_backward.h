@@ -228,6 +228,11 @@ template <
     // block dimensions
     int kBlockSizeI_,
     int kBlockSizeJ_,
+    // Compile-time varlen/fixed selector. No default: every instantiation
+    // site must say which one it wants (see natten/cuda/fna/na_utils.cuh
+    // for the rationale). Placed ahead of kMaxK_/kAllowDeltaCompute so both
+    // of those keep their existing defaults.
+    bool kIsVarlen_,
     // upperbound on `max(value.shape[-1], query.shape[-1])`
     int kMaxK_ = (int)cutlass::platform::numeric_limits<uint32_t>::max(),
     // NOTE(alih): we force alignment on dim in NATTEN, so we
@@ -242,6 +247,7 @@ struct FusedNeighborhoodAttentionBackwardKernel {
   using Stride = typename GetStride<NADim>::type;
   using NAMask = NeighborhoodAttentionMask<NADim, CausalMask>;
   static constexpr bool kHasCausalDims = CausalMask::AnyCausalDims;
+  static constexpr bool kIsVarlen = kIsVarlen_;
 
   using scalar_t = scalar_t_;
   using output_t = scalar_t;
@@ -657,7 +663,10 @@ struct FusedNeighborhoodAttentionBackwardKernel {
     output_accum_t buffer[MatmulGradQ::AccumTileGmem::kElementsStored];
   };
 
-  struct Params {
+  struct Params : std::conditional_t<
+                      kIsVarlen,
+                      VarlenBackwardParamsExtra,
+                      NoVarlenBackwardMeta> {
     // Input tensors
     scalar_t* query_ptr = nullptr; // [Mq, nH, K]
     scalar_t* key_ptr = nullptr; // [Mk, nH, K]
@@ -714,15 +723,27 @@ struct FusedNeighborhoodAttentionBackwardKernel {
 
     CUTLASS_HOST_DEVICE int32_t num_splits_key_device() const {
 #ifdef __CUDA_ARCH__
-      return kEnableSplitKeys ? gridDim.x : 1;
+      if constexpr (kIsVarlen) {
+        return kEnableSplitKeys ? num_splits_key.prod32() : 1;
+      } else {
+        return kEnableSplitKeys ? gridDim.x : 1;
+      }
 #else
       return num_splits_key.prod32(); // for host-side tests
 #endif
     }
 
-    CUTLASS_HOST_DEVICE int16_t split_key_device() const {
+    // The fixed path returns int16_t (its split key is blockIdx.x); varlen's
+    // split_key is decoded from a worklist entry and can exceed that range,
+    // so only the varlen instantiation widens to int32_t.
+    CUTLASS_HOST_DEVICE std::conditional_t<kIsVarlen, int32_t, int16_t>
+    split_key_device() const {
 #ifdef __CUDA_ARCH__
-      return kEnableSplitKeys ? blockIdx.x : 0;
+      if constexpr (kIsVarlen) {
+        return kEnableSplitKeys ? this->split_key : 0;
+      } else {
+        return kEnableSplitKeys ? blockIdx.x : 0;
+      }
 #else
       return 0; // for host-side tests
 #endif
@@ -731,154 +752,333 @@ struct FusedNeighborhoodAttentionBackwardKernel {
     CUTLASS_DEVICE Dim split_key_device_dim() const {
       // auto num_key_tiles = ceil_div_dim(num_queries_post_partitioning,
       // key_tile_shape);
-      return kEnableSplitKeys ? map_index_to_coord(blockIdx.x, num_splits_key)
-                              : Dim();
+      if constexpr (kIsVarlen) {
+        return kEnableSplitKeys
+            ? map_index_to_coord(split_key_device(), num_splits_key)
+            : Dim();
+      } else {
+        return kEnableSplitKeys ? map_index_to_coord(blockIdx.x, num_splits_key)
+                                : Dim();
+      }
     }
 
     CUTLASS_DEVICE bool advance_to_block() {
-      num_queries_post_partitioning = ceil_div_dim(num_queries, dilation);
-      // num_tokens = num_queries_post_partitioning.prod32();
-
-      auto batch_id = blockIdx.z;
-      auto bidxy = blockIdx.y;
-      auto dilation_size = dilation.prod32();
-      auto dilation_dim_idx = (int32_t)bidxy % dilation_size;
-      auto dilation_idx = map_index_to_coord(dilation_dim_idx, dilation);
-      auto head_id = bidxy / dilation_size;
-
-      auto q_strideH = head_dim;
-      auto k_strideH = head_dim;
-      auto v_strideH = head_dim_value;
-      auto o_strideH = head_dim_value;
-
-      auto q_heads_dims = num_heads * q_strideH;
-      auto k_heads_dims = num_heads * k_strideH;
-      auto v_heads_dims = num_heads * v_strideH;
-      auto o_heads_dims = num_heads * o_strideH;
-
-      auto q_stride_dilation = compute_stride(num_queries, q_heads_dims);
-      auto k_stride_dilation = compute_stride(num_queries, k_heads_dims);
-      auto v_stride_dilation = compute_stride(num_queries, v_heads_dims);
-      auto o_stride_dilation = compute_stride(num_queries, o_heads_dims);
-
-      q_strideM = q_stride_dilation * dilation;
-      k_strideM = k_stride_dilation * dilation;
-      v_strideM = v_stride_dilation * dilation;
-      o_strideM = o_stride_dilation * dilation;
-
-      auto q_strideB = num_queries.prod() * q_heads_dims;
-      auto k_strideB = num_queries.prod() * k_heads_dims;
-      auto v_strideB = num_queries.prod() * v_heads_dims;
-      auto o_strideB = num_queries.prod() * o_heads_dims;
-
-      maybe_mask_qk_tiles(
-          num_queries_post_partitioning, num_queries, dilation, dilation_idx);
-
-      // NOTE: causal mask is antithetical to being fully block sparse.
-      // While there are cases where a causal mask has mostly dense blocks, the
-      // last one (at least) will always be causally masked. Fast paths for
-      // block sparsity in FNA are limited to masks that are guaranteed to be
-      // fully block sparse only.
-      is_fully_block_sparse = not kHasCausalDims &&
-          fully_block_sparse(
-              num_queries_post_partitioning,
-              kernel_size,
-              stride,
-              query_tile_shape,
-              key_tile_shape);
-
-      has_q_padding =
-          not evenly_divides(num_queries_post_partitioning, query_tile_shape);
-
-      if constexpr (kNeedsAccumGradQ || kNeedsAccumGradK || kNeedsAccumGradV) {
+      if constexpr (kIsVarlen) {
+        const int64_t work_item = static_cast<int64_t>(blockIdx.x);
+        const auto batch_id = this->varlen.backward_worklist[work_item * 2];
+        this->split_key = this->varlen.backward_worklist[work_item * 2 + 1];
 #ifdef NATTEN_ENABLE_DEVICE_SIDE_ASSERTIONS
-        assert(workspace_size() == 0 || workspace != nullptr);
+        assert(batch_id >= 0 && batch_id < num_batches);
+        assert(this->split_key >= 0);
+#endif
+        num_queries = device_ptr_to_na_dim<Dim>(
+            this->varlen.token_layouts + (int64_t)batch_id * NADim);
+        num_splits_key = device_ptr_to_na_dim<Dim>(
+            this->varlen.per_document_splits + (int64_t)batch_id * NADim);
+        const int32_t token_start = this->varlen.cumulative_seqlens[batch_id];
+        const int64_t q_tile_offset =
+            this->varlen.backward_q_tile_offsets[batch_id];
+        const int64_t num_q_tiles_for_document =
+            this->varlen.backward_q_tile_offsets[batch_id + 1] - q_tile_offset;
+        const int64_t kv_split_offset =
+            this->varlen.backward_kv_split_offsets[batch_id];
+        const int64_t num_kv_splits_for_document =
+            this->varlen.backward_kv_split_offsets[batch_id + 1] -
+            kv_split_offset;
+
+        num_queries_post_partitioning = ceil_div_dim(num_queries, dilation);
+        // num_tokens = num_queries_post_partitioning.prod32();
+
+#ifdef NATTEN_ENABLE_DEVICE_SIDE_ASSERTIONS
+        {
+          const auto actual_q_tiles =
+              ceil_div_dim(num_queries_post_partitioning, query_tile_shape);
+          assert(this->split_key < num_splits_key.prod32());
+          assert(num_kv_splits_for_document == num_splits_key.prod32());
+          assert(num_q_tiles_for_document == actual_q_tiles.prod32());
+        }
 #endif
 
-        workspace += (batch_id * num_heads * dilation_size +
-                      head_id * dilation_size + dilation_dim_idx) *
-            workspace_strideBH();
-        // Mutex lock shift
-        workspace = gemm_kernel_utils::warp_uniform(workspace);
-        workspace_gv = workspace + workspace_elements_gk();
-        workspace_gq =
-            (GradQTempStorage*)(workspace_gv + workspace_elements_gv());
+        auto bidxy = blockIdx.y;
+        auto dilation_size = dilation.prod32();
+        auto dilation_dim_idx = (int32_t)bidxy % dilation_size;
+        auto dilation_idx = map_index_to_coord(dilation_dim_idx, dilation);
+        auto head_id = bidxy / dilation_size;
 
-        // workspace += dilation_dim_idx * workspace_elements_gk();
-        // workspace_gq += dilation_dim_idx * workspace_elements_gq();
-        // workspace_gv += dilation_dim_idx * workspace_elements_gv();
+        auto q_strideH = head_dim;
+        auto k_strideH = head_dim;
+        auto v_strideH = head_dim_value;
+        auto o_strideH = head_dim_value;
 
-        if (kEnableSplitKeys) {
-          workspace_gv += workspace_elements_gv() * split_key_device() /
-              num_splits_key_device();
-          workspace += workspace_elements_gk() * split_key_device() /
-              num_splits_key_device();
+        auto q_heads_dims = num_heads * q_strideH;
+        auto k_heads_dims = num_heads * k_strideH;
+        auto v_heads_dims = num_heads * v_strideH;
+        auto o_heads_dims = num_heads * o_strideH;
+
+        auto q_stride_dilation = compute_stride(num_queries, q_heads_dims);
+        auto k_stride_dilation = compute_stride(num_queries, k_heads_dims);
+        auto v_stride_dilation = compute_stride(num_queries, v_heads_dims);
+        auto o_stride_dilation = compute_stride(num_queries, o_heads_dims);
+
+        q_strideM = q_stride_dilation * dilation;
+        k_strideM = k_stride_dilation * dilation;
+        v_strideM = v_stride_dilation * dilation;
+        o_strideM = o_stride_dilation * dilation;
+
+        maybe_mask_qk_tiles(
+            num_queries_post_partitioning, num_queries, dilation, dilation_idx);
+
+        // NOTE: causal mask is antithetical to being fully block sparse.
+        // While there are cases where a causal mask has mostly dense
+        // blocks, the last one (at least) will always be causally masked.
+        // Fast paths for block sparsity in FNA are limited to masks that
+        // are guaranteed to be fully block sparse only.
+        is_fully_block_sparse = not kHasCausalDims &&
+            fully_block_sparse(
+                num_queries_post_partitioning,
+                kernel_size,
+                stride,
+                query_tile_shape,
+                key_tile_shape);
+
+        has_q_padding =
+            not evenly_divides(num_queries_post_partitioning, query_tile_shape);
+
+        if constexpr (
+            kNeedsAccumGradQ || kNeedsAccumGradK || kNeedsAccumGradV) {
+#ifdef NATTEN_ENABLE_DEVICE_SIDE_ASSERTIONS
+          assert(workspace_size() == 0 || workspace != nullptr);
+#endif
+          auto* workspace_base = workspace;
+          const int64_t head_dilation_id =
+              static_cast<int64_t>(head_id) * dilation_size + dilation_dim_idx;
+          const int64_t split_slot =
+              kv_split_offset * num_heads * dilation_size +
+              head_dilation_id * num_kv_splits_for_document + this->split_key;
+          const int64_t q_tile_slot =
+              q_tile_offset * num_heads * dilation_size +
+              head_dilation_id * num_q_tiles_for_document;
+          workspace =
+              workspace_base + split_slot * workspace_elements_gk_per_split();
+          workspace_gv = workspace_base + workspace_elements_gk() +
+              split_slot * workspace_elements_gv_per_split();
+          workspace_gq = reinterpret_cast<GradQTempStorage*>(
+                             workspace_base + workspace_elements_gk() +
+                             workspace_elements_gv()) +
+              q_tile_slot * workspace_num_cols_gq();
+          workspace = gemm_kernel_utils::warp_uniform(workspace);
+          workspace_gv = gemm_kernel_utils::warp_uniform(workspace_gv);
+          workspace_gq = gemm_kernel_utils::warp_uniform(workspace_gq);
+        } else {
+          workspace = nullptr;
         }
+
+        // Advance pointers that depend on the total concatenated
+        // number of queries, as `num_queries` is modified in the block
+        // below
+        auto lse_stride_dilation = compute_stride(num_queries, num_heads);
+        lse_strideM = lse_stride_dilation * dilation;
+        logsumexp_ptr += (int64_t)token_start * num_heads +
+            (dilation_idx * lse_stride_dilation).sum() + head_id;
+
+        // NOTE(alih): assumes delta and lse have identical shape and layout
+        delta_ptr += (int64_t)token_start * num_heads +
+            (dilation_idx * lse_stride_dilation).sum() + head_id;
+
+        query_ptr += (int64_t)token_start * q_heads_dims + head_id * q_strideH +
+            (dilation_idx * q_stride_dilation).sum();
+        key_ptr += (int64_t)token_start * k_heads_dims + head_id * k_strideH +
+            (dilation_idx * k_stride_dilation).sum();
+        value_ptr += (int64_t)token_start * v_heads_dims + head_id * v_strideH +
+            (dilation_idx * v_stride_dilation).sum();
+
+        output_ptr += (int64_t)token_start * o_heads_dims +
+            head_id * o_strideH + (dilation_idx * o_stride_dilation).sum();
+        // NOTE(alih): assumes gradient tensors match the layout of the
+        // original tensors, and are contiguous
+        // grad_output_ptr += batch_id * gO_strideB + head_id * gO_strideH;
+
+        grad_query_ptr += (int64_t)token_start * q_heads_dims +
+            head_id * q_strideH + (dilation_idx * q_stride_dilation).sum();
+        grad_key_ptr += (int64_t)token_start * k_heads_dims +
+            head_id * k_strideH + (dilation_idx * k_stride_dilation).sum();
+        grad_value_ptr += (int64_t)token_start * v_heads_dims +
+            head_id * v_strideH + (dilation_idx * v_stride_dilation).sum();
+        grad_output_ptr += (int64_t)token_start * o_heads_dims +
+            head_id * o_strideH + (dilation_idx * o_stride_dilation).sum();
+
+        // Some values are modified above
+        // Signal to the compiler that they are the same in all threads
+        // and can be stored in warp-uniform registers (Sm75+)
+        query_ptr = gemm_kernel_utils::warp_uniform(query_ptr);
+        key_ptr = gemm_kernel_utils::warp_uniform(key_ptr);
+        value_ptr = gemm_kernel_utils::warp_uniform(value_ptr);
+        logsumexp_ptr = gemm_kernel_utils::warp_uniform(logsumexp_ptr);
+        output_ptr = gemm_kernel_utils::warp_uniform(output_ptr);
+        grad_output_ptr = gemm_kernel_utils::warp_uniform(grad_output_ptr);
+        delta_ptr = gemm_kernel_utils::warp_uniform(delta_ptr);
+
+        grad_query_ptr = gemm_kernel_utils::warp_uniform(grad_query_ptr);
+        grad_key_ptr = gemm_kernel_utils::warp_uniform(grad_key_ptr);
+        grad_value_ptr = gemm_kernel_utils::warp_uniform(grad_value_ptr);
+
+        return true;
       } else {
-        workspace = nullptr;
+        num_queries_post_partitioning = ceil_div_dim(num_queries, dilation);
+        // num_tokens = num_queries_post_partitioning.prod32();
+
+        auto batch_id = blockIdx.z;
+        auto bidxy = blockIdx.y;
+        auto dilation_size = dilation.prod32();
+        auto dilation_dim_idx = (int32_t)bidxy % dilation_size;
+        auto dilation_idx = map_index_to_coord(dilation_dim_idx, dilation);
+        auto head_id = bidxy / dilation_size;
+
+        auto q_strideH = head_dim;
+        auto k_strideH = head_dim;
+        auto v_strideH = head_dim_value;
+        auto o_strideH = head_dim_value;
+
+        auto q_heads_dims = num_heads * q_strideH;
+        auto k_heads_dims = num_heads * k_strideH;
+        auto v_heads_dims = num_heads * v_strideH;
+        auto o_heads_dims = num_heads * o_strideH;
+
+        auto q_stride_dilation = compute_stride(num_queries, q_heads_dims);
+        auto k_stride_dilation = compute_stride(num_queries, k_heads_dims);
+        auto v_stride_dilation = compute_stride(num_queries, v_heads_dims);
+        auto o_stride_dilation = compute_stride(num_queries, o_heads_dims);
+
+        q_strideM = q_stride_dilation * dilation;
+        k_strideM = k_stride_dilation * dilation;
+        v_strideM = v_stride_dilation * dilation;
+        o_strideM = o_stride_dilation * dilation;
+
+        auto q_strideB = num_queries.prod() * q_heads_dims;
+        auto k_strideB = num_queries.prod() * k_heads_dims;
+        auto v_strideB = num_queries.prod() * v_heads_dims;
+        auto o_strideB = num_queries.prod() * o_heads_dims;
+
+        maybe_mask_qk_tiles(
+            num_queries_post_partitioning, num_queries, dilation, dilation_idx);
+
+        // NOTE: causal mask is antithetical to being fully block sparse.
+        // While there are cases where a causal mask has mostly dense
+        // blocks, the last one (at least) will always be causally masked.
+        // Fast paths for block sparsity in FNA are limited to masks that
+        // are guaranteed to be fully block sparse only.
+        is_fully_block_sparse = not kHasCausalDims &&
+            fully_block_sparse(
+                num_queries_post_partitioning,
+                kernel_size,
+                stride,
+                query_tile_shape,
+                key_tile_shape);
+
+        has_q_padding =
+            not evenly_divides(num_queries_post_partitioning, query_tile_shape);
+
+        if constexpr (
+            kNeedsAccumGradQ || kNeedsAccumGradK || kNeedsAccumGradV) {
+#ifdef NATTEN_ENABLE_DEVICE_SIDE_ASSERTIONS
+          assert(workspace_size() == 0 || workspace != nullptr);
+#endif
+
+          workspace += (batch_id * num_heads * dilation_size +
+                        head_id * dilation_size + dilation_dim_idx) *
+              workspace_strideBH();
+          // Mutex lock shift
+          workspace = gemm_kernel_utils::warp_uniform(workspace);
+          workspace_gv = workspace + workspace_elements_gk();
+          workspace_gq =
+              (GradQTempStorage*)(workspace_gv + workspace_elements_gv());
+
+          // workspace += dilation_dim_idx * workspace_elements_gk();
+          // workspace_gq += dilation_dim_idx * workspace_elements_gq();
+          // workspace_gv += dilation_dim_idx * workspace_elements_gv();
+
+          if (kEnableSplitKeys) {
+            workspace_gv += workspace_elements_gv() * split_key_device() /
+                num_splits_key_device();
+            workspace += workspace_elements_gk() * split_key_device() /
+                num_splits_key_device();
+          }
+        } else {
+          workspace = nullptr;
+        }
+
+        // Advance pointers that depend on the total concatenated
+        // number of queries, as `num_queries` is modified in the block
+        // below
+        auto lse_stride_dilation = compute_stride(num_queries, num_heads);
+        lse_strideM = lse_stride_dilation * dilation;
+        logsumexp_ptr += batch_id * num_queries.prod32() * num_heads +
+            (dilation_idx * lse_stride_dilation).sum() + head_id;
+
+        // NOTE(alih): assumes delta and lse have identical shape and layout
+        delta_ptr += batch_id * num_queries.prod32() * num_heads +
+            (dilation_idx * lse_stride_dilation).sum() + head_id;
+
+        query_ptr += batch_id * q_strideB + head_id * q_strideH +
+            (dilation_idx * q_stride_dilation).sum();
+        key_ptr += batch_id * k_strideB + head_id * k_strideH +
+            (dilation_idx * k_stride_dilation).sum();
+        value_ptr += batch_id * v_strideB + head_id * v_strideH +
+            (dilation_idx * v_stride_dilation).sum();
+
+        output_ptr += batch_id * o_strideB + head_id * o_strideH +
+            (dilation_idx * o_stride_dilation).sum();
+        // NOTE(alih): assumes gradient tensors match the layout of the
+        // original tensors, and are contiguous
+        // grad_output_ptr += batch_id * gO_strideB + head_id * gO_strideH;
+
+        grad_query_ptr += batch_id * q_strideB + head_id * q_strideH +
+            (dilation_idx * q_stride_dilation).sum();
+        grad_key_ptr += batch_id * k_strideB + head_id * k_strideH +
+            (dilation_idx * k_stride_dilation).sum();
+        grad_value_ptr += batch_id * v_strideB + head_id * v_strideH +
+            (dilation_idx * v_stride_dilation).sum();
+        grad_output_ptr += batch_id * o_strideB + head_id * o_strideH +
+            (dilation_idx * o_stride_dilation).sum();
+
+        // Some values are modified above
+        // Signal to the compiler that they are the same in all threads
+        // and can be stored in warp-uniform registers (Sm75+)
+        // num_queries = gemm_kernel_utils::warp_uniform(num_queries);
+        // num_keys = gemm_kernel_utils::warp_uniform(num_keys);
+        // custom_mask_type = gemm_kernel_utils::warp_uniform(custom_mask_type);
+
+        query_ptr = gemm_kernel_utils::warp_uniform(query_ptr);
+        key_ptr = gemm_kernel_utils::warp_uniform(key_ptr);
+        value_ptr = gemm_kernel_utils::warp_uniform(value_ptr);
+        // bias_ptr = gemm_kernel_utils::warp_uniform(bias_ptr);
+        logsumexp_ptr = gemm_kernel_utils::warp_uniform(logsumexp_ptr);
+        output_ptr = gemm_kernel_utils::warp_uniform(output_ptr);
+        grad_output_ptr = gemm_kernel_utils::warp_uniform(grad_output_ptr);
+        delta_ptr = gemm_kernel_utils::warp_uniform(delta_ptr);
+
+        grad_query_ptr = gemm_kernel_utils::warp_uniform(grad_query_ptr);
+        grad_key_ptr = gemm_kernel_utils::warp_uniform(grad_key_ptr);
+        grad_value_ptr = gemm_kernel_utils::warp_uniform(grad_value_ptr);
+        // grad_bias_ptr = gemm_kernel_utils::warp_uniform(grad_bias_ptr);
+
+        return true;
       }
-
-      // Advance pointers that depend on the total concatenated
-      // number of queries, as `num_queries` is modified in the block
-      // below
-      auto lse_stride_dilation = compute_stride(num_queries, num_heads);
-      lse_strideM = lse_stride_dilation * dilation;
-      logsumexp_ptr += batch_id * num_queries.prod32() * num_heads +
-          (dilation_idx * lse_stride_dilation).sum() + head_id;
-
-      // NOTE(alih): assumes delta and lse have identical shape and layout
-      delta_ptr += batch_id * num_queries.prod32() * num_heads +
-          (dilation_idx * lse_stride_dilation).sum() + head_id;
-
-      query_ptr += batch_id * q_strideB + head_id * q_strideH +
-          (dilation_idx * q_stride_dilation).sum();
-      key_ptr += batch_id * k_strideB + head_id * k_strideH +
-          (dilation_idx * k_stride_dilation).sum();
-      value_ptr += batch_id * v_strideB + head_id * v_strideH +
-          (dilation_idx * v_stride_dilation).sum();
-
-      output_ptr += batch_id * o_strideB + head_id * o_strideH +
-          (dilation_idx * o_stride_dilation).sum();
-      // NOTE(alih): assumes gradient tensors match the layout of the original
-      // tensors, and are contiguous
-      // grad_output_ptr += batch_id * gO_strideB + head_id * gO_strideH;
-
-      grad_query_ptr += batch_id * q_strideB + head_id * q_strideH +
-          (dilation_idx * q_stride_dilation).sum();
-      grad_key_ptr += batch_id * k_strideB + head_id * k_strideH +
-          (dilation_idx * k_stride_dilation).sum();
-      grad_value_ptr += batch_id * v_strideB + head_id * v_strideH +
-          (dilation_idx * v_stride_dilation).sum();
-      grad_output_ptr += batch_id * o_strideB + head_id * o_strideH +
-          (dilation_idx * o_stride_dilation).sum();
-
-      // Some values are modified above
-      // Signal to the compiler that they are the same in all threads
-      // and can be stored in warp-uniform registers (Sm75+)
-      // num_queries = gemm_kernel_utils::warp_uniform(num_queries);
-      // num_keys = gemm_kernel_utils::warp_uniform(num_keys);
-      // custom_mask_type = gemm_kernel_utils::warp_uniform(custom_mask_type);
-
-      query_ptr = gemm_kernel_utils::warp_uniform(query_ptr);
-      key_ptr = gemm_kernel_utils::warp_uniform(key_ptr);
-      value_ptr = gemm_kernel_utils::warp_uniform(value_ptr);
-      // bias_ptr = gemm_kernel_utils::warp_uniform(bias_ptr);
-      logsumexp_ptr = gemm_kernel_utils::warp_uniform(logsumexp_ptr);
-      output_ptr = gemm_kernel_utils::warp_uniform(output_ptr);
-      grad_output_ptr = gemm_kernel_utils::warp_uniform(grad_output_ptr);
-      delta_ptr = gemm_kernel_utils::warp_uniform(delta_ptr);
-
-      grad_query_ptr = gemm_kernel_utils::warp_uniform(grad_query_ptr);
-      grad_key_ptr = gemm_kernel_utils::warp_uniform(grad_key_ptr);
-      grad_value_ptr = gemm_kernel_utils::warp_uniform(grad_value_ptr);
-      // grad_bias_ptr = gemm_kernel_utils::warp_uniform(grad_bias_ptr);
-
-      return true;
     }
 
     __host__ dim3 getBlocksGrid() const {
-      return dim3(
-          num_splits_key.prod32(), num_heads * dilation.prod32(), num_batches);
+      if constexpr (kIsVarlen) {
+        return dim3(
+            static_cast<uint32_t>(this->varlen.backward_work_count),
+            static_cast<uint32_t>(
+                static_cast<int64_t>(num_heads) * dilation.prod32()),
+            1);
+      } else {
+        return dim3(
+            num_splits_key.prod32(),
+            num_heads * dilation.prod32(),
+            num_batches);
+      }
     }
 
     __host__ dim3 getThreadsGrid() const {
@@ -889,7 +1089,20 @@ struct FusedNeighborhoodAttentionBackwardKernel {
       if constexpr (!kNeedsAccumGradK) {
         return 0;
       }
-      return num_splits_key.prod32() * kBlockSizeJ *
+      if constexpr (kIsVarlen) {
+        return this->varlen.backward_work_count * num_heads *
+            dilation.prod32() * workspace_elements_gk_per_split();
+      } else {
+        return num_splits_key.prod32() * kBlockSizeJ *
+            gemm_kernel_utils::align_up(head_dim, (int32_t)kBlockSizeI);
+      }
+    }
+
+    CUTLASS_HOST_DEVICE int64_t workspace_elements_gk_per_split() const {
+      if constexpr (!kNeedsAccumGradK) {
+        return 0;
+      }
+      return static_cast<int64_t>(kBlockSizeJ) *
           gemm_kernel_utils::align_up(head_dim, (int32_t)kBlockSizeI);
     }
 
@@ -897,22 +1110,53 @@ struct FusedNeighborhoodAttentionBackwardKernel {
       if constexpr (!kNeedsAccumGradV) {
         return 0;
       }
-      return num_splits_key.prod32() * kBlockSizeJ *
+      if constexpr (kIsVarlen) {
+        return this->varlen.backward_work_count * num_heads *
+            dilation.prod32() * workspace_elements_gv_per_split();
+      } else {
+        return num_splits_key.prod32() * kBlockSizeJ *
+            gemm_kernel_utils::align_up(head_dim_value, (int32_t)kBlockSizeI);
+      }
+    }
+
+    CUTLASS_HOST_DEVICE int64_t workspace_elements_gv_per_split() const {
+      if constexpr (!kNeedsAccumGradV) {
+        return 0;
+      }
+      return static_cast<int64_t>(kBlockSizeJ) *
           gemm_kernel_utils::align_up(head_dim_value, (int32_t)kBlockSizeI);
+    }
+
+    CUTLASS_HOST_DEVICE int64_t workspace_num_cols_gq() const {
+      return gemm_kernel_utils::ceil_div(
+          head_dim, MatmulGradQ::ThreadblockShape::kN);
+    }
+
+    CUTLASS_HOST_DEVICE int64_t workspace_elements_gq_per_tile() const {
+      if constexpr (!kNeedsAccumGradQ) {
+        return 0;
+      }
+      return workspace_num_cols_gq() * sizeof(GradQTempStorage) /
+          sizeof(output_accum_t);
     }
 
     CUTLASS_HOST_DEVICE int64_t workspace_elements_gq() const {
       if constexpr (!kNeedsAccumGradQ) {
         return 0;
       }
-      auto num_q_post_dilation = ceil_div_dim(num_queries, dilation);
-      auto num_q_tiles =
-          ceil_div_dim(num_q_post_dilation, query_tile_shape); // kBlockSizeI
-      auto num_blocks = num_q_tiles.prod32();
-      int num_cols = gemm_kernel_utils::ceil_div(
-          head_dim, MatmulGradQ::ThreadblockShape::kN);
-      return num_blocks * num_cols * sizeof(GradQTempStorage) /
-          sizeof(output_accum_t);
+      if constexpr (kIsVarlen) {
+        return this->varlen.total_backward_q_tiles * num_heads *
+            dilation.prod32() * workspace_elements_gq_per_tile();
+      } else {
+        auto num_q_post_dilation = ceil_div_dim(num_queries, dilation);
+        auto num_q_tiles =
+            ceil_div_dim(num_q_post_dilation, query_tile_shape); // kBlockSizeI
+        auto num_blocks = num_q_tiles.prod32();
+        int num_cols = gemm_kernel_utils::ceil_div(
+            head_dim, MatmulGradQ::ThreadblockShape::kN);
+        return num_blocks * num_cols * sizeof(GradQTempStorage) /
+            sizeof(output_accum_t);
+      }
     }
 
     CUTLASS_HOST_DEVICE int64_t workspace_strideBH() const {
@@ -925,9 +1169,15 @@ struct FusedNeighborhoodAttentionBackwardKernel {
 
     CUTLASS_HOST_DEVICE int64_t workspace_size() const {
       // Returns size of buffer we need to run this kernel
-      return (num_batches * num_heads * dilation.prod32() *
-              workspace_strideBH()) *
-          sizeof(float);
+      if constexpr (kIsVarlen) {
+        return (workspace_elements_gk() + workspace_elements_gv() +
+                workspace_elements_gq()) *
+            sizeof(output_accum_t);
+      } else {
+        return (num_batches * num_heads * dilation.prod32() *
+                workspace_strideBH()) *
+            sizeof(float);
+      }
     }
 
     // NOTE(alih): we check whether a CTA-scope GEMM should load from workspace
@@ -937,8 +1187,12 @@ struct FusedNeighborhoodAttentionBackwardKernel {
     CUTLASS_HOST_DEVICE bool should_zero_workspace() const {
       // return num_splits_key > 1 || window_size > 0;
       if constexpr (kNeedsAccumGradQ) {
-        if (num_splits_key.prod32() > 1) {
+        if constexpr (kIsVarlen) {
           return true;
+        } else {
+          if (num_splits_key.prod32() > 1) {
+            return true;
+          }
         }
       }
       return false;
@@ -1233,13 +1487,26 @@ struct FusedNeighborhoodAttentionBackwardKernel {
     // NATTEN_CHECK(
     //     p.num_splits_key > 0, "Invalid `num_splits_key` (expected >0)");
 
-    auto cta_shape_y =
-        ceil_div_dim(ceil_div_dim(p.num_queries, p.dilation), p.key_tile_shape);
-    NATTEN_CHECK(
-        // p.num_splits_key <= cutlass::ceil_div(p.num_keys, kBlockSizeJ),
-        // p.num_splits_key <= cta_shape_y.prod32(),
-        is_coord_less_than_or_equal_to(p.num_splits_key, cta_shape_y),
-        "Number of KV splits exceeds the number of tiles!");
+    if constexpr (kIsVarlen) {
+      NATTEN_CHECK(
+          p.varlen.backward_work_count > 0,
+          "Invalid varlen backward work count.");
+      NATTEN_CHECK(
+          p.varlen.total_backward_q_tiles > 0,
+          "Invalid varlen backward Q-tile count.");
+      NATTEN_CHECK(
+          p.varlen.backward_q_tile_offsets != nullptr &&
+              p.varlen.backward_kv_split_offsets != nullptr,
+          "Missing compact varlen backward workspace offsets.");
+    } else {
+      auto cta_shape_y = ceil_div_dim(
+          ceil_div_dim(p.num_queries, p.dilation), p.key_tile_shape);
+      NATTEN_CHECK(
+          // p.num_splits_key <= cutlass::ceil_div(p.num_keys, kBlockSizeJ),
+          // p.num_splits_key <= cta_shape_y.prod32(),
+          is_coord_less_than_or_equal_to(p.num_splits_key, cta_shape_y),
+          "Number of KV splits exceeds the number of tiles!");
+    }
     return true;
   }
 
