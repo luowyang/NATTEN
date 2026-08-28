@@ -38,6 +38,7 @@ from natten.backends import (
     flex_fmha,
     flex_fna_generic,
 )
+from natten.backends.varlen_fna import _neighborhood_attention_varlen_generic
 from natten.types import (
     CausalArg1DTypeOrDed,
     CausalArg2DTypeOrDed,
@@ -64,6 +65,7 @@ from natten.utils.checks import (
     na_tensor_checks,
     varlen_tensor_checks,
 )
+from natten.varlen import VarlenLayout
 
 logger = log.get_logger(__name__)
 
@@ -1147,5 +1149,366 @@ def na3d(
         run_persistent_kernel=run_persistent_kernel,
         kernel_schedule=kernel_schedule,
         torch_compile=torch_compile,
+        return_lse=return_lse,
+    )
+
+
+# Variable-length Neighborhood Attention
+
+
+def na1d_varlen(
+    query: Tensor,
+    key: Tensor,
+    value: Tensor,
+    layout: VarlenLayout,
+    kernel_size: Dimension1DTypeOrDed,
+    stride: Dimension1DTypeOrDed = 1,
+    dilation: Dimension1DTypeOrDed = 1,
+    is_causal: Optional[CausalArg1DTypeOrDed] = False,
+    scale: Optional[float] = None,
+    backend: Optional[str] = None,
+    q_tile_shape: Optional[Dimension1DType] = None,
+    kv_tile_shape: Optional[Dimension1DType] = None,
+    backward_q_tile_shape: Optional[Dimension1DType] = None,
+    backward_kv_tile_shape: Optional[Dimension1DType] = None,
+    backward_kv_splits: Optional[Dimension1DType] = None,
+    backward_use_pt_reduction: bool = False,
+    return_lse: bool = False,
+) -> Union[Tensor, Tuple[Tensor, Tensor]]:
+    """Computes 1-D variable-length (sequence-packed) neighborhood attention.
+
+    GQA/MQA support (`heads != heads_kv`) is available, with explicit repeats
+    (increases memory usage and runtime), same as fixed [na1d][natten.na1d].
+
+    A document may be empty (zero tokens, e.g. shape `(0,)` in `layout`); an
+    empty document is an exact no-op, contributing no rows to `query`/`key`/
+    `value` and never scheduled. A layout whose documents are all empty
+    returns correctly-shaped empty output (and, with `return_lse=True`,
+    empty logsumexp) without a kernel launch; `backward()` still produces
+    correctly-shaped (empty) gradients for `query`/`key`/`value`.
+
+    `layout` defines the document order for `query`/`key`/`value`; every
+    tensor passed with it must be packed in that same order.
+
+    !!! warning
+        A mismatched packing computes attention over the wrong
+        neighborhoods without an error. Prefer
+        [VarlenLayout.from_tensor_list][natten.VarlenLayout.from_tensor_list],
+        which guarantees consistency between the returned layout and packed
+        tensor at construction time; tensors derived from that packed
+        representation must still preserve its document order and token
+        layout.
+
+    Compatible with `torch.compile(..., fullgraph=True)`. The first use of
+    a previously unseen geometry materializes schedule state and may create
+    one additional specialization; subsequent calls with the same geometry
+    reuse the memoized state. No prewarming is required for correctness
+    (optionally, prewarming with one eager call avoids that one extra
+    specialization under strict recompile budgets).
+
+    Parameters:
+        query (Tensor): 3-D query tensor, with the heads last layout
+            (`[total_tokens, heads, head_dim]`).
+
+        key (Tensor): 3-D key tensor, with the heads last layout
+            (`[total_tokens, heads_kv, head_dim]`).
+
+        value (Tensor): 3-D value tensor, with the heads last layout
+            (`[total_tokens, heads_kv, head_dim_v]`).
+
+        layout (VarlenLayout): Packed-document layout; `layout.rank` must be 1,
+            and `layout.total_tokens` must equal `query.shape[0]` exactly (no
+            capacity/padding).
+
+        kernel_size (Tuple[int] | int): Neighborhood window (kernel) size.
+
+        stride (Tuple[int] | int): Sliding window step size. Defaults to `1`.
+
+        dilation (Tuple[int] | int): Dilation step size. Defaults to `1`.
+
+        is_causal (Tuple[bool] | bool): Toggle causal masking. Defaults to
+            `False`.
+
+        scale (float): Attention scale. `None` selects `head_dim ** -0.5`.
+
+    Other Parameters:
+        backend (Optional[str]): Backend implementation to run with. Choices are: `None`
+            (defaults to `"cutlass-fna"`, the only backend currently supported), `"cutlass-fna"`.
+
+        q_tile_shape (Tuple[int]): 1-D Tile shape for the query token layout
+            in the forward pass kernel.
+
+        kv_tile_shape (Tuple[int]): 1-D Tile shape for the key-value token
+            layout in the forward pass kernel.
+
+        backward_q_tile_shape (Tuple[int]): 1-D Tile shape for the query
+            token layout in the backward pass kernel.
+
+        backward_kv_tile_shape (Tuple[int]): 1-D Tile shape for the
+            key/value token layout in the backward pass kernel.
+
+        backward_kv_splits (Tuple[int]): Optional per-axis cap for backward
+            KV parallelism. Like tile shapes, this is a tuple and not an
+            integer for neighborhood attention operations, and the size of
+            the tuple corresponds to `layout.rank`. An explicit value is
+            always respected regardless of the
+            [KV parallelism](context.md#kv-parallelism-in-fna) switch
+            (clamped per axis to what the geometry can feasibly support);
+            the switch governs only the *default* (uncapped) split
+            selection. Deterministic mode (`torch.use_deterministic_algorithms`)
+            forces serial (all-1) splits regardless of either.
+
+        backward_use_pt_reduction (bool): Whether to use PyTorch eager for
+            computing the `dO * O` product required by the backward pass,
+            over the CUTLASS kernel.
+
+        return_lse (bool): Whether or not to return the `logsumexp` tensor.
+
+    Returns:
+        output (Tensor): `[total_tokens, heads, head_dim_v]` packed output.
+
+        logsumexp (Tensor): only returned when `return_lse=True`.
+            `[total_tokens, heads]` packed logsumexp.
+    """
+    return _neighborhood_attention_varlen_generic(
+        na_dim=1,
+        query=query,
+        key=key,
+        value=value,
+        layout=layout,
+        kernel_size=kernel_size,
+        stride=stride,
+        dilation=dilation,
+        is_causal=is_causal,
+        scale=scale,
+        backend=backend,
+        q_tile_shape=q_tile_shape,
+        kv_tile_shape=kv_tile_shape,
+        backward_q_tile_shape=backward_q_tile_shape,
+        backward_kv_tile_shape=backward_kv_tile_shape,
+        backward_kv_splits=backward_kv_splits,
+        backward_use_pt_reduction=backward_use_pt_reduction,
+        return_lse=return_lse,
+    )
+
+
+def na2d_varlen(
+    query: Tensor,
+    key: Tensor,
+    value: Tensor,
+    layout: VarlenLayout,
+    kernel_size: Dimension2DTypeOrDed,
+    stride: Dimension2DTypeOrDed = 1,
+    dilation: Dimension2DTypeOrDed = 1,
+    is_causal: Optional[CausalArg2DTypeOrDed] = False,
+    scale: Optional[float] = None,
+    backend: Optional[str] = None,
+    q_tile_shape: Optional[Dimension2DType] = None,
+    kv_tile_shape: Optional[Dimension2DType] = None,
+    backward_q_tile_shape: Optional[Dimension2DType] = None,
+    backward_kv_tile_shape: Optional[Dimension2DType] = None,
+    backward_kv_splits: Optional[Dimension2DType] = None,
+    backward_use_pt_reduction: bool = False,
+    return_lse: bool = False,
+) -> Union[Tensor, Tuple[Tensor, Tensor]]:
+    """Computes 2-D variable-length (sequence-packed) neighborhood attention.
+
+    See [na1d_varlen][natten.na1d_varlen] for the full parameter/behavior
+    description (identical, modulo rank); `layout.rank` must be 2 here, and
+    `kernel_size`/`stride`/`dilation`/`is_causal`/tile shapes are 2-tuples.
+
+    Compatible with `torch.compile(..., fullgraph=True)`. The first use of
+    a previously unseen geometry materializes schedule state and may create
+    one additional specialization; subsequent calls with the same geometry
+    reuse the memoized state. No prewarming is required for correctness
+    (optionally, prewarming with one eager call avoids that one extra
+    specialization under strict recompile budgets).
+
+    Parameters:
+        query (Tensor): 3-D query tensor, with the heads last layout
+            (`[total_tokens, heads, head_dim]`).
+
+        key (Tensor): 3-D key tensor, with the heads last layout
+            (`[total_tokens, heads_kv, head_dim]`).
+
+        value (Tensor): 3-D value tensor, with the heads last layout
+            (`[total_tokens, heads_kv, head_dim_v]`).
+
+        layout (VarlenLayout): Packed-document layout; `layout.rank` must be 2,
+            and `layout.total_tokens` must equal `query.shape[0]` exactly.
+
+        kernel_size (Tuple[int, int] | int): Neighborhood window (kernel)
+            size/shape.
+
+        stride (Tuple[int, int] | int): Sliding window step size/shape.
+            Defaults to `1`.
+
+        dilation (Tuple[int, int] | int): Dilation step size/shape. Defaults
+            to `1`.
+
+        is_causal (Tuple[bool, bool] | bool): Toggle causal masking. Defaults
+            to `False`.
+
+        scale (float): Attention scale. `None` selects `head_dim ** -0.5`.
+
+    Other Parameters:
+        backend (Optional[str]): Backend implementation to run with. Choices are: `None`
+            (defaults to `"cutlass-fna"`, the only backend currently supported), `"cutlass-fna"`.
+
+        q_tile_shape (Tuple[int, int]): 2-D Tile shape for the query token
+            layout in the forward pass kernel.
+
+        kv_tile_shape (Tuple[int, int]): 2-D Tile shape for the key-value
+            token layout in the forward pass kernel.
+
+        backward_q_tile_shape (Tuple[int, int]): 2-D Tile shape for the
+            query token layout in the backward pass kernel.
+
+        backward_kv_tile_shape (Tuple[int, int]): 2-D Tile shape for the
+            key/value token layout in the backward pass kernel.
+
+        backward_kv_splits (Tuple[int, int]): Optional per-axis cap for
+            backward KV parallelism.
+
+        backward_use_pt_reduction (bool): Whether to use PyTorch eager for
+            computing the `dO * O` product required by the backward pass.
+
+        return_lse (bool): Whether or not to return the `logsumexp` tensor.
+
+    Returns:
+        output (Tensor): `[total_tokens, heads, head_dim_v]` packed output.
+
+        logsumexp (Tensor): only returned when `return_lse=True`.
+            `[total_tokens, heads]` packed logsumexp.
+    """
+    return _neighborhood_attention_varlen_generic(
+        na_dim=2,
+        query=query,
+        key=key,
+        value=value,
+        layout=layout,
+        kernel_size=kernel_size,
+        stride=stride,
+        dilation=dilation,
+        is_causal=is_causal,
+        scale=scale,
+        backend=backend,
+        q_tile_shape=q_tile_shape,
+        kv_tile_shape=kv_tile_shape,
+        backward_q_tile_shape=backward_q_tile_shape,
+        backward_kv_tile_shape=backward_kv_tile_shape,
+        backward_kv_splits=backward_kv_splits,
+        backward_use_pt_reduction=backward_use_pt_reduction,
+        return_lse=return_lse,
+    )
+
+
+def na3d_varlen(
+    query: Tensor,
+    key: Tensor,
+    value: Tensor,
+    layout: VarlenLayout,
+    kernel_size: Dimension3DTypeOrDed,
+    stride: Dimension3DTypeOrDed = 1,
+    dilation: Dimension3DTypeOrDed = 1,
+    is_causal: Optional[CausalArg3DTypeOrDed] = False,
+    scale: Optional[float] = None,
+    backend: Optional[str] = None,
+    q_tile_shape: Optional[Dimension3DType] = None,
+    kv_tile_shape: Optional[Dimension3DType] = None,
+    backward_q_tile_shape: Optional[Dimension3DType] = None,
+    backward_kv_tile_shape: Optional[Dimension3DType] = None,
+    backward_kv_splits: Optional[Dimension3DType] = None,
+    backward_use_pt_reduction: bool = False,
+    return_lse: bool = False,
+) -> Union[Tensor, Tuple[Tensor, Tensor]]:
+    """Computes 3-D variable-length (sequence-packed) neighborhood attention.
+
+    See [na1d_varlen][natten.na1d_varlen] for the full parameter/behavior
+    description (identical, modulo rank); `layout.rank` must be 3 here, and
+    `kernel_size`/`stride`/`dilation`/`is_causal`/tile shapes are 3-tuples.
+
+    Compatible with `torch.compile(..., fullgraph=True)`. The first use of
+    a previously unseen geometry materializes schedule state and may create
+    one additional specialization; subsequent calls with the same geometry
+    reuse the memoized state. No prewarming is required for correctness
+    (optionally, prewarming with one eager call avoids that one extra
+    specialization under strict recompile budgets).
+
+    Parameters:
+        query (Tensor): 3-D query tensor, with the heads last layout
+            (`[total_tokens, heads, head_dim]`).
+
+        key (Tensor): 3-D key tensor, with the heads last layout
+            (`[total_tokens, heads_kv, head_dim]`).
+
+        value (Tensor): 3-D value tensor, with the heads last layout
+            (`[total_tokens, heads_kv, head_dim_v]`).
+
+        layout (VarlenLayout): Packed-document layout; `layout.rank` must be 3,
+            and `layout.total_tokens` must equal `query.shape[0]` exactly.
+
+        kernel_size (Tuple[int, int, int] | int): Neighborhood window
+            (kernel) size/shape.
+
+        stride (Tuple[int, int, int] | int): Sliding window step size/shape.
+            Defaults to `1`.
+
+        dilation (Tuple[int, int, int] | int): Dilation step size/shape.
+            Defaults to `1`.
+
+        is_causal (Tuple[bool, bool, bool] | bool): Toggle causal masking.
+            Defaults to `False`.
+
+        scale (float): Attention scale. `None` selects `head_dim ** -0.5`.
+
+    Other Parameters:
+        backend (Optional[str]): Backend implementation to run with. Choices are: `None`
+            (defaults to `"cutlass-fna"`, the only backend currently supported), `"cutlass-fna"`.
+
+        q_tile_shape (Tuple[int, int, int]): 3-D Tile shape for the query
+            token layout in the forward pass kernel.
+
+        kv_tile_shape (Tuple[int, int, int]): 3-D Tile shape for the
+            key-value token layout in the forward pass kernel.
+
+        backward_q_tile_shape (Tuple[int, int, int]): 3-D Tile shape for the
+            query token layout in the backward pass kernel.
+
+        backward_kv_tile_shape (Tuple[int, int, int]): 3-D Tile shape for the
+            key/value token layout in the backward pass kernel.
+
+        backward_kv_splits (Tuple[int, int, int]): Optional per-axis cap for
+            backward KV parallelism.
+
+        backward_use_pt_reduction (bool): Whether to use PyTorch eager for
+            computing the `dO * O` product required by the backward pass.
+
+        return_lse (bool): Whether or not to return the `logsumexp` tensor.
+
+    Returns:
+        output (Tensor): `[total_tokens, heads, head_dim_v]` packed output.
+
+        logsumexp (Tensor): only returned when `return_lse=True`.
+            `[total_tokens, heads]` packed logsumexp.
+    """
+    return _neighborhood_attention_varlen_generic(
+        na_dim=3,
+        query=query,
+        key=key,
+        value=value,
+        layout=layout,
+        kernel_size=kernel_size,
+        stride=stride,
+        dilation=dilation,
+        is_causal=is_causal,
+        scale=scale,
+        backend=backend,
+        q_tile_shape=q_tile_shape,
+        kv_tile_shape=kv_tile_shape,
+        backward_q_tile_shape=backward_q_tile_shape,
+        backward_kv_tile_shape=backward_kv_tile_shape,
+        backward_kv_splits=backward_kv_splits,
+        backward_use_pt_reduction=backward_use_pt_reduction,
         return_lse=return_lse,
     )

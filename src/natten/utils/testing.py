@@ -123,6 +123,19 @@ def skip_if_blackwell_kernels_not_supported():
     return decorator
 
 
+def skip_if_fewer_than_n_gpus(n: int):
+    def decorator(f):
+        def wrapper(self, *args, **kwargs):
+            if torch.cuda.device_count() < n:
+                self.skipTest(f"Fewer than {n} GPUs are available.")
+            else:
+                return f(self, *args, **kwargs)
+
+        return wrapper
+
+    return decorator
+
+
 def supports_float16(device: torch.device) -> bool:
     if is_cuda(device):
         device_cc = get_device_cc(device)
