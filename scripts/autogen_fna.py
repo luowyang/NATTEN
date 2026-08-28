@@ -31,37 +31,58 @@ _SM_TO_LOWER_BOUND = {
 
 
 class KernelConfig:
-    def __init__(self, na_dim: int, sm: int, gemm_shape: Tuple[int, int, int]):
+    def __init__(
+        self,
+        na_dim: int,
+        sm: int,
+        gemm_shape: Tuple[int, int, int],
+        varlen: bool = False,
+    ):
         assert 0 < na_dim <= 3
         assert 50 <= sm <= 80
         assert len(gemm_shape) == 3
         self.na_dim = na_dim
         self.sm = sm
         self.gemm_shape = gemm_shape
+        self.varlen = varlen
 
     def get_name(self, is_backward: bool) -> str:
         backward_str = "" if not is_backward else "_backward"
-        return f"fna{self.na_dim}d{backward_str}_{self.gemm_shape[0]}x{self.gemm_shape[1]}x{self.gemm_shape[2]}_sm{self.sm}"
+        varlen_str = "" if not self.varlen else "_varlen"
+        return f"fna{self.na_dim}d{backward_str}{varlen_str}_{self.gemm_shape[0]}x{self.gemm_shape[1]}x{self.gemm_shape[2]}_sm{self.sm}"
 
 
 class KernelConfigList:
-    def __init__(self, na_dim: int, sm: int, gemm_shapes: List[Tuple[int, int, int]]):
+    def __init__(
+        self,
+        na_dim: int,
+        sm: int,
+        gemm_shapes: List[Tuple[int, int, int]],
+        varlen: bool = False,
+    ):
         assert 0 < na_dim <= 3
         assert 50 <= sm <= 80
         self.na_dim = na_dim
         self.sm = sm
         self.gemm_shapes = gemm_shapes
+        self.varlen = varlen
 
     @property
     def configs(self) -> List[KernelConfig]:
         return [
-            KernelConfig(na_dim=self.na_dim, sm=self.sm, gemm_shape=gemm_shape)
+            KernelConfig(
+                na_dim=self.na_dim,
+                sm=self.sm,
+                gemm_shape=gemm_shape,
+                varlen=self.varlen,
+            )
             for gemm_shape in self.gemm_shapes
         ]
 
     def get_name(self, is_backward: bool) -> str:
         backward_str = "" if not is_backward else "_backward"
-        return f"fna{self.na_dim}d{backward_str}_sm{self.sm}"
+        varlen_str = "" if not self.varlen else "_varlen"
+        return f"fna{self.na_dim}d{backward_str}{varlen_str}_sm{self.sm}"
 
 
 class DataType:
@@ -147,6 +168,7 @@ class FusedNAKernel:
 
     @property
     def cpp_class(self) -> str:
+        varlen_str = "true" if self.config.varlen else "false"
         if self.is_backward:
             template_args = ", ".join(
                 [
@@ -157,6 +179,11 @@ class FusedNAKernel:
                     "true" if self.aligned else "false",
                     str(self.config.gemm_shape[0]),
                     str(self.config.gemm_shape[1]),
+                    # kIsVarlen_ precedes kMaxK_/kAllowDeltaCompute in
+                    # FusedNeighborhoodAttentionBackwardKernel's template
+                    # parameter list (see kernel_backward.h), so those two
+                    # keep their existing defaults.
+                    varlen_str,
                     str(self.config.gemm_shape[2]),
                 ]
             )
@@ -172,6 +199,9 @@ class FusedNAKernel:
                     str(self.config.gemm_shape[0]),
                     str(self.config.gemm_shape[1]),
                     str(self.config.gemm_shape[2]),
+                    # kIsVarlen_ is FusedNeighborhoodAttentionKernel's last
+                    # template parameter (see kernel_forward.h).
+                    varlen_str,
                 ]
             )
             return f"FusedNeighborhoodAttentionKernel<{template_args}>"
@@ -296,17 +326,14 @@ def write_combined_source_file(path, filename, headers, sources):
 
 
 class RankDispatcher:
-    def __init__(self, is_backward: bool):
-        self.name_cc = (
-            "DISPATCH_FNA_FORWARD_KERNEL"
-            if not is_backward
-            else "DISPATCH_FNA_BACKWARD_KERNEL"
-        )
-        self.name_target = (
-            "DISPATCH_FNA_FORWARD_" if not is_backward else "DISPATCH_FNA_BACKWARD_"
-        )
+    def __init__(self, is_backward: bool, varlen: bool = False):
+        direction = "BACKWARD" if is_backward else "FORWARD"
+        suffix = "_VARLEN" if varlen else ""
+        self.name_cc = f"DISPATCH_FNA_{direction}{suffix}_KERNEL"
+        self.name_target = f"DISPATCH_FNA_{direction}{suffix}_"
         self.dims: List[int] = []
         self.is_backward = is_backward
+        self.varlen = varlen
 
     def append(self, na_dim: int):
         self.dims.append(na_dim)
@@ -351,16 +378,15 @@ class RankDispatcher:
 
 
 class DeviceDispatcher:
-    def __init__(self, is_backward: bool, na_dim: int):
+    def __init__(self, is_backward: bool, na_dim: int, varlen: bool = False):
         self.na_dim = na_dim
-        self.name_cc = (
-            f"DISPATCH_FNA_FORWARD_{self.na_dim}D"
-            if not is_backward
-            else f"DISPATCH_FNA_BACKWARD_{self.na_dim}D"
-        )
+        direction = "BACKWARD" if is_backward else "FORWARD"
+        suffix = "_VARLEN" if varlen else ""
+        self.name_cc = f"DISPATCH_FNA_{direction}{suffix}_{self.na_dim}D"
         self.name_target = self.name_cc + "_SM"
         self.devices: List[int] = []
         self.is_backward = is_backward
+        self.varlen = varlen
 
     def append(self, sm: int):
         self.devices.append(sm)
@@ -404,17 +430,16 @@ class DeviceDispatcher:
 
 
 class DataTypeDispatcher:
-    def __init__(self, is_backward: bool, na_dim: int, sm: int):
+    def __init__(self, is_backward: bool, na_dim: int, sm: int, varlen: bool = False):
         self.dtypes: List[DataType] = []
         self.na_dim = na_dim
         self.sm = sm
-        self.name_cc = (
-            f"DISPATCH_FNA_FORWARD_{self.na_dim}D_SM{self.sm}"
-            if not is_backward
-            else f"DISPATCH_FNA_BACKWARD_{self.na_dim}D_SM{self.sm}"
-        )
+        direction = "BACKWARD" if is_backward else "FORWARD"
+        suffix = "_VARLEN" if varlen else ""
+        self.name_cc = f"DISPATCH_FNA_{direction}{suffix}_{self.na_dim}D_SM{self.sm}"
         self.name_target = self.name_cc
         self.is_backward = is_backward
+        self.varlen = varlen
 
     def append(self, dtype: DataType):
         self.dtypes.append(dtype)
@@ -461,21 +486,24 @@ class CausalMaskDispatcher:
         na_dim: int,
         sm: int,
         dtype: DataType,
+        varlen: bool = False,
     ):
         self.na_dim = na_dim
         self.sm = sm
         self.dtype = dtype
+        direction = "BACKWARD" if is_backward else "FORWARD"
+        dispatch_suffix = "_VARLEN" if varlen else ""
         self.name_cc = (
-            (f"DISPATCH_FNA_FORWARD_{self.na_dim}D_SM{self.sm}_{self.dtype.short_name}")
-            if not is_backward
-            else (
-                f"DISPATCH_FNA_BACKWARD_{self.na_dim}D_SM{self.sm}_{self.dtype.short_name}"
-            )
+            f"DISPATCH_FNA_{direction}{dispatch_suffix}_{self.na_dim}D_SM{self.sm}_"
+            f"{self.dtype.short_name}"
         )
         backward_str = "" if not is_backward else "_backward"
+        varlen_str = "" if not varlen else "_varlen"
         self.is_backward = is_backward
+        self.varlen = varlen
         self.name_target = (
-            f"fna{self.na_dim}d{backward_str}_sm{self.sm}_{self.dtype.short_name}"
+            f"fna{self.na_dim}d{backward_str}{varlen_str}_sm{self.sm}_"
+            f"{self.dtype.short_name}"
         )
         self.cms: List = []
 
@@ -597,49 +625,6 @@ def generate_cuda_kernels(path, num_splits=2):
         (64, 128, 2**16),
         (64, 64, 2**16),
     ]
-    device_dispatchers = []
-    dtype_dispatchers = []
-    cm_dispatchers = []
-    kernels = []
-
-    rank_dispatcher = RankDispatcher(is_backward=False)
-    for na_dim in NA_RANKS:
-        rank_dispatcher.append(na_dim)
-        device_dispatcher = DeviceDispatcher(is_backward=False, na_dim=na_dim)
-        for sm in SUPPORTED_ARCHS:
-            device_dispatcher.append(sm)
-            dtype_dispatcher = DataTypeDispatcher(
-                is_backward=False, na_dim=na_dim, sm=sm
-            )
-            for dtype in CUDA_DTYPES:
-                if dtype.min_sm > sm:
-                    continue
-                dtype_dispatcher.append(dtype)
-                cm_dispatcher = CausalMaskDispatcher(
-                    is_backward=False, na_dim=na_dim, sm=sm, dtype=dtype
-                )
-                for cm in CAUSAL_MASKS[na_dim]:
-                    cm_dispatcher.append(cm)
-                    kernels.append(
-                        FusedNAKernelBundle(
-                            is_backward=False,
-                            na_dim=na_dim,
-                            sm=sm,
-                            dtype=dtype,
-                            config_list=KernelConfigList(
-                                na_dim=na_dim,
-                                sm=sm,
-                                gemm_shapes=GEMM_SHAPES,  # GEMM_SHAPES[na_dim][sm]
-                            ),
-                            causal_mask=cm,
-                        )
-                    )
-                cm_dispatchers.append(cm_dispatcher)
-            dtype_dispatchers.append(dtype_dispatcher)
-        device_dispatchers.append(device_dispatcher)
-
-    #
-
     BACKWARD_GEMM_SHAPES = {
         80: {
             NATTEN_Half: [
@@ -749,47 +734,130 @@ def generate_cuda_kernels(path, num_splits=2):
         },
     }
 
-    # Backward kernels
-    rank_dispatcher_backward = RankDispatcher(is_backward=True)
-    # for na_dim in [1, 2, 3]:
-    for na_dim in NA_RANKS:
-        rank_dispatcher_backward.append(na_dim)
-        device_dispatcher = DeviceDispatcher(is_backward=True, na_dim=na_dim)
-        for sm in SUPPORTED_ARCHS:
-            device_dispatcher.append(sm)
-            dtype_dispatcher = DataTypeDispatcher(
-                is_backward=True, na_dim=na_dim, sm=sm
+    def build_variant(varlen: bool):
+        """Builds the dispatcher set and kernel-bundle list for one variant.
+
+        varlen=False reproduces this script's original (pre-varlen) output
+        exactly (kIsVarlen=false is appended/inserted as an explicit extra
+        template argument, but every name is unchanged). varlen=True mirrors
+        the same arch x dtype x rank x tile x causal enumeration -- no
+        support-surface narrowing -- into a distinctly-named parallel set
+        (kIsVarlen=true, kernel/dispatch-macro names carrying a `varlen`
+        marker) so it never shares a kernel symbol or a dispatch macro with
+        the fixed set.
+        """
+        device_dispatchers = []
+        dtype_dispatchers = []
+        cm_dispatchers = []
+        kernels = []
+
+        rank_dispatcher = RankDispatcher(is_backward=False, varlen=varlen)
+        for na_dim in NA_RANKS:
+            rank_dispatcher.append(na_dim)
+            device_dispatcher = DeviceDispatcher(
+                is_backward=False, na_dim=na_dim, varlen=varlen
             )
-            for dtype in CUDA_DTYPES:
-                if dtype.min_sm > sm:
-                    continue
-                dtype_dispatcher.append(dtype)
-                cm_dispatcher = CausalMaskDispatcher(
-                    is_backward=True, na_dim=na_dim, sm=sm, dtype=dtype
+            for sm in SUPPORTED_ARCHS:
+                device_dispatcher.append(sm)
+                dtype_dispatcher = DataTypeDispatcher(
+                    is_backward=False, na_dim=na_dim, sm=sm, varlen=varlen
                 )
-                for cm in CAUSAL_MASKS[na_dim]:
-                    cm_dispatcher.append(cm)
-                    kernels.append(
-                        FusedNAKernelBundle(
-                            is_backward=True,
-                            na_dim=na_dim,
-                            sm=sm,
-                            dtype=dtype,
-                            config_list=KernelConfigList(
+                for dtype in CUDA_DTYPES:
+                    if dtype.min_sm > sm:
+                        continue
+                    dtype_dispatcher.append(dtype)
+                    cm_dispatcher = CausalMaskDispatcher(
+                        is_backward=False,
+                        na_dim=na_dim,
+                        sm=sm,
+                        dtype=dtype,
+                        varlen=varlen,
+                    )
+                    for cm in CAUSAL_MASKS[na_dim]:
+                        cm_dispatcher.append(cm)
+                        kernels.append(
+                            FusedNAKernelBundle(
+                                is_backward=False,
                                 na_dim=na_dim,
                                 sm=sm,
-                                gemm_shapes=BACKWARD_GEMM_SHAPES[sm][
-                                    dtype
-                                ],  # GEMM_SHAPES[na_dim][sm]
-                            ),
-                            causal_mask=cm,
+                                dtype=dtype,
+                                config_list=KernelConfigList(
+                                    na_dim=na_dim,
+                                    sm=sm,
+                                    gemm_shapes=GEMM_SHAPES,
+                                    varlen=varlen,
+                                ),
+                                causal_mask=cm,
+                            )
                         )
-                    )
-                cm_dispatchers.append(cm_dispatcher)
-            dtype_dispatchers.append(dtype_dispatcher)
-        device_dispatchers.append(device_dispatcher)
+                    cm_dispatchers.append(cm_dispatcher)
+                dtype_dispatchers.append(dtype_dispatcher)
+            device_dispatchers.append(device_dispatcher)
 
-    #
+        # Backward kernels
+        rank_dispatcher_backward = RankDispatcher(is_backward=True, varlen=varlen)
+        for na_dim in NA_RANKS:
+            rank_dispatcher_backward.append(na_dim)
+            device_dispatcher = DeviceDispatcher(
+                is_backward=True, na_dim=na_dim, varlen=varlen
+            )
+            for sm in SUPPORTED_ARCHS:
+                device_dispatcher.append(sm)
+                dtype_dispatcher = DataTypeDispatcher(
+                    is_backward=True, na_dim=na_dim, sm=sm, varlen=varlen
+                )
+                for dtype in CUDA_DTYPES:
+                    if dtype.min_sm > sm:
+                        continue
+                    dtype_dispatcher.append(dtype)
+                    cm_dispatcher = CausalMaskDispatcher(
+                        is_backward=True,
+                        na_dim=na_dim,
+                        sm=sm,
+                        dtype=dtype,
+                        varlen=varlen,
+                    )
+                    for cm in CAUSAL_MASKS[na_dim]:
+                        cm_dispatcher.append(cm)
+                        kernels.append(
+                            FusedNAKernelBundle(
+                                is_backward=True,
+                                na_dim=na_dim,
+                                sm=sm,
+                                dtype=dtype,
+                                config_list=KernelConfigList(
+                                    na_dim=na_dim,
+                                    sm=sm,
+                                    gemm_shapes=BACKWARD_GEMM_SHAPES[sm][dtype],
+                                    varlen=varlen,
+                                ),
+                                causal_mask=cm,
+                            )
+                        )
+                    cm_dispatchers.append(cm_dispatcher)
+                dtype_dispatchers.append(dtype_dispatcher)
+            device_dispatchers.append(device_dispatcher)
+
+        rank_disp = rank_dispatcher.get_dispatcher()
+        rank_disp += rank_dispatcher_backward.get_dispatcher()
+
+        device_disp = ""
+        for device_d in device_dispatchers:
+            device_disp += device_d.get_dispatcher()
+
+        dtype_disp = ""
+        for dtype_d in dtype_dispatchers:
+            dtype_disp += dtype_d.get_dispatcher()
+
+        cm_disp = ""
+        for cm_d in cm_dispatchers:
+            cm_disp += cm_d.get_dispatcher()
+
+        headers = ""
+        for kernel in kernels:
+            headers += kernel.header()
+
+        return rank_disp, device_disp, dtype_disp, cm_disp, headers, kernels
 
     path_to_sources = f"{path}/autogen/src/cuda/fna/"
     rel_header = "natten_autogen/cuda/fna/"
@@ -798,70 +866,6 @@ def generate_cuda_kernels(path, num_splits=2):
     os.makedirs(path_to_sources, exist_ok=False)
     os.makedirs(path_to_header_dir, exist_ok=False)
 
-    path_headers = f"{path_to_header_dir}kernels.h"
-    path_rank = f"{path_to_header_dir}interface.h"
-    path_device = f"{path_to_header_dir}dispatch_device.h"
-    path_dtype = f"{path_to_header_dir}dispatch_dtype.h"
-    path_cm = f"{path_to_header_dir}dispatch_cm.h"
-
-    rel_path_headers = f"{rel_header}kernels.h"
-    rel_path_device = f"{rel_header}dispatch_device.h"
-    rel_path_dtype = f"{rel_header}dispatch_dtype.h"
-    rel_path_cm = f"{rel_header}dispatch_cm.h"
-
-    rank_disp = rank_dispatcher.get_dispatcher()
-    rank_disp += rank_dispatcher_backward.get_dispatcher()
-
-    device_disp = ""
-    for dispatcher in device_dispatchers:
-        device_disp += dispatcher.get_dispatcher()
-
-    dtype_disp = ""
-    for dispatcher in dtype_dispatchers:
-        dtype_disp += dispatcher.get_dispatcher()
-
-    cm_disp = ""
-    for dispatcher in cm_dispatchers:
-        cm_disp += dispatcher.get_dispatcher()
-
-    headers = ""
-    for kernel in kernels:
-        headers += kernel.header()
-
-    assert (
-        len(kernels) >= num_splits
-    ), f"Generated {len(kernels)} kernels, but got {num_splits=}."
-    split_size = len(kernels) // num_splits
-    num_splits_with_res = len(kernels) % num_splits
-    kernels_emitted = []
-    kernels_split = []
-    for split_idx in range(num_splits):
-        kernel_start_idx = split_size * split_idx + min(num_splits_with_res, split_idx)
-        num_kernels_in_split = split_size + (
-            1 if split_idx < num_splits_with_res else 0
-        )
-        kernel_end_idx = kernel_start_idx + num_kernels_in_split
-        assert kernel_end_idx <= len(kernels)
-        pth_set = set()
-        source_list = []
-        for kernel_idx in range(kernel_start_idx, kernel_end_idx):
-            kernel = kernels[kernel_idx]
-            pth_set.add(kernel.path_to_header)
-            source_list.append(kernel)
-            kernels_emitted.append(kernel_idx)
-        pth_set.add(rel_path_headers)
-        write_combined_source_file(
-            path_to_sources, f"source_{split_idx}.cu", sorted(pth_set), source_list
-        )
-        kernels_split.append(source_list)
-        # print(f"{split_idx=}, {kernel_start_idx=}, {kernel_end_idx=}, {len(kernels_emitted)=}")
-    assert split_idx == num_splits - 1, f"Expected {split_idx=} == {num_splits=} - 1"
-    assert len(kernels_emitted) == len(kernels)
-    assert sorted(kernels_emitted) == [
-        x for x in range(len(kernels))
-    ], f"{sorted(kernels_emitted)=}"
-    assert all(len(x) > 0 for x in kernels_split)
-
     namespaces = ["natten", "cuda", "fna"]
     cuda_headers = [
         "natten/natten.h",
@@ -869,17 +873,87 @@ def generate_cuda_kernels(path, num_splits=2):
         "natten/cuda/fna/kernel_forward.h",
         "natten/cuda/fna/kernel_backward.h",
     ]
-    write_header_file(
-        rank_disp, path_rank, namespaces, cuda_headers + [rel_path_device]
-    )
-    write_header_file(
-        device_disp, path_device, namespaces, cuda_headers + [rel_path_dtype]
-    )
-    write_header_file(dtype_disp, path_dtype, namespaces, cuda_headers + [rel_path_cm])
-    write_header_file(cm_disp, path_cm, namespaces, cuda_headers + [rel_path_headers])
-    # write_header_file(ks_disp, path_ks, namespaces, cuda_headers + [rel_path_di])
-    # write_header_file(di_disp, path_di, namespaces, cuda_headers + [rel_path_headers])
-    write_header_file(headers, path_headers, namespaces, cuda_headers)
+
+    def write_variant(varlen: bool):
+        """Writes one variant's dispatch headers and split source files
+        into the shared fna/ source and include directories -- varlen=False
+        under this script's original file names, varlen=True under a
+        parallel `_varlen`-suffixed set of file names (new translation
+        units, new dispatch macros, same directories)."""
+        name_suffix = "_varlen" if varlen else ""
+        source_prefix = "source_varlen_" if varlen else "source_"
+
+        path_headers = f"{path_to_header_dir}kernels{name_suffix}.h"
+        path_rank = f"{path_to_header_dir}interface{name_suffix}.h"
+        path_device = f"{path_to_header_dir}dispatch_device{name_suffix}.h"
+        path_dtype = f"{path_to_header_dir}dispatch_dtype{name_suffix}.h"
+        path_cm = f"{path_to_header_dir}dispatch_cm{name_suffix}.h"
+
+        rel_path_headers = f"{rel_header}kernels{name_suffix}.h"
+        rel_path_device = f"{rel_header}dispatch_device{name_suffix}.h"
+        rel_path_dtype = f"{rel_header}dispatch_dtype{name_suffix}.h"
+        rel_path_cm = f"{rel_header}dispatch_cm{name_suffix}.h"
+
+        rank_disp, device_disp, dtype_disp, cm_disp, headers, kernels = build_variant(
+            varlen
+        )
+
+        assert (
+            len(kernels) >= num_splits
+        ), f"Generated {len(kernels)} kernels, but got {num_splits=}."
+        split_size = len(kernels) // num_splits
+        num_splits_with_res = len(kernels) % num_splits
+        kernels_emitted = []
+        kernels_split = []
+        for split_idx in range(num_splits):
+            kernel_start_idx = split_size * split_idx + min(
+                num_splits_with_res, split_idx
+            )
+            num_kernels_in_split = split_size + (
+                1 if split_idx < num_splits_with_res else 0
+            )
+            kernel_end_idx = kernel_start_idx + num_kernels_in_split
+            assert kernel_end_idx <= len(kernels)
+            pth_set = set()
+            source_list = []
+            for kernel_idx in range(kernel_start_idx, kernel_end_idx):
+                kernel = kernels[kernel_idx]
+                pth_set.add(kernel.path_to_header)
+                source_list.append(kernel)
+                kernels_emitted.append(kernel_idx)
+            pth_set.add(rel_path_headers)
+            write_combined_source_file(
+                path_to_sources,
+                f"{source_prefix}{split_idx}.cu",
+                sorted(pth_set),
+                source_list,
+            )
+            kernels_split.append(source_list)
+        assert (
+            split_idx == num_splits - 1
+        ), f"Expected {split_idx=} == {num_splits=} - 1"
+        assert len(kernels_emitted) == len(kernels)
+        assert sorted(kernels_emitted) == [
+            x for x in range(len(kernels))
+        ], f"{sorted(kernels_emitted)=}"
+        assert all(len(x) > 0 for x in kernels_split)
+
+        write_header_file(
+            rank_disp, path_rank, namespaces, cuda_headers + [rel_path_device]
+        )
+        write_header_file(
+            device_disp, path_device, namespaces, cuda_headers + [rel_path_dtype]
+        )
+        write_header_file(
+            dtype_disp, path_dtype, namespaces, cuda_headers + [rel_path_cm]
+        )
+        write_header_file(
+            cm_disp, path_cm, namespaces, cuda_headers + [rel_path_headers]
+        )
+        write_header_file(headers, path_headers, namespaces, cuda_headers)
+
+    write_variant(varlen=False)
+    write_variant(varlen=True)
 
 
 def generate_cuda_fused(output_directory: str, num_splits: int):

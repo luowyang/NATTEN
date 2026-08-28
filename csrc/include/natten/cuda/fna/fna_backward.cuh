@@ -46,6 +46,7 @@
 #include <natten/cuda/fna/na_utils.cuh>
 
 #include <natten_autogen/cuda/fna/interface.h>
+#include <natten_autogen/cuda/fna/interface_varlen.h>
 
 namespace natten {
 namespace cuda {
@@ -89,7 +90,8 @@ void fna_backward_generic(
     float attn_scale,
     IntTuple query_tile_shape,
     IntTuple key_tile_shape,
-    IntTuple num_splits_key) {
+    IntTuple num_splits_key,
+    const VarlenFnaBackwardMeta* varlen_meta = nullptr) {
   static constexpr auto kRank =
       std::tuple_size<decltype(spatial_extent)>::value;
   using Dim = typename GetDim<kRank>::type;
@@ -147,6 +149,12 @@ void fna_backward_generic(
     p.head_dim_value = dim_value;
     p.num_queries = tuple_to_na_dim<Dim>(spatial_extent);
     p.num_batches = batch_size;
+    if constexpr (Kernel::kIsVarlen) {
+      // Only varlen-true instantiations have a `varlen` member (see
+      // kernel_backward.h); only varlen-true instantiations are ever
+      // reached with a non-null varlen_meta (see the dispatch fork below).
+      p.varlen = *varlen_meta;
+    }
 
     p.kernel_size = tuple_to_na_dim<Dim>(kernel_size);
     p.stride = tuple_to_na_dim<Dim>(stride);
@@ -207,7 +215,15 @@ void fna_backward_generic(
     // }
   };
 
-  DISPATCH_FNA_BACKWARD_KERNEL(kRank, cc, dtype, is_causal, launchKernel);
+  // Varlen calls (varlen_meta != nullptr) route to the kIsVarlen=true
+  // instantiations (separate translation units, separate dispatch macros);
+  // the fixed path's own dispatch call is untouched.
+  if (varlen_meta != nullptr) {
+    DISPATCH_FNA_BACKWARD_VARLEN_KERNEL(
+        kRank, cc, dtype, is_causal, launchKernel);
+  } else {
+    DISPATCH_FNA_BACKWARD_KERNEL(kRank, cc, dtype, is_causal, launchKernel);
+  }
   NATTEN_CHECK(
       kernel_launched,
       "Could not find a compatible fused neighborhood attention backward kernel.");

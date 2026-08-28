@@ -23,6 +23,8 @@
 
 #pragma once
 #include <ATen/ATen.h>
+#include <limits>
+#include <tuple>
 
 #define CHECK_CONTIGUOUS(x)                                     \
   TORCH_CHECK(not x.is_sparse(), #x " must be a dense tensor"); \
@@ -456,6 +458,47 @@ inline void AssertDimsAre128BitAligned(
       "to meet the 128-bit alignment constraint, got ",
       head_dim_value,
       ".");
+}
+
+template <typename StdTuple>
+int64_t CheckedPositiveTupleProduct(const StdTuple& values, const char* name) {
+  int64_t product = 1;
+  auto accumulate = [&](int64_t value) {
+    TORCH_CHECK(value > 0, name, " entries must be positive.");
+    TORCH_CHECK(
+        product <= std::numeric_limits<int64_t>::max() / value,
+        name,
+        " product exceeds int64.");
+    product *= value;
+  };
+  std::apply([&](auto... value) { (accumulate(value), ...); }, values);
+  return product;
+}
+
+// Overflow-only counterpart to CheckedPositiveTupleProduct: for callers that
+// have already established positivity for every entry (e.g. via CheckArgs),
+// this avoids re-asserting it while still catching int64 overflow.
+template <typename StdTuple>
+int64_t CheckedTupleProduct(const StdTuple& values, const char* name) {
+  int64_t product = 1;
+  auto accumulate = [&](int64_t value) {
+    TORCH_CHECK(
+        product <= std::numeric_limits<int64_t>::max() / value,
+        name,
+        " product exceeds int64.");
+    product *= value;
+  };
+  std::apply([&](auto... value) { (accumulate(value), ...); }, values);
+  return product;
+}
+
+inline int64_t CheckedMul(int64_t lhs, int64_t rhs, const char* name) {
+  TORCH_CHECK(lhs >= 0 && rhs >= 0, name, " has a negative factor.");
+  TORCH_CHECK(
+      lhs == 0 || rhs <= std::numeric_limits<int64_t>::max() / lhs,
+      name,
+      " overflows int64.");
+  return lhs * rhs;
 }
 
 } // namespace natten

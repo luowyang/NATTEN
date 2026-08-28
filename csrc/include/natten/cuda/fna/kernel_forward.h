@@ -111,7 +111,11 @@ template <
     int kQueriesPerBlock_,
     int kKeysPerBlock_,
     // upperbound on `max(value.shape[-1], query.shape[-1])`
-    int kMaxK_ = (int)cutlass::platform::numeric_limits<uint32_t>::max()>
+    int kMaxK_,
+    // Compile-time varlen/fixed selector. No default: every instantiation
+    // site must say which one it wants (see natten/cuda/fna/na_utils.cuh
+    // for the rationale).
+    bool kIsVarlen_>
 struct FusedNeighborhoodAttentionKernel {
   static constexpr int NADim = NADim_;
   static_assert(NADim >= 1 && NADim < 4, "Only 1D-3D NA are implemented.");
@@ -122,6 +126,7 @@ struct FusedNeighborhoodAttentionKernel {
   static constexpr int kKeysPerBlock = kKeysPerBlock_;
   static constexpr int kQueriesPerBlock = kQueriesPerBlock_;
   static constexpr int kMaxK = kMaxK_;
+  static constexpr bool kIsVarlen = kIsVarlen_;
 
   // static constexpr Dim QueryTileShape = MapTileSizeToNd<kQueriesPerBlock,
   // NADim>::value; static constexpr Dim KeyTileShape =
@@ -157,7 +162,10 @@ struct FusedNeighborhoodAttentionKernel {
   static constexpr int kMinBlocksPerSm =
       getWarpsPerSmFw<scalar_t, ArchTag>() / kNumWarpsPerBlock;
 
-  struct Params {
+  struct Params : std::conditional_t<
+                      kIsVarlen,
+                      VarlenForwardParamsExtra,
+                      NoVarlenForwardMeta> {
     // Input tensors
     scalar_t* query_ptr = nullptr; // [..., num_heads, head_dim]
     scalar_t* key_ptr = nullptr; // [..., num_heads, head_dim]
@@ -204,131 +212,267 @@ struct FusedNeighborhoodAttentionKernel {
     // Moves pointers to what we should process
     // Returns "false" if there is no work to do
     CUTLASS_DEVICE bool advance_to_block() {
-      num_queries_post_partitioning = ceil_div_dim(num_queries, dilation);
+      if constexpr (kIsVarlen) {
+        const int64_t work_item = static_cast<int64_t>(blockIdx.x);
+        const auto batch_id = this->varlen.forward_worklist[work_item * 2];
+        this->query_tile_id = this->varlen.forward_worklist[work_item * 2 + 1];
+#ifdef NATTEN_ENABLE_DEVICE_SIDE_ASSERTIONS
+        assert(batch_id >= 0 && batch_id < num_batches);
+        assert(this->query_tile_id >= 0);
+#endif
+        num_queries = device_ptr_to_na_dim<Dim>(
+            this->varlen.token_layouts + (int64_t)batch_id * NADim);
+        const int32_t token_start = this->varlen.cumulative_seqlens[batch_id];
+        num_queries_post_partitioning = ceil_div_dim(num_queries, dilation);
 
-      auto batch_id = blockIdx.z;
-      auto bidxy = blockIdx.y;
-      auto dilation_size = dilation.prod32();
-      auto dilation_dim_idx = (int32_t)bidxy % dilation_size;
-      auto dilation_idx = map_index_to_coord(dilation_dim_idx, dilation);
-      auto head_id = bidxy / dilation_size;
+        auto bidxy = blockIdx.y;
+        auto dilation_size = dilation.prod32();
+        auto dilation_dim_idx = (int32_t)bidxy % dilation_size;
+        auto dilation_idx = map_index_to_coord(dilation_dim_idx, dilation);
+        auto head_id = bidxy / dilation_size;
 
-      auto q_strideH = head_dim;
-      auto k_strideH = head_dim;
-      auto v_strideH = head_dim_value;
-      auto o_strideH = head_dim_value;
+        auto q_strideH = head_dim;
+        auto k_strideH = head_dim;
+        auto v_strideH = head_dim_value;
+        auto o_strideH = head_dim_value;
 
-      auto q_heads_dims = num_heads * q_strideH;
-      auto k_heads_dims = num_heads * k_strideH;
-      auto v_heads_dims = num_heads * v_strideH;
-      auto o_heads_dims = num_heads * o_strideH;
+        auto q_heads_dims = num_heads * q_strideH;
+        auto k_heads_dims = num_heads * k_strideH;
+        auto v_heads_dims = num_heads * v_strideH;
+        auto o_heads_dims = num_heads * o_strideH;
 
-      auto q_stride_dilation = compute_stride(num_queries, q_heads_dims);
-      auto k_stride_dilation = compute_stride(num_queries, k_heads_dims);
-      auto v_stride_dilation = compute_stride(num_queries, v_heads_dims);
-      auto o_stride_dilation = compute_stride(num_queries, o_heads_dims);
+        auto q_stride_dilation = compute_stride(num_queries, q_heads_dims);
+        auto k_stride_dilation = compute_stride(num_queries, k_heads_dims);
+        auto v_stride_dilation = compute_stride(num_queries, v_heads_dims);
+        auto o_stride_dilation = compute_stride(num_queries, o_heads_dims);
 
-      q_strideM = q_stride_dilation * dilation;
-      k_strideM = k_stride_dilation * dilation;
-      v_strideM = v_stride_dilation * dilation;
-      o_strideM = o_stride_dilation * dilation;
+        q_strideM = q_stride_dilation * dilation;
+        k_strideM = k_stride_dilation * dilation;
+        v_strideM = v_stride_dilation * dilation;
+        o_strideM = o_stride_dilation * dilation;
 
-      auto q_strideB = num_queries.prod() * q_heads_dims;
-      auto k_strideB = num_queries.prod() * k_heads_dims;
-      auto v_strideB = num_queries.prod() * v_heads_dims;
-      auto o_strideB = num_queries.prod() * o_heads_dims;
+        // This is where qkv shape is corrected:
+        maybe_mask_qk_tiles(
+            num_queries_post_partitioning, num_queries, dilation, dilation_idx);
 
-      // This is where qkv shape is corrected:
-      maybe_mask_qk_tiles(
-          num_queries_post_partitioning, num_queries, dilation, dilation_idx);
+        // NOTE: causal mask is antithetical to being fully block sparse.
+        // While there are cases where a causal mask has mostly dense
+        // blocks, the last one (at least) will always be causally masked.
+        // Fast paths for block sparsity in FNA are limited to masks that
+        // are guaranteed to be fully block sparse only.
+        is_fully_block_sparse = not kHasCausalDims &&
+            fully_block_sparse(
+                num_queries_post_partitioning,
+                kernel_size,
+                stride,
+                query_tile_shape,
+                key_tile_shape);
 
-      // NOTE: causal mask is antithetical to being fully block sparse.
-      // While there are cases where a causal mask has mostly dense blocks, the
-      // last one (at least) will always be causally masked. Fast paths for
-      // block sparsity in FNA are limited to masks that are guaranteed to be
-      // fully block sparse only.
-      is_fully_block_sparse = not kHasCausalDims &&
-          fully_block_sparse(
-              num_queries_post_partitioning,
-              kernel_size,
-              stride,
-              query_tile_shape,
-              key_tile_shape);
+        has_kv_padding =
+            not evenly_divides(num_queries_post_partitioning, key_tile_shape);
 
-      has_kv_padding =
-          not evenly_divides(num_queries_post_partitioning, key_tile_shape);
+        cta_shape_x =
+            ceil_div_dim(num_queries_post_partitioning, query_tile_shape);
 
-      cta_shape_x =
-          ceil_div_dim(num_queries_post_partitioning, query_tile_shape);
+        if (this->query_tile_id >= cta_shape_x.prod32()) {
+          return false;
+        }
 
-      const auto first_query =
-          map_index_to_coord((int32_t)blockIdx.x, cta_shape_x) *
-          query_tile_shape;
+        const auto first_query =
+            map_index_to_coord(this->query_tile_id, cta_shape_x) *
+            query_tile_shape;
 
-      // Advance to current batch
-      query_ptr += batch_id * q_strideB;
-      key_ptr += batch_id * k_strideB;
-      value_ptr += batch_id * v_strideB;
-      output_ptr += batch_id * o_strideB;
-      if (output_accum_ptr != nullptr) {
-        output_accum_ptr += batch_id * o_strideB;
-      }
+        // Advance to current batch (packed [N, H, D] layout: batch offset
+        // is the document's starting token, not batch_id * strideB)
+        query_ptr += (int64_t)token_start * q_heads_dims;
+        key_ptr += (int64_t)token_start * k_heads_dims;
+        value_ptr += (int64_t)token_start * v_heads_dims;
+        output_ptr += (int64_t)token_start * o_heads_dims;
+        if (output_accum_ptr != nullptr) {
+          output_accum_ptr += (int64_t)token_start * o_heads_dims;
+        }
 
-      // Advance to the current batch / head / first_query
-      query_ptr += (first_query * q_strideM).sum() +
-          (dilation_idx * q_stride_dilation).sum() + head_id * q_strideH;
-      key_ptr += (dilation_idx * k_stride_dilation).sum() + head_id * k_strideH;
-      value_ptr +=
-          (dilation_idx * v_stride_dilation).sum() + head_id * v_strideH;
-      output_ptr += (first_query * o_strideM).sum() +
-          (dilation_idx * o_stride_dilation).sum() + head_id * o_strideH;
-
-      if (output_accum_ptr != nullptr) {
-        output_accum_ptr += (first_query * o_strideM).sum() +
+        // Advance to the current batch / head / first_query
+        query_ptr += (first_query * q_strideM).sum() +
+            (dilation_idx * q_stride_dilation).sum() + head_id * q_strideH;
+        key_ptr +=
+            (dilation_idx * k_stride_dilation).sum() + head_id * k_strideH;
+        value_ptr +=
+            (dilation_idx * v_stride_dilation).sum() + head_id * v_strideH;
+        output_ptr += (first_query * o_strideM).sum() +
             (dilation_idx * o_stride_dilation).sum() + head_id * o_strideH;
+
+        if (output_accum_ptr != nullptr) {
+          output_accum_ptr += (first_query * o_strideM).sum() +
+              (dilation_idx * o_stride_dilation).sum() + head_id * o_strideH;
+        } else {
+          // Accumulate directly in the destination buffer (eg for f32)
+          output_accum_ptr = (accum_t*)output_ptr;
+        }
+
+        if (logsumexp_ptr != nullptr) {
+          auto lse_stride_dilation = compute_stride(num_queries, num_heads);
+          lse_strideM = lse_stride_dilation * dilation;
+
+          // NOTE(alih): we don't pad for 128-bit alignment like in
+          // xFormers, because we have to rewrite the vector iterator in
+          // the backward kernel into a gather op.
+          // lse[batch_id, query_start, head_id]
+          logsumexp_ptr += (int64_t)token_start * num_heads +
+              ((first_query * lse_strideM).sum() +
+               (dilation_idx * lse_stride_dilation).sum()) +
+              head_id;
+        }
+
+        num_batches = 0; // no longer used after
+
+        // Make sure the compiler knows these variables are the same on all
+        // the threads of the warp.
+        // Only worth doing if they could have been modified above.
+        query_ptr = gemm_kernel_utils::warp_uniform(query_ptr);
+        key_ptr = gemm_kernel_utils::warp_uniform(key_ptr);
+        value_ptr = gemm_kernel_utils::warp_uniform(value_ptr);
+        output_ptr = gemm_kernel_utils::warp_uniform(output_ptr);
+        output_accum_ptr = gemm_kernel_utils::warp_uniform(output_accum_ptr);
+        logsumexp_ptr = gemm_kernel_utils::warp_uniform(logsumexp_ptr);
+        num_heads = gemm_kernel_utils::warp_uniform(num_heads);
+        return true;
       } else {
-        // Accumulate directly in the destination buffer (eg for f32)
-        output_accum_ptr = (accum_t*)output_ptr;
+        num_queries_post_partitioning = ceil_div_dim(num_queries, dilation);
+
+        auto batch_id = blockIdx.z;
+        auto bidxy = blockIdx.y;
+        auto dilation_size = dilation.prod32();
+        auto dilation_dim_idx = (int32_t)bidxy % dilation_size;
+        auto dilation_idx = map_index_to_coord(dilation_dim_idx, dilation);
+        auto head_id = bidxy / dilation_size;
+
+        auto q_strideH = head_dim;
+        auto k_strideH = head_dim;
+        auto v_strideH = head_dim_value;
+        auto o_strideH = head_dim_value;
+
+        auto q_heads_dims = num_heads * q_strideH;
+        auto k_heads_dims = num_heads * k_strideH;
+        auto v_heads_dims = num_heads * v_strideH;
+        auto o_heads_dims = num_heads * o_strideH;
+
+        auto q_stride_dilation = compute_stride(num_queries, q_heads_dims);
+        auto k_stride_dilation = compute_stride(num_queries, k_heads_dims);
+        auto v_stride_dilation = compute_stride(num_queries, v_heads_dims);
+        auto o_stride_dilation = compute_stride(num_queries, o_heads_dims);
+
+        q_strideM = q_stride_dilation * dilation;
+        k_strideM = k_stride_dilation * dilation;
+        v_strideM = v_stride_dilation * dilation;
+        o_strideM = o_stride_dilation * dilation;
+
+        auto q_strideB = num_queries.prod() * q_heads_dims;
+        auto k_strideB = num_queries.prod() * k_heads_dims;
+        auto v_strideB = num_queries.prod() * v_heads_dims;
+        auto o_strideB = num_queries.prod() * o_heads_dims;
+
+        // This is where qkv shape is corrected:
+        maybe_mask_qk_tiles(
+            num_queries_post_partitioning, num_queries, dilation, dilation_idx);
+
+        // NOTE: causal mask is antithetical to being fully block sparse.
+        // While there are cases where a causal mask has mostly dense
+        // blocks, the last one (at least) will always be causally masked.
+        // Fast paths for block sparsity in FNA are limited to masks that
+        // are guaranteed to be fully block sparse only.
+        is_fully_block_sparse = not kHasCausalDims &&
+            fully_block_sparse(
+                num_queries_post_partitioning,
+                kernel_size,
+                stride,
+                query_tile_shape,
+                key_tile_shape);
+
+        has_kv_padding =
+            not evenly_divides(num_queries_post_partitioning, key_tile_shape);
+
+        cta_shape_x =
+            ceil_div_dim(num_queries_post_partitioning, query_tile_shape);
+
+        const auto first_query =
+            map_index_to_coord((int32_t)blockIdx.x, cta_shape_x) *
+            query_tile_shape;
+
+        // Advance to current batch
+        query_ptr += batch_id * q_strideB;
+        key_ptr += batch_id * k_strideB;
+        value_ptr += batch_id * v_strideB;
+        output_ptr += batch_id * o_strideB;
+        if (output_accum_ptr != nullptr) {
+          output_accum_ptr += batch_id * o_strideB;
+        }
+
+        // Advance to the current batch / head / first_query
+        query_ptr += (first_query * q_strideM).sum() +
+            (dilation_idx * q_stride_dilation).sum() + head_id * q_strideH;
+        key_ptr +=
+            (dilation_idx * k_stride_dilation).sum() + head_id * k_strideH;
+        value_ptr +=
+            (dilation_idx * v_stride_dilation).sum() + head_id * v_strideH;
+        output_ptr += (first_query * o_strideM).sum() +
+            (dilation_idx * o_stride_dilation).sum() + head_id * o_strideH;
+
+        if (output_accum_ptr != nullptr) {
+          output_accum_ptr += (first_query * o_strideM).sum() +
+              (dilation_idx * o_stride_dilation).sum() + head_id * o_strideH;
+        } else {
+          // Accumulate directly in the destination buffer (eg for f32)
+          output_accum_ptr = (accum_t*)output_ptr;
+        }
+
+        if (logsumexp_ptr != nullptr) {
+          auto lse_stride_dilation = compute_stride(num_queries, num_heads);
+          lse_strideM = lse_stride_dilation * dilation;
+
+          // NOTE(alih): we don't pad for 128-bit alignment like in
+          // xFormers, because we have to rewrite the vector iterator in
+          // the backward kernel into a gather op.
+          // auto lse_dim = cutlass::ceil_div((int32_t)num_queries.prod32(),
+          // kAlignLSE) * kAlignLSE;
+          // lse[batch_id, query_start, head_id]
+          logsumexp_ptr += batch_id * num_queries.prod32() * num_heads +
+              ((first_query * lse_strideM).sum() +
+               (dilation_idx * lse_stride_dilation).sum()) +
+              head_id;
+        }
+
+        num_batches = 0; // no longer used after
+        // dilation = 0;
+
+        // Make sure the compiler knows these variables are the same on all
+        // the threads of the warp.
+        // Only worth doing if they could have been modified above.
+        query_ptr = gemm_kernel_utils::warp_uniform(query_ptr);
+        key_ptr = gemm_kernel_utils::warp_uniform(key_ptr);
+        value_ptr = gemm_kernel_utils::warp_uniform(value_ptr);
+        output_ptr = gemm_kernel_utils::warp_uniform(output_ptr);
+        output_accum_ptr = gemm_kernel_utils::warp_uniform(output_accum_ptr);
+        logsumexp_ptr = gemm_kernel_utils::warp_uniform(logsumexp_ptr);
+        num_heads = gemm_kernel_utils::warp_uniform(num_heads);
+        return true;
       }
-
-      if (logsumexp_ptr != nullptr) {
-        auto lse_stride_dilation = compute_stride(num_queries, num_heads);
-        lse_strideM = lse_stride_dilation * dilation;
-
-        // NOTE(alih): we don't pad for 128-bit alignment like in xFormers,
-        // because we have to rewrite the vector iterator in the backward
-        // kernel into a gather op.
-        // auto lse_dim = cutlass::ceil_div((int32_t)num_queries.prod32(),
-        // kAlignLSE) * kAlignLSE;
-        // lse[batch_id, query_start, head_id]
-        logsumexp_ptr += batch_id * num_queries.prod32() * num_heads +
-            ((first_query * lse_strideM).sum() +
-             (dilation_idx * lse_stride_dilation).sum()) +
-            head_id;
-      }
-
-      num_batches = 0; // no longer used after
-      // dilation = 0;
-
-      // Make sure the compiler knows these variables are the same on all
-      // the threads of the warp.
-      // Only worth doing if they could have been modified above.
-      query_ptr = gemm_kernel_utils::warp_uniform(query_ptr);
-      key_ptr = gemm_kernel_utils::warp_uniform(key_ptr);
-      value_ptr = gemm_kernel_utils::warp_uniform(value_ptr);
-      output_ptr = gemm_kernel_utils::warp_uniform(output_ptr);
-      output_accum_ptr = gemm_kernel_utils::warp_uniform(output_accum_ptr);
-      logsumexp_ptr = gemm_kernel_utils::warp_uniform(logsumexp_ptr);
-      num_heads = gemm_kernel_utils::warp_uniform(num_heads);
-      return true;
     }
 
     __host__ dim3 getBlocksGrid() const {
-      return dim3(
-          ceil_div_dim(ceil_div_dim(num_queries, dilation), query_tile_shape)
-              .prod32(),
-          num_heads * dilation.prod32(),
-          num_batches);
+      if constexpr (kIsVarlen) {
+        return dim3(
+            static_cast<uint32_t>(this->varlen.forward_work_count),
+            static_cast<uint32_t>(
+                static_cast<int64_t>(num_heads) * dilation.prod32()),
+            1);
+      } else {
+        return dim3(
+            ceil_div_dim(ceil_div_dim(num_queries, dilation), query_tile_shape)
+                .prod32(),
+            num_heads * dilation.prod32(),
+            num_batches);
+      }
     }
 
     __host__ dim3 getThreadsGrid() const {
@@ -583,8 +727,14 @@ struct FusedNeighborhoodAttentionKernel {
     auto& s_prime = shared_storage.s_prime;
     auto& mi = shared_storage.mi;
     auto& out_rescale = shared_storage.out_rescale;
-    auto first_query = map_index_to_coord((int32_t)blockIdx.x, p.cta_shape_x) *
-        p.query_tile_shape;
+    Dim first_query;
+    if constexpr (kIsVarlen) {
+      first_query = map_index_to_coord(p.query_tile_id, p.cta_shape_x) *
+          p.query_tile_shape;
+    } else {
+      first_query = map_index_to_coord((int32_t)blockIdx.x, p.cta_shape_x) *
+          p.query_tile_shape;
+    }
     auto problem_size_0_m = fast_min(
         p.query_tile_shape, p.num_queries_post_partitioning - first_query);
     auto last_query = first_query + problem_size_0_m - 1;
