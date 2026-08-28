@@ -33,3 +33,15 @@ best configuration.
           members:
               - attention
               - merge_attentions
+
+## Variable-length Neighborhood Attention
+
+::: natten
+    options:
+          heading_level: 3
+          show_object_full_path: true
+          members:
+              - na1d_varlen
+              - na2d_varlen
+              - na3d_varlen
+              - VarlenLayout

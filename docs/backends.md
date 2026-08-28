@@ -19,6 +19,11 @@ Use `torch.compile` in earlier versions at your own risk.
 - [x] MLA support (head_dim != head_dim_v)
 - [x] torch.compile support without graph breaks
 
+**FNA-specific features**
+
+- [x] Causal masking
+- [x] Variable length with sequence-packed format
+
 **FMHA-specific features**
 
 - [x] Causal masking
@@ -35,7 +40,69 @@ Based on
 (a.k.a. _memory-efficient attention_), this kernel is based on the CUTLASS 2.X API, and targets
 multiple architectures: SM50 (Maxwell), SM70 (Volta), SM75 (Turing), and SM80 (Ampere).
 You can use these kernels on any NVIDIA GPU with compute capability >= 5.0, and
-both for training and inference.
+both for training and inference. FP16 and FP32 inputs require compute capability
+>= 5.0; BF16 inputs require compute capability >= 8.0.
+
+Variable-length FNA packs independent documents into QKV tensors shaped
+`[total_tokens, heads, head_dim]` (no batch dimension, no capacity padding --
+`total_tokens` must equal the layout's total exactly). Build a
+[`VarlenLayout`][natten.VarlenLayout] once, then reuse it from eager or
+compiled code, across layers, geometries, and AMP dtypes.
+
+[`from_tensor_list`][natten.VarlenLayout.from_tensor_list] is the supported
+construction path: it builds the layout and packs a list of per-document
+tensors in one call, guaranteeing layout/data consistency at construction
+time:
+
+```python
+layout, query = natten.VarlenLayout.from_tensor_list([doc0_q, doc1_q])
+```
+
+Advanced construction / interoperability: a layout can also be built
+directly from already-known per-document shapes. This validates only
+metadata-local invariants -- the caller is then responsible for keeping
+every packed tensor used with the layout in the same document order and
+token layout, since NATTEN cannot infer that from the packed tensor alone:
+
+```python
+layout = natten.VarlenLayout(
+    [(25, 16, 16), (61, 8, 8)],
+    device=query.device,
+)
+output = natten.na3d_varlen(
+    query,
+    key,
+    value,
+    layout,
+    kernel_size=(5, 8, 8),
+    backend="cutlass-fna",
+)
+```
+
+A document may be empty (zero tokens along any axis); an empty document is an
+exact no-op, and a layout whose documents are all empty returns correctly-shaped
+empty outputs without a kernel launch. All documents in one layout share the
+same spatial rank; `kernel_size`, `stride`, `dilation`, and the causal mask are
+per-call arguments, not bound to the layout, so the same layout can be reused
+across different geometries. A `VarlenLayout` defines the document order for
+the packed tensors used with it. Its derived metadata is built on the stream
+current at first use of a geometry; consuming it from a different stream
+afterwards is the caller's responsibility to order, same as any other tensor
+shared across streams.
+
+!!! warning
+    A mismatched packing computes attention over the wrong neighborhoods
+    without an error. Prefer `from_tensor_list` over direct construction
+    when the packed data isn't already fixed elsewhere -- it structurally
+    rules this out.
+
+Resolving a geometry while deterministic algorithms are enabled selects a
+single (serialized) backward KV split per document for that geometry,
+matching fixed FNA; resolving the same geometry again under a different
+determinism setting builds its own memo entry instead of reusing or
+rejecting the earlier one. As with fixed FNA, grouped-query and multi-query
+attention repeat packed key/value heads internally and therefore use memory
+proportional to the expanded query head count.
 
 Some newer architectures such as Hopper (SM90), and Blackwell DC-class (SM100, SM103) have much
 more performant dedicated kernels.
@@ -47,6 +114,29 @@ To read more about this, we refer you to our
 proposed solutions such as Token Permutation, which we use to build our
 [Hopper](#hopper-fna-fmha) and [Blackwell](#blackwell-fna-fmha) kernels.
 
+### Design notes
+
+[`VarlenLayout`][natten.VarlenLayout]'s construction and
+[`split`][natten.VarlenLayout.split]/[`from_tensor_list`][natten.VarlenLayout.from_tensor_list]
+mirror xFormers' `BlockDiagonalMask`. Unlike that class, a `VarlenLayout` also owns **mutable,
+per-object derived schedule state** (worklists, KV-split selection, resolved tile configs), one
+entry per neighborhood-attention geometry (kernel size, dilation, query head count, backward
+KV-split cap, deterministic flag, the KV-parallelism switch, the grid bound the memory-usage
+preference resolves to, resolved forward and backward tile configs, dtype, device -- stride and
+the causal mask are not part of the key: they act per-call inside the kernel and do not influence
+how this metadata is built). Derived state lives on the layout, rather than a separate plan
+object, because its derivation inputs (kernel size, dilation, dtype, ...) only arrive per call --
+derivation is necessarily lazy and per-geometry, and holding the resulting cache on the
+caller-owned object follows the same pattern as FlashInfer's wrapper objects and xFormers'
+`BlockDiagonalMask` (derived state lives on an object the caller already holds, and is reclaimed
+with it); a separate plan type would push a second object into every call site without changing
+what is cached or when. Building that metadata is the expensive part of variable-length FNA, so
+the same `VarlenLayout` should be reused across calls -- and across layers, geometries, and AMP
+dtypes, since the object only fixes document composition, not any of those -- rather than
+reconstructed every step. Derived state lives only on this object and only for its lifetime:
+distinct instances never share entries, and a discarded instance's state is reclaimed with it.
+Growth is one entry per distinct geometry used on this object; recreate the layout if that set
+must be unbounded.
 
 ### Finding configurations
 
