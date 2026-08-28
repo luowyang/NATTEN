@@ -66,6 +66,12 @@ try:
         token_unpermute_1d,
         token_unpermute_2d,
         token_unpermute_3d,
+        varlen_na1d_backward,
+        varlen_na1d_forward,
+        varlen_na2d_backward,
+        varlen_na2d_forward,
+        varlen_na3d_backward,
+        varlen_na3d_forward,
     )
 
 except ImportError:
@@ -109,6 +115,12 @@ except ImportError:
         token_unpermute_1d,
         token_unpermute_2d,
         token_unpermute_3d,
+        varlen_na1d_backward,
+        varlen_na1d_forward,
+        varlen_na2d_backward,
+        varlen_na2d_forward,
+        varlen_na3d_backward,
+        varlen_na3d_forward,
     )
 
 
@@ -150,4 +162,10 @@ __all__ = [
     "token_unpermute_1d",
     "token_unpermute_2d",
     "token_unpermute_3d",
+    "varlen_na1d_backward",
+    "varlen_na1d_forward",
+    "varlen_na2d_backward",
+    "varlen_na2d_forward",
+    "varlen_na3d_backward",
+    "varlen_na3d_forward",
 ]
