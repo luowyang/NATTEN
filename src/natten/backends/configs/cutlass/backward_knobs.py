@@ -30,7 +30,7 @@
 
 import itertools
 import math
-from typing import Optional
+from typing import Optional, Sequence, Tuple
 
 from torch import Tensor
 
@@ -172,6 +172,61 @@ def get_default_kv_splits_backward(
             )
 
     return kv_splits
+
+
+def get_default_varlen_fna_kv_splits(
+    input_shapes: Sequence[DimensionType],
+    num_heads: int,
+    dilation: DimensionType,
+    kv_tile_shape: DimensionType,
+    deterministic: bool,
+    kv_parallelism_enabled: bool,
+    max_grid_size: int,
+) -> Tuple[DimensionType, ...]:
+    """Selects per-document KV splits for sequence-packed FNA.
+
+    ``kv_parallelism_enabled`` and ``max_grid_size`` are snapshots of the
+    otherwise-global KV-parallelism switch and memory-usage-preference-
+    derived grid bound, taken once by the caller (whose result this feeds a
+    memo keyed on those same snapshots) rather than read here -- this
+    function must stay a pure function of its arguments so a memo hit is
+    never stale relative to either global's current value.
+    """
+    if not input_shapes:
+        raise ValueError("input_shapes must contain at least one token layout.")
+    if num_heads <= 0:
+        raise ValueError(f"num_heads must be positive, got {num_heads}.")
+
+    na_dim = len(input_shapes[0])
+    if na_dim not in [1, 2, 3]:
+        raise ValueError(f"Only 1-D, 2-D, and 3-D FNA are supported, got {na_dim}-D.")
+    if any(len(shape) != na_dim for shape in input_shapes):
+        raise ValueError("All token layouts must have the same dimensionality.")
+
+    min_splits = get_min_splits(na_dim)
+    if deterministic or not kv_parallelism_enabled:
+        return tuple(min_splits for _ in input_shapes)
+
+    max_splits_per_document = max(
+        1,
+        max_grid_size // (len(input_shapes) * num_heads * math.prod(dilation)),
+    )
+    selected_splits = []
+    for input_shape in input_shapes:
+        kv_splits = get_max_splits(
+            input_shape,
+            dilation=dilation,
+            kv_tile_shape=kv_tile_shape,
+        )
+        if math.prod(kv_splits) > max_splits_per_document:
+            kv_splits = _reduce_max_kv_splits(
+                na_dim=na_dim,
+                kv_splits=kv_splits,
+                max_splits=max_splits_per_document,
+            )
+        selected_splits.append(kv_splits)
+
+    return tuple(selected_splits)
 
 
 def check_fmha_kv_splits(
