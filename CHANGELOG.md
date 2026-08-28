@@ -3,6 +3,19 @@
 ## [Main branch]
 * Fixed int32 address-offset overflow in the CUTLASS `dO * O` reduction
   kernel for large sequence lengths.
+* Added variable-length 1-D, 2-D, and 3-D CUTLASS FNA for sequence-packed QKV,
+  including training, deterministic backward, GQA/MQA, MLA, and `torch.compile`.
+  Public entry points are `natten.VarlenLayout` (a caller-held, reusable
+  packed-document layout with a per-geometry memo scoped to the layout's
+  lifetime) and
+  `natten.na1d_varlen`/`na2d_varlen`/`na3d_varlen` (parameter-for-parameter
+  aligned with `na1d`/`na2d`/`na3d`, plus `layout`); QKV are flat
+  `[total_tokens, heads, head_dim]`, with `total_tokens` equal to the layout's
+  total exactly (no batch dimension, no capacity padding).
+* Variable-length CUTLASS FNA does not fence total active QKV element count
+  to int32. Its limits are: total packed tokens and `heads * head_dim` (and
+  `heads * head_dim_v`) must each fit in int32; the practical ceiling for
+  element count is device memory.
 
 ## [0.21.7] - 2026-07-26
 * Switched to int64 strides in cutlass-fna to avoid overflows in larger use cases.
