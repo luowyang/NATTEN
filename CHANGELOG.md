@@ -16,6 +16,10 @@
   to int32. Its limits are: total packed tokens and `heads * head_dim` (and
   `heads * head_dim_v`) must each fit in int32; the practical ceiling for
   element count is device memory.
+* A variable-length document narrower than `kernel_size` on some axis now
+  attends over its whole extent on that axis (`effective_kernel_size =
+  min(kernel_size, extent)`), as long as `dilation == 1` on that axis; axes
+  with `dilation > 1` still require the document to fit `kernel_size * dilation`.
 
 ## [0.21.7] - 2026-07-26
 * Switched to int64 strides in cutlass-fna to avoid overflows in larger use cases.

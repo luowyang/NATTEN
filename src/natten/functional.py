@@ -1187,6 +1187,12 @@ def na1d_varlen(
     empty logsumexp) without a kernel launch; `backward()` still produces
     correctly-shaped (empty) gradients for `query`/`key`/`value`.
 
+    A document narrower than `kernel_size` on some axis attends over its
+    whole extent on that axis instead (`effective_kernel_size =
+    min(kernel_size, extent)`), as long as `dilation == 1` on that axis;
+    axes with `dilation > 1` still require the document to fit
+    `kernel_size * dilation`.
+
     `layout` defines the document order for `query`/`key`/`value`; every
     tensor passed with it must be packed in that same order.
 

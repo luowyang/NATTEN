@@ -615,13 +615,22 @@ def _build_varlen_fna_state(
         # to fit into.
         if is_empty_doc[index]:
             continue
+        # dilation == 1 axes have no fit requirement here: the CUDA kernel
+        # clamps kernel_size down to this document's extent on that axis
+        # (effective_kernel = min(kernel_size, extent)), so a document
+        # narrower than kernel_size attends over its whole extent instead
+        # of erroring. dilation > 1 axes still require the document to fit
+        # kernel_size * dilation -- the clamp is only defined for
+        # dilation == 1 on a given axis.
         if any(
             extent < kernel_axis * dilation_axis
             for extent, kernel_axis, dilation_axis in zip(layout, kernel_size, dilation)
+            if dilation_axis > 1
         ):
             raise ValueError(
-                "kernel_size * dilation must fit every token layout; "
-                f"token_layouts[{index}]={layout}."
+                "kernel_size * dilation must fit every token layout on any "
+                "axis with dilation > 1; "
+                f"token_layouts[{index}]={layout}, dilation={dilation}."
             )
 
     q_tile_shape, _ = forward_config
