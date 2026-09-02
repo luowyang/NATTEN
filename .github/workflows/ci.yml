@@ -106,7 +106,12 @@ jobs:
       - name: Relay failure annotations
         if: failure()
         run: |
-          set -uo pipefail
+          set +e -u -o pipefail
+          # +e deliberately: GitHub Actions' default shell invocation
+          # already runs with errexit on regardless of this script's own
+          # `set` line (see wheel.yml's Build wheel step for the full
+          # explanation) -- without it, grep matching nothing below would
+          # kill this best-effort step before finishing.
           for f in ufmt.log flake8.log mypy.log host_tests.log; do
             if [[ -f "$f" ]]; then
               echo "--- last 30 lines of $f ---"
@@ -119,5 +124,5 @@ jobs:
               esc="${line//$'\r'/}"
               esc="${esc//%/%25}"
               echo "::error::${esc}"
-            done
+            done || true
           exit 0
