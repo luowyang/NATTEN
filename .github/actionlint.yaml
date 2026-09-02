@@ -1,0 +1,7 @@
+self-hosted-runner:
+  # Custom label for the one self-hosted GPU runner on dev machine 2
+  # (dsw-machine2-gpu; see .github/README-fork-ci.md). actionlint only
+  # knows GitHub's default hosted-runner labels out of the box; this
+  # tells it "gpu-sm90" is a real, intentional label rather than a typo.
+  labels:
+    - gpu-sm90
