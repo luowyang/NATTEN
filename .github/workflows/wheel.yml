@@ -180,7 +180,15 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          set -uo pipefail
+          set +e -u -o pipefail
+          # +e deliberately: GitHub Actions' default shell invocation for
+          # `run:` steps is already `bash --noprofile --norc -eo pipefail
+          # {0}` -- errexit is ON by default regardless of what flags a
+          # script's own `set` line adds, and omitting `-e` from that line
+          # (what earlier revisions of this workflow did) does NOT turn it
+          # off, since `set` only ever ADDS the flags you name. This step
+          # is diagnostics-only and must not itself fail the job over an
+          # incidental nonzero from something like an empty `git diff`.
           {
             echo "wheel.yml run ${{ github.run_id }} attempt ${{ github.run_attempt }}: build starting"
             echo "Ref built: ${{ steps.resolve_ref.outputs.build_ref }}"
@@ -267,12 +275,18 @@ jobs:
           # documents in its own header, reused here since it applies
           # identically to this workflow's own `python -m build` call.
         run: |
-          set -uo pipefail
-          # Deliberately no -e at the top level: this step runs the build
-          # as a background job and manages its exit code manually (see
-          # BUILD_RC below) while a foreground sampler loop runs
-          # alongside it; -e would only affect the samplER loop's own
-          # commands, which already have their own error handling.
+          set +e -u -o pipefail
+          # +e deliberately: GitHub Actions' default shell invocation for
+          # `run:` steps already runs with errexit on (`bash --noprofile
+          # --norc -eo pipefail {0}`) regardless of this script's own
+          # `set` line, which only ever ADDS flags, never removes ones
+          # already active -- so without an explicit +e here, the
+          # foreground sampler loop's own commands (or a nonzero from the
+          # backgrounded build job's pipeline) could abort this whole
+          # step early. This step manages the actual build's pass/fail
+          # via BUILD_RC (from the backgrounded job's own captured exit
+          # code) and its own explicit `exit "$BUILD_RC"` at the end, not
+          # via errexit.
           echo "--- free -m (before build) ---"
           free -m
           export CUDA_HOME="${{ steps.cuda-toolkit.outputs.CUDA_PATH }}"
@@ -335,6 +349,7 @@ jobs:
 
           # --- run the build in the background; sample in the foreground ---
           (
+            set +e -u -o pipefail   # this subshell inherits shell options at fork time too
             python -m build --no-isolation --wheel -o dist/ 2>&1 | tee "$GITHUB_WORKSPACE/build.log"
             echo "${PIPESTATUS[0]}" > /tmp/build_exit_code.txt
           ) &
@@ -459,10 +474,16 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          set -uo pipefail
-          # Deliberately no -e: this is best-effort diagnostics that must
-          # not itself fail the job, and must keep going even if one
-          # piece (e.g. sccache stats when sccache never ran) is missing.
+          set +e -u -o pipefail
+          # +e deliberately: GitHub Actions' default shell invocation
+          # already runs with errexit on regardless of this script's own
+          # `set` line (see the Build wheel step's comment for the full
+          # explanation) -- found the hard way: on a clean, error-free
+          # build.log, the grep below legitimately matches nothing and
+          # exits 1, which with errexit still active (the bug: omitting
+          # -e from a `set` line does not turn off a shell flag already
+          # on) killed this whole best-effort step before it reached the
+          # ci-logs push, even though the build itself had succeeded.
 
           echo "--- last 60 lines of build.log ---"
           if [[ -f build.log ]]; then
@@ -477,7 +498,7 @@ jobs:
               esc="${line//$'\r'/}"
               esc="${esc//%/%25}"
               echo "::error::${esc}"
-            done
+            done || true   # grep matching nothing (a clean build) exits 1 -- not a script error
           fi
 
           LOG_FILE=""
