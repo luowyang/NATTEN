@@ -1,0 +1,7 @@
+# dev-only: union-merges CHANGELOG.md across topic branches (fork build
+# tooling; this file lives only on the throwaway `dev` branch and is never
+# merged upstream). Every topic branch is expected to append its own
+# bullet under CHANGELOG's shared "## [Main branch]" section, which would
+# otherwise conflict on every multi-branch assembly; union merge keeps
+# every side's added lines instead.
+CHANGELOG.md merge=union
