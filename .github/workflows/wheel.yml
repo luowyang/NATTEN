@@ -39,6 +39,20 @@ on:
   push:
     tags:
       - 'fork/*'
+    # TEMPORARY bootstrap trigger, removed once this workflow has had its
+    # first run: GitHub's workflow_dispatch API only accepts dispatches
+    # for a workflow that has already run at least once (confirmed:
+    # `gh workflow run wheel.yml --ref fork-ci` 404s with "workflow
+    # wheel.yml not found on the default branch" until then, even though
+    # the file exists and is valid on this branch) -- a brand-new
+    # workflow whose only triggers are a tag push (can't fire one without
+    # pushing a tag, which is out of scope here) and workflow_dispatch
+    # (can't fire the first one without already being registered) has no
+    # way to ever get that first run otherwise. This branch push is that
+    # one bootstrap event; it also doubles as this workflow's actual
+    # first real run (the "dry run on fork-ci" validation pass).
+    branches:
+      - 'fork-ci'
   workflow_dispatch:
     inputs:
       ref:
