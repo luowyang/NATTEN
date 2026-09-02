@@ -81,7 +81,11 @@ output = natten.na3d_varlen(
 
 A document may be empty (zero tokens along any axis); an empty document is an
 exact no-op, and a layout whose documents are all empty returns correctly-shaped
-empty outputs without a kernel launch. All documents in one layout share the
+empty outputs without a kernel launch. A document narrower than `kernel_size`
+on some axis attends over its whole extent on that axis instead
+(`effective_kernel_size = min(kernel_size, extent)`), as long as `dilation == 1`
+on that axis; axes with `dilation > 1` still require the document to fit
+`kernel_size * dilation`. All documents in one layout share the
 same spatial rank; `kernel_size`, `stride`, `dilation`, and the causal mask are
 per-call arguments, not bound to the layout, so the same layout can be reused
 across different geometries. A `VarlenLayout` defines the document order for

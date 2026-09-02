@@ -828,6 +828,12 @@ struct FusedNeighborhoodAttentionBackwardKernel {
         maybe_mask_qk_tiles(
             num_queries_post_partitioning, num_queries, dilation, dilation_idx);
 
+        // Per-axis effective kernel: a document narrower than kernel_size
+        // on some axis attends over its whole extent on that axis, i.e.
+        // effective_kernel = min(kernel_size, extent). Only defined for
+        // dilation == 1 on that axis (see the Python fit check).
+        kernel_size = fast_min(kernel_size, num_queries_post_partitioning);
+
         // NOTE: causal mask is antithetical to being fully block sparse.
         // While there are cases where a causal mask has mostly dense
         // blocks, the last one (at least) will always be causally masked.
