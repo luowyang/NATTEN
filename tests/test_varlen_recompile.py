@@ -182,6 +182,21 @@ def _prepare_case(seqlens_list, total_seqlen, heads, head_dim):
 
 
 def _run_empty_batch_kernel_check(backend, use_compile, test_causal=False):
+    max_recompiles = 2 if test_causal else 1
+    with torch._dynamo.config.patch(
+        recompile_limit=max_recompiles,
+        accumulated_recompile_limit=max_recompiles,
+        fail_on_recompile_limit_hit=True,
+    ):
+        try:
+            return _run_empty_batch_kernel_check_impl(
+                backend, use_compile, test_causal=test_causal
+            )
+        finally:
+            torch.compiler.reset()
+
+
+def _run_empty_batch_kernel_check_impl(backend, use_compile, test_causal=False):
     _reset(max_recompiles=2 if test_causal else 1)
     mode = "compiled" if use_compile else "eager"
     causal_tag = "test_causal" if test_causal else "noncausal"

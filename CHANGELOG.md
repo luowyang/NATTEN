@@ -1,6 +1,38 @@
 # Changelog
 
 ## [Main branch]
+* Fixed int32 address-offset overflow in the CUTLASS `dO * O` reduction
+  kernel for large sequence lengths.
+* Added variable-length 1-D, 2-D, and 3-D CUTLASS FNA for sequence-packed QKV,
+  including training, deterministic backward, GQA/MQA, MLA, and `torch.compile`.
+  Public entry points are `natten.VarlenLayout` (a caller-held, reusable
+  packed-document layout with a per-geometry memo scoped to the layout's
+  lifetime) and
+  `natten.na1d_varlen`/`na2d_varlen`/`na3d_varlen` (parameter-for-parameter
+  aligned with `na1d`/`na2d`/`na3d`, plus `layout`); QKV are flat
+  `[total_tokens, heads, head_dim]`, with `total_tokens` equal to the layout's
+  total exactly (no batch dimension, no capacity padding).
+* Variable-length CUTLASS FNA does not fence total active QKV element count
+  to int32. Its limits are: total packed tokens and `heads * head_dim` (and
+  `heads * head_dim_v`) must each fit in int32; the practical ceiling for
+  element count is device memory.
+* A variable-length document narrower than `kernel_size` on some axis now
+  attends over its whole extent on that axis (`effective_kernel_size =
+  min(kernel_size, extent)`), as long as `dilation == 1` on that axis; axes
+  with `dilation > 1` still require the document to fit `kernel_size * dilation`.
+* A `VarlenLayout` whose documents all share the same shape dispatches to
+  the fixed-shape CUTLASS FNA kernels on a batched view instead of
+  building a varlen schedule, returning results bit-for-bit identical to
+  `na{1,2,3}d(..., backend="cutlass-fna")` on that view.
+* `na{1,2,3}d_varlen`'s `kernel_size` may contain `1`: that axis mixes
+  nothing (each query attends only to tokens sharing its coordinate on that
+  axis), with no effect from `is_causal`/`dilation` there. Such an axis is
+  lowered away in Python (folded or permuted, depending on position) before
+  reaching a CUDA kernel; an all-degenerate call short-circuits to an
+  identity (`output = value`, `logsumexp = scale * (query * key).sum(-1)`)
+  with no kernel launch. Explicit tile shapes and `backward_kv_splits` are
+  not supported together with a `kernel_size = 1` axis. The fixed
+  (non-varlen) family is unchanged and still rejects `kernel_size = 1`.
 
 ## [0.21.7] - 2026-07-26
 * Switched to int64 strides in cutlass-fna to avoid overflows in larger use cases.

@@ -114,6 +114,21 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       "na1d_forward", &natten::na1d_forward, "NA1D forward (fused)");
 
   m.def(
+      "varlen_na1d_forward",
+      &natten::varlen_na1d_forward,
+      "Varlen NA1D forward (fused)");
+
+  m.def(
+      "varlen_na2d_forward",
+      &natten::varlen_na2d_forward,
+      "Varlen NA2D forward (fused)");
+
+  m.def(
+      "varlen_na3d_forward",
+      &natten::varlen_na3d_forward,
+      "Varlen NA3D forward (fused)");
+
+  m.def(
       "na2d_forward", &natten::na2d_forward, "NA2D forward (fused)");
 
   m.def(
@@ -121,6 +136,21 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 
   m.def(
       "na1d_backward", &natten::na1d_backward, "NA1D backward (fused)");
+
+  m.def(
+      "varlen_na1d_backward",
+      &natten::varlen_na1d_backward,
+      "Varlen NA1D backward (fused)");
+
+  m.def(
+      "varlen_na2d_backward",
+      &natten::varlen_na2d_backward,
+      "Varlen NA2D backward (fused)");
+
+  m.def(
+      "varlen_na3d_backward",
+      &natten::varlen_na3d_backward,
+      "Varlen NA3D backward (fused)");
 
   m.def(
       "na2d_backward", &natten::na2d_backward, "NA2D backward (fused)");

@@ -584,6 +584,93 @@ inline NA3dDim tuple_to_na_dim(std::tuple<int32_t, int32_t, int32_t> v) {
   return NA3dDim(std::get<0>(v), std::get<1>(v), std::get<2>(v));
 }
 
+template <typename Dim>
+CUTLASS_DEVICE Dim device_ptr_to_na_dim(const int32_t* ptr);
+
+template <>
+CUTLASS_DEVICE NA1dDim device_ptr_to_na_dim(const int32_t* ptr) {
+  return NA1dDim(ptr[0]);
+}
+
+template <>
+CUTLASS_DEVICE NA2dDim device_ptr_to_na_dim(const int32_t* ptr) {
+  return NA2dDim(ptr[0], ptr[1]);
+}
+
+template <>
+CUTLASS_DEVICE NA3dDim device_ptr_to_na_dim(const int32_t* ptr) {
+  return NA3dDim(ptr[0], ptr[1], ptr[2]);
+}
+
+// Varlen metadata bundles shared by the FNA forward/backward launch
+// interfaces (fna_forward_generic / fna_backward_generic) and their
+// Kernel::Params: one struct per direction, field set matching exactly what
+// each launch path already threads through. Populated (all fields) or left
+// default (all fields) as one unit, so varlen-ness is a single
+// non-nullness check instead of several independently-nullable pointers
+// checked together.
+struct VarlenFnaForwardMeta {
+  const int32_t* cumulative_seqlens = nullptr;
+  const int32_t* token_layouts = nullptr;
+  const int32_t* forward_worklist = nullptr;
+  int64_t forward_work_count = 0;
+};
+
+struct VarlenFnaBackwardMeta {
+  const int32_t* cumulative_seqlens = nullptr;
+  const int32_t* token_layouts = nullptr;
+  const int32_t* per_document_splits = nullptr;
+  const int32_t* backward_worklist = nullptr;
+  const int64_t* backward_q_tile_offsets = nullptr;
+  const int64_t* backward_kv_split_offsets = nullptr;
+  int64_t backward_work_count = 0;
+  int64_t total_backward_q_tiles = 0;
+};
+
+// Bundles the varlen-only fields that kIsVarlen=true Params add on top of
+// the fixed layout (the meta struct plus the one extra per-block-decoded
+// scalar each direction needs -- forward's current query tile index,
+// backward's current split-key index). Named members, so `p.varlen` and
+// `p.query_tile_id` / `p.split_key` keep working exactly as before through
+// public inheritance; grouped into one struct so Params only needs a single
+// conditional base per direction (the fixed alternative is
+// NoVarlenForwardMeta / NoVarlenBackwardMeta below).
+struct VarlenForwardParamsExtra {
+  VarlenFnaForwardMeta varlen;
+  int32_t query_tile_id = 0;
+};
+
+struct VarlenBackwardParamsExtra {
+  VarlenFnaBackwardMeta varlen;
+  int32_t split_key = 0;
+};
+
+// Empty-base placeholders selected in place of VarlenForwardParamsExtra /
+// VarlenBackwardParamsExtra above when kIsVarlen=false (see the `Params`
+// structs in kernel_forward.h / kernel_backward.h): a Params that inherits
+// from one of these instead of the real extra-fields struct carries zero
+// bytes of varlen storage via the empty base class optimization, rather
+// than an unused-but-present field -- so a fixed-shape Params has the same
+// layout it would have if varlen support did not exist.
+struct NoVarlenForwardMeta {};
+struct NoVarlenBackwardMeta {};
+
+// kernel_forward.h/kernel_backward.h select varlen-vs-fixed behavior through
+// the `kIsVarlen` template parameter (checked with `if constexpr`), not a
+// runtime branch, so the fixed (kIsVarlen=false) FNA kernel instantiations
+// keep the code generation they have without varlen support. Fixed-length
+// and variable-length paths are separate compile-time specializations: the
+// fixed specialization carries no variable-length state, and its
+// translation units are unchanged by the varlen feature. Resource-level
+// verification of specific builds (register/stack/shared/local usage,
+// spill deltas) is reported in the PR/release evidence, not here. Varlen
+// (kIsVarlen=true) instantiations live in their own translation units,
+// separate from the fixed ones, so their extra code has no way to perturb
+// the fixed kernels' codegen. The cost of this isolation is a second,
+// parallel set of FNA kernel instantiations (varlen) alongside the fixed
+// set, doubling this build dimension's instantiation count, binary size,
+// and compile time.
+
 //// Factories
 // template <int Value, int NADim>
 // struct MakeDim;
@@ -1382,9 +1469,10 @@ struct NeighborhoodAttentionMask<1, CausalMask_> {
       Dim index,
       Dim key_tile_shape,
       Dim last_possible_key_tile) const {
-    return Dim(cutlass::fast_min(
-        align_down(mask_0.get_window_end_(index.x) - 1, key_tile_shape.x),
-        last_possible_key_tile.x));
+    return Dim(
+        cutlass::fast_min(
+            align_down(mask_0.get_window_end_(index.x) - 1, key_tile_shape.x),
+            last_possible_key_tile.x));
   }
 
   CUTLASS_DEVICE Dim get_backward_window_start(Dim index) const {

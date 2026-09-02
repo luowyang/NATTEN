@@ -40,12 +40,14 @@
 #pragma once
 
 #include <natten/cuda/utils/cuda.h>
+#include <natten/helpers.h>
 #include <natten/natten.h>
 #include <natten/cuda/utils/cutlass.cuh>
 
 #include <natten/cuda/fna/na_utils.cuh>
 
 #include <natten_autogen/cuda/fna/interface.h>
+#include <natten_autogen/cuda/fna/interface_varlen.h>
 
 namespace natten {
 namespace cuda {
@@ -79,7 +81,9 @@ void fna_forward_generic(
     float attn_scale,
     void* logsumexp_ptr,
     IntTuple query_tile_shape,
-    IntTuple key_tile_shape) {
+    IntTuple key_tile_shape,
+    const VarlenFnaForwardMeta* varlen_meta = nullptr,
+    int64_t total_tokens = -1) {
   static constexpr auto kRank =
       std::tuple_size<decltype(spatial_extent)>::value;
   using Dim = typename GetDim<kRank>::type;
@@ -136,9 +140,26 @@ void fna_forward_generic(
       // issues.
       // cudaMalloc(&accum_ptr, batch_size * natten::flatten(spatial_extent) *
       // heads * dim_value * sizeof(AccumType));
-      int64_t workspace_size_bytes = batch_size *
-          natten::flatten(spatial_extent) * heads * dim_value *
-          sizeof(AccumType);
+      int64_t num_output_tokens = total_tokens >= 0
+          ? total_tokens
+          : static_cast<int64_t>(batch_size) * natten::flatten(spatial_extent);
+      int64_t workspace_size_bytes = 0;
+      if (total_tokens >= 0) {
+        workspace_size_bytes = natten::CheckedMul(
+            natten::CheckedMul(
+                natten::CheckedMul(
+                    num_output_tokens,
+                    static_cast<int64_t>(heads),
+                    "Varlen FNA forward workspace size"),
+                static_cast<int64_t>(dim_value),
+                "Varlen FNA forward workspace size"),
+            static_cast<int64_t>(sizeof(AccumType)),
+            "Varlen FNA forward workspace size");
+      } else {
+        workspace_size_bytes = static_cast<int64_t>(batch_size) *
+            natten::flatten(spatial_extent) * heads * dim_value *
+            sizeof(AccumType);
+      }
       void* accum_ptr = nullptr;
       alloc_bytes(&accum_ptr, workspace_size_bytes, /* zero_fill = */ false);
       // NATTEN_CUDA_CHECK(cudaMallocAsync(
@@ -157,6 +178,12 @@ void fna_forward_generic(
     p.head_dim_value = dim_value;
     p.num_queries = tuple_to_na_dim<Dim>(spatial_extent);
     p.num_batches = batch_size;
+    if constexpr (Kernel::kIsVarlen) {
+      // Only varlen-true instantiations have a `varlen` member (see
+      // kernel_forward.h); only varlen-true instantiations are ever
+      // reached with a non-null varlen_meta (see the dispatch fork below).
+      p.varlen = *varlen_meta;
+    }
 
     p.scale = attn_scale;
 
@@ -180,7 +207,26 @@ void fna_forward_generic(
     kernel_fn<<<blocks, p.getThreadsGrid(), smem_bytes, stream>>>(p);
   };
 
-  DISPATCH_FNA_FORWARD_KERNEL(kRank, cc, dtype, is_causal, launchKernel);
+  // Internal launch-ABI invariant: `varlen_meta` and `total_tokens` are two
+  // independent knobs that every caller in this codebase sets together
+  // (both varlen, or both fixed/default) -- see fna_forward.cu's fixed and
+  // varlen call sites. This checks OUR launch plumbing's self-consistency,
+  // not caller-supplied metadata (that is validated in fna_forward.cu).
+  TORCH_CHECK(
+      (varlen_meta != nullptr) == (total_tokens >= 0),
+      "internal varlen launch ABI inconsistency: varlen_meta and "
+      "total_tokens must either both indicate a varlen call or both "
+      "indicate a fixed-shape call.");
+
+  // Varlen calls (varlen_meta != nullptr) route to the kIsVarlen=true
+  // instantiations (separate translation units, separate dispatch macros);
+  // the fixed path's own dispatch call is untouched.
+  if (varlen_meta != nullptr) {
+    DISPATCH_FNA_FORWARD_VARLEN_KERNEL(
+        kRank, cc, dtype, is_causal, launchKernel);
+  } else {
+    DISPATCH_FNA_FORWARD_KERNEL(kRank, cc, dtype, is_causal, launchKernel);
+  }
   NATTEN_CHECK(
       kernel_launched,
       "Could not find a compatible fused neighborhood attention kernel.");
