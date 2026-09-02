@@ -52,9 +52,12 @@ jobs:
     runs-on: [self-hosted, gpu-sm90]
     timeout-minutes: 180
     env:
-      CONDA_BIN: /cpfs/luowenyang/miniconda3/bin/conda
-      SOURCE_ENV: /cpfs/luowenyang/miniconda3/envs/natten_dev
-      ENV_PATH: /cpfs/luowenyang/natten_dev/ci/envs/extended-${{ github.run_id }}
+      # Placeholder paths -- adjust to wherever a matching self-hosted
+      # runner's conda lives if/when this workflow is revived (see the
+      # status note at the top of this file).
+      CONDA_BIN: /opt/miniconda3/bin/conda
+      SOURCE_ENV: /opt/miniconda3/envs/natten_dev
+      ENV_PATH: /opt/natten-ci/envs/extended-${{ github.run_id }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -78,7 +81,7 @@ jobs:
           export CUDA_HOME=/usr/local/cuda
           export CUDACXX=/usr/local/cuda/bin/nvcc
           export PATH=/usr/local/cuda/bin:${PATH}
-          export TMPDIR=/cpfs/luowenyang/natten_dev/tmp
+          export TMPDIR=/opt/natten-ci/tmp
           mkdir -p "$TMPDIR"
           export NATTEN_CUDA_ARCH="9.0"
           export NATTEN_N_WORKERS=39
@@ -103,8 +106,8 @@ jobs:
           NATTEN_LOG_LEVEL: CRITICAL
           PYTORCH_NO_CUDA_MEMORY_CACHING: "1"
           CUBLAS_WORKSPACE_CONFIG: ":4096:8"
-          TRITON_CACHE_DIR: /cpfs/luowenyang/natten_dev/ci/cache/triton
-          TORCHINDUCTOR_CACHE_DIR: /cpfs/luowenyang/natten_dev/ci/cache/inductor
+          TRITON_CACHE_DIR: /opt/natten-ci/cache/triton
+          TORCHINDUCTOR_CACHE_DIR: /opt/natten-ci/cache/inductor
         run: |
           mkdir -p "$TRITON_CACHE_DIR" "$TORCHINDUCTOR_CACHE_DIR"
           "$CONDA_BIN" run -p "$ENV_PATH" --no-capture-output \

@@ -1,10 +1,21 @@
 name: ci
 
-# Lint + host-only tests on GitHub-hosted runners. No CUDA build here --
-# see .github/README-fork-ci.md for why (short version: libnatten needs
-# a self-hosted GPU runner, wired up in wheel.yml / extended.yml
-# instead). This workflow must stay green on a plain ubuntu-latest
-# runner with no GPU and no compiled extension.
+# Lint + host-only tests on GitHub-hosted runners. No CUDA build here:
+# the organization's network does not allow self-hosted runners to reach
+# GitHub Actions, so everything in this fork's CI runs on GitHub-hosted
+# runners, which have no GPU -- see .github/README-fork-ci.md. wheel.yml
+# builds the CUDA extension on ubuntu-latest (no GPU there either); GPU
+# kernel tests run outside CI. This workflow must stay green on a plain
+# ubuntu-latest runner with no GPU and no compiled extension.
+#
+# LOG ACCESS: the same organization network that blocks self-hosted
+# runners also blocks reading hosted-run logs the normal way (see
+# wheel.yml's header for the full account). The final `Relay failure
+# annotations` step below is the cheap version of wheel.yml's log relay:
+# on failure, it echoes the relevant tool output back as `::error::`
+# workflow annotations, which `gh run view -v` / the Actions UI surface
+# without needing the blocked hosts. No branch push here -- ci.yml's
+# steps are small enough that annotations alone are enough.
 
 on:
   push:
@@ -51,13 +62,16 @@ jobs:
         # succeeds with zero CMake invocation.
 
       - name: ufmt check
-        run: ufmt check src/natten tests scripts setup.py
+        id: ufmt
+        run: ufmt check src/natten tests scripts setup.py 2>&1 | tee ufmt.log
 
       - name: flake8
-        run: flake8 src/natten tests scripts setup.py
+        id: flake8
+        run: flake8 src/natten tests scripts setup.py 2>&1 | tee flake8.log
 
       - name: mypy (src/natten)
-        run: mypy src/natten
+        id: mypy
+        run: mypy src/natten 2>&1 | tee mypy.log
         # requirements-dev.txt already installs rich==14.0.0, and the
         # rich 14.0.0 wheel ships a `rich/py.typed` marker (checked by
         # inspecting the wheel directly) -- so the historically-known
@@ -69,13 +83,16 @@ jobs:
         # installed. No mypy ignore rule needed; nothing to allow here.
 
       - name: Host-only tests (tests/test_varlen_layout.py, if present)
+        id: host_tests
         run: |
           if [ -f tests/test_varlen_layout.py ]; then
-            pytest -v tests/test_varlen_layout.py
+            pytest -v tests/test_varlen_layout.py 2>&1 | tee host_tests.log
           else
-            echo "tests/test_varlen_layout.py is not present on this ref."
-            echo "VarlenLayout (and its host-only test classes) is added by this fork's varlen topic branches, not upstream v0.21.7 -- 'fork-ci' itself (branched straight from origin/main) doesn't have it; 'dev' does, once assemble.sh merges those branches in."
-            echo "No other file under tests/ has a class that runs without CUDA/libnatten (checked: everything else needs a real device or the compiled extension), so this job is lint-only on this ref."
+            {
+              echo "tests/test_varlen_layout.py is not present on this ref."
+              echo "VarlenLayout (and its host-only test classes) is added by this fork's varlen topic branches, not upstream v0.21.7 -- 'fork-ci' itself (branched straight from origin/main) doesn't have it; 'dev' does, once assemble.sh merges those branches in."
+              echo "No other file under tests/ has a class that runs without CUDA/libnatten (checked: everything else needs a real device or the compiled extension), so this job is lint-only on this ref."
+            } | tee host_tests.log
           fi
         # On a ref that does have the file: VarlenLayoutGpuMechanismTests
         # is `@unittest.skipUnless(torch.cuda.is_available())`, so it
@@ -85,3 +102,22 @@ jobs:
         # logic (construction, memoization, pickling -- no device
         # materialization) and actually run. Verified locally (CUDA
         # hidden): 22 passed, 23 skipped, 0 failed.
+
+      - name: Relay failure annotations
+        if: failure()
+        run: |
+          set -uo pipefail
+          for f in ufmt.log flake8.log mypy.log host_tests.log; do
+            if [[ -f "$f" ]]; then
+              echo "--- last 30 lines of $f ---"
+              tail -n 30 "$f"
+            fi
+          done
+          echo "--- error-pattern lines -> workflow annotations ---"
+          cat ufmt.log flake8.log mypy.log host_tests.log 2>/dev/null \
+            | grep -aE "error|Error|FAILED|Traceback" | tail -n 20 | while IFS= read -r line; do
+              esc="${line//$'\r'/}"
+              esc="${esc//%/%25}"
+              echo "::error::${esc}"
+            done
+          exit 0
