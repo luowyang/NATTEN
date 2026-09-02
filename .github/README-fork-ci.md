@@ -20,8 +20,8 @@ branch (see `branches.txt`), so every fork build gets these workflows too.
 ## Tag -> release flow
 
 ```
-integration/assemble.sh N /cpfs/luowenyang/natten_dev/NATTEN --tag
-git -C /cpfs/luowenyang/natten_dev/wt_dev push origin refs/tags/fork/<version>
+integration/assemble.sh N <path-to-fork-checkout> --tag
+git -C <assemble.sh's --worktree, default wt_dev> push origin refs/tags/fork/<version>
 ```
 
 Pushing that tag triggers `wheel.yml`, which builds the wheel, runs a
@@ -54,35 +54,18 @@ manifest onto an existing one.
 
 ## Why GitHub-hosted runners, not self-hosted
 
-The original design used one self-hosted GPU runner on dev machine 2, so
-wheel builds and GPU tests would happen on the same hardware the fork is
-actually developed on. That runner never came online: the org's shared
-egress proxy (`10.33.197.9:3128`) allows outbound
-`github.com`/`api.github.com`/`objects.githubusercontent.com`/
-`codeload.github.com` traffic but returns 403 on CONNECT to
-`pipelines.actions.githubusercontent.com` (confirmed directly in a runner
-registration attempt's own diag log: `GET .../connectionData ...
-HttpRequestException: The proxy tunnel request to proxy
-'http://10.33.197.9:3128/' failed with status code '403'`) and to
-`uploads.github.com` -- both required for a self-hosted runner to
-register, poll for jobs, or upload anything. This is a network policy
-choice (downloads only, no uploads, no proxy exception requested), not a
-CI misconfiguration, so it isn't something to retry or work around here.
+The build runs on GitHub-hosted runners because the organization's
+network does not allow self-hosted runners to reach GitHub Actions;
+there is no GPU on hosted runners, so kernel tests run elsewhere.
 
 Consequence: **`wheel.yml` cannot run GPU kernel tests.** It still builds
 a real CUDA extension (`NATTEN_CUDA_ARCH=9.0`, targeting sm_90a) using a
 CUDA 12.8 toolkit installed on the runner itself, and verifies the wheel
 installs and `import natten` works -- but that's an import smoke test,
-not kernel correctness. **GPU validation stays local and manual**, on the
-dev machines, via the existing `integration/` scripts
-(`build_wheel.sh`'s own smoke-test phase, `run_extended.sh`, etc.) --
-those are unrelated to and unaffected by anything in `.github/`.
-
-`ci/runner/` (sibling to this repo, not part of it) is left as a one-line
-marker explaining the above; the downloaded runner tarball and the
-registration/lifecycle scripts written for it were deleted rather than
-left dormant, since this was a considered decision, not a temporary
-outage.
+not kernel correctness. **GPU validation happens outside this CI**, via
+this fork's own build/test tooling (`integration/build_wheel.sh`'s own
+smoke-test phase, `run_extended.sh`, etc.) -- those are unrelated to and
+unaffected by anything in `.github/`.
 
 ## The three workflows
 

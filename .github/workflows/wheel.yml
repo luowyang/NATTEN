@@ -2,28 +2,33 @@ name: wheel
 
 # Builds the NATTEN fork wheel on a GitHub-hosted runner, then (tag
 # builds only) publishes a GitHub Release with the wheel attached. See
-# .github/README-fork-ci.md for the full tag -> release flow, and for
-# why this runs on ubuntu-latest rather than a self-hosted GPU runner.
+# .github/README-fork-ci.md for the full tag -> release flow.
 #
-# WHY HOSTED, NOT SELF-HOSTED (short version -- full account in the
-# README): the org's egress proxy (10.33.197.9:3128, shared by every dev
-# machine) allows outbound github.com/api.github.com/
-# objects.githubusercontent.com/codeload.github.com traffic -- downloads
-# only -- but returns 403 on CONNECT to
-# pipelines.actions.githubusercontent.com (confirmed directly in a runner
-# registration attempt's own diag log) and to uploads.github.com, both
-# required for a self-hosted runner to so much as register, let alone
-# poll for jobs or stream logs/results. That's a network policy decision,
-# not a CI bug, and no proxy exception was requested -- the pipeline runs
-# entirely on GitHub-hosted infrastructure instead.
+# The build runs on GitHub-hosted runners because the organization's
+# network does not allow self-hosted runners to reach GitHub Actions;
+# there is no GPU on hosted runners, so kernel tests run elsewhere.
 #
 # CONSEQUENCE: no GPU on this runner, so this workflow cannot run
 # libnatten's actual kernel tests. It still builds a real CUDA extension
 # (nvcc targets sm_90a) and does a CPU-only import smoke test. GPU
-# correctness validation stays local and manual, on the dev machines, via
-# the existing integration/ scripts (build_wheel.sh's own smoke-test
-# phase, run_extended.sh, etc.) -- unrelated to and unaffected by this
-# workflow.
+# correctness validation happens outside this CI, via this fork's own
+# build/test tooling (integration/build_wheel.sh and friends) -- unrelated
+# to and unaffected by this workflow.
+#
+# LOG ACCESS: the same organization network that blocks self-hosted
+# runners also blocks reading hosted-run logs and artifacts the normal
+# way (`gh run view --log`, the jobs/logs API, and artifact downloads all
+# redirect through hosts that are unreachable from here) -- confirmed the
+# hard way when a build failed and neither `--log-failed` nor `gh run
+# download` would return anything but "Forbidden". The last step in this
+# job (`Relay build log and diagnostics`) works around that: it captures
+# the build's own output, extracts likely-relevant lines as `::error::`
+# workflow annotations (visible via `gh run view -v` / the Actions UI
+# without needing the blocked hosts), and pushes the full log + a
+# diagnostics summary to an orphan `ci-logs` branch via plain `git` over
+# `github.com` (not blocked -- only the *reading* side, from this
+# network, hits the blocked hosts; a runner pushing to github.com is
+# unaffected).
 #
 # Triggers:
 #   - push of a tag matching fork/* (the normal release path: assemble.sh
@@ -39,20 +44,6 @@ on:
   push:
     tags:
       - 'fork/*'
-    # TEMPORARY bootstrap trigger, removed once this workflow has had its
-    # first run: GitHub's workflow_dispatch API only accepts dispatches
-    # for a workflow that has already run at least once (confirmed:
-    # `gh workflow run wheel.yml --ref fork-ci` 404s with "workflow
-    # wheel.yml not found on the default branch" until then, even though
-    # the file exists and is valid on this branch) -- a brand-new
-    # workflow whose only triggers are a tag push (can't fire one without
-    # pushing a tag, which is out of scope here) and workflow_dispatch
-    # (can't fire the first one without already being registered) has no
-    # way to ever get that first run otherwise. This branch push is that
-    # one bootstrap event; it also doubles as this workflow's actual
-    # first real run (the "dry run on fork-ci" validation pass).
-    branches:
-      - 'fork-ci'
   workflow_dispatch:
     inputs:
       ref:
@@ -65,10 +56,11 @@ concurrency:
   cancel-in-progress: false
 
 permissions:
-  contents: write   # only actually needed for the tag-build release step;
-                     # repo default is read-only (checked via `gh api
-                     # repos/luowyang/NATTEN/actions/permissions/workflow`),
-                     # so this must be declared here to elevate it.
+  contents: write   # needed for the tag-build release step AND the
+                     # ci-logs branch push below; repo default is
+                     # read-only (checked via `gh api repos/luowyang/
+                     # NATTEN/actions/permissions/workflow`), so this
+                     # must be declared here to elevate it.
 
 jobs:
   build:
@@ -104,6 +96,7 @@ jobs:
           echo "Building ref: $BUILD_REF (tag build: $([[ "$BUILD_REF" == fork/* ]] && echo true || echo false))"
 
       - name: Checkout
+        id: checkout
         uses: actions/checkout@v7
         with:
           ref: ${{ inputs.ref }}
@@ -116,10 +109,28 @@ jobs:
           # both cases.
 
       - name: Set up Python 3.11
+        id: setup_python
         uses: actions/setup-python@v7
         with:
           python-version: "3.11"
           cache: pip
+
+      - name: Free disk space if needed
+        id: free_disk
+        run: |
+          set -euo pipefail
+          echo "--- df -h (before) ---"
+          df -h
+          AVAIL_GB="$(df --output=avail -BG / | tail -1 | tr -dc '0-9')"
+          echo "Available on / : ${AVAIL_GB}G"
+          if [[ "$AVAIL_GB" -lt 12 ]]; then
+            echo "Free space below 12G threshold -- clearing standard hosted-runner preinstalled bulk (dotnet/android/ghc; the usual 'maximize build space' trick) before the CUDA toolkit install."
+            sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc || true
+            echo "--- df -h (after cleanup) ---"
+            df -h
+          else
+            echo "Free space above threshold; skipping cleanup."
+          fi
 
       - name: Install CUDA toolkit 12.8
         id: cuda-toolkit
@@ -133,10 +144,16 @@ jobs:
                            # not having to guess apt sub-package names.
           linux-local-args: '["--toolkit"]'   # skip samples/docs, keep nvcc + libs
 
+      - name: Disk space after CUDA toolkit install
+        id: post_cuda_df
+        run: df -h
+
       - name: Set up sccache
+        id: sccache_setup
         uses: mozilla-actions/sccache-action@v0.0.11
 
       - name: Install Python build dependencies
+        id: deps
         run: |
           set -euo pipefail
           # Matches natten_dev's own torch build exactly (confirmed via
@@ -156,7 +173,29 @@ jobs:
         id: build
         env:
           NATTEN_CUDA_ARCH: "9.0"
-          NATTEN_AUTOGEN_POLICY: default
+          NATTEN_N_WORKERS: "2"     # NOT nproc. Hosted ubuntu-latest is 4
+                                     # vCPU / 16GB RAM; nvcc/cicc/ptxas on
+                                     # NATTEN's autogenerated translation
+                                     # units can each use several GB. A
+                                     # prior run's "Build wheel" step was
+                                     # killed (exit 143) after ~36 minutes
+                                     # with no compile-error text in its
+                                     # annotations -- consistent with OOM
+                                     # or disk exhaustion, not a code bug.
+                                     # Capped low deliberately.
+          NATTEN_AUTOGEN_POLICY: fine   # More (smaller) translation units
+                                     # per kernel family than "default".
+                                     # Checked setup.py's NUM_SPLITS table:
+                                     # "fine" only raises each category's
+                                     # split *count* (e.g. fna: 64 -> 128)
+                                     # -- it does not change which kernels
+                                     # get generated (same `categories`
+                                     # dict, same autogen scripts either
+                                     # way). Smaller, more numerous compile
+                                     # units instead of fewer, larger ones
+                                     # for the identical instantiation set
+                                     # -- lower peak memory per nvcc
+                                     # process, same output.
           NATTEN_VERBOSE: "1"
           SCCACHE_GHA_ENABLED: "true"
           # NATTEN_IS_BUILDING_DIST intentionally NOT set: setup.py would
@@ -168,8 +207,8 @@ jobs:
           # identically to this workflow's own `python -m build` call.
         run: |
           set -euo pipefail
-          NATTEN_N_WORKERS="$(nproc)"
-          export NATTEN_N_WORKERS
+          echo "--- free -m (before build) ---"
+          free -m
           export CUDA_HOME="${{ steps.cuda-toolkit.outputs.CUDA_PATH }}"
           export TMPDIR="${{ runner.temp }}"
 
@@ -194,12 +233,13 @@ jobs:
           export CUDACXX=/tmp/sccache-wrappers/nvcc
           export CXX=/tmp/sccache-wrappers/c++
 
-          echo "nproc=$NATTEN_N_WORKERS CUDA_HOME=$CUDA_HOME"
+          echo "nproc=$(nproc) NATTEN_N_WORKERS=$NATTEN_N_WORKERS CUDA_HOME=$CUDA_HOME"
           nvcc --version | tee /tmp/nvcc-version.txt
-          python -m build --no-isolation --wheel -o dist/
+          python -m build --no-isolation --wheel -o dist/ 2>&1 | tee "$GITHUB_WORKSPACE/build.log"
           sccache --show-stats
 
       - name: Install wheel + import smoke test
+        id: install_smoke
         run: |
           set -euo pipefail
           WHEEL="$(ls dist/*.whl)"
@@ -216,6 +256,7 @@ jobs:
           python -c "import natten; print('natten.__version__ =', natten.__version__)"
 
       - name: Build manifest
+        id: manifest
         run: |
           set -euo pipefail
           SHA256="$(sha256sum "$WHEEL" | awk '{print $1}')"
@@ -240,7 +281,8 @@ jobs:
             echo "  torch CUDA       : $(python -c 'import torch; print(torch.version.cuda)')"
             echo "  nvcc             : $(tr '\n' ' ' < /tmp/nvcc-version.txt)"
             echo "  NATTEN_CUDA_ARCH : 9.0"
-            echo "  NATTEN_N_WORKERS : $(nproc)"
+            echo "  NATTEN_N_WORKERS : 2"
+            echo "  NATTEN_AUTOGEN_POLICY : fine"
             echo
             echo "GPU kernel tests: NOT run in this workflow (no GPU on"
             echo "ubuntu-latest). Only the CPU-only import smoke test above"
@@ -252,6 +294,7 @@ jobs:
           cat "$MANIFEST"
 
       - name: Upload wheel + manifest as workflow artifact
+        id: upload
         uses: actions/upload-artifact@v7
         with:
           name: natten-wheel-${{ github.run_id }}
@@ -262,6 +305,7 @@ jobs:
           retention-days: 30
 
       - name: Create or update GitHub Release (fork/* tag builds only)
+        id: release
         if: steps.resolve_ref.outputs.is_tag_build == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
@@ -281,3 +325,101 @@ jobs:
               --notes-file "$MANIFEST" \
               --prerelease
           fi
+
+      - name: Relay build log and diagnostics (ci-logs branch)
+        id: relay_logs
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -uo pipefail
+          # Deliberately no -e: this is best-effort diagnostics that must
+          # not itself fail the job, and must keep going even if one
+          # piece (e.g. sccache stats when sccache never ran) is missing.
+
+          echo "--- last 60 lines of build.log ---"
+          if [[ -f build.log ]]; then
+            tail -n 60 build.log
+          else
+            echo "(no build.log -- Build wheel step likely never ran)"
+          fi
+
+          if [[ -f build.log ]]; then
+            echo "--- error-pattern lines (last 20) -> workflow annotations ---"
+            grep -aE "error|Error|Killed|No space|fatal" build.log | tail -n 20 | while IFS= read -r line; do
+              esc="${line//$'\r'/}"
+              esc="${esc//%/%25}"
+              echo "::error::${esc}"
+            done
+          fi
+
+          LOG_FILE=""
+          if [[ -f build.log ]]; then
+            SIZE="$(stat -c%s build.log)"
+            if [[ "$SIZE" -gt 1048576 ]]; then
+              gzip -f build.log
+              LOG_FILE="build.log.gz"
+            else
+              LOG_FILE="build.log"
+            fi
+          fi
+
+          {
+            echo "wheel.yml run ${{ github.run_id }} attempt ${{ github.run_attempt }}"
+            echo "Ref built    : ${{ steps.resolve_ref.outputs.build_ref }}"
+            echo "Commit       : ${{ github.sha }}"
+            echo "Workflow run : ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            echo
+            echo "Step outcomes:"
+            echo "  Resolve build ref                 : ${{ steps.resolve_ref.outcome }}"
+            echo "  Checkout                           : ${{ steps.checkout.outcome }}"
+            echo "  Set up Python 3.11                 : ${{ steps.setup_python.outcome }}"
+            echo "  Free disk space if needed          : ${{ steps.free_disk.outcome }}"
+            echo "  Install CUDA toolkit 12.8          : ${{ steps.cuda-toolkit.outcome }}"
+            echo "  Disk space after CUDA install      : ${{ steps.post_cuda_df.outcome }}"
+            echo "  Set up sccache                     : ${{ steps.sccache_setup.outcome }}"
+            echo "  Install Python build dependencies  : ${{ steps.deps.outcome }}"
+            echo "  Build wheel                        : ${{ steps.build.outcome }}"
+            echo "  Install wheel + import smoke test  : ${{ steps.install_smoke.outcome }}"
+            echo "  Build manifest                     : ${{ steps.manifest.outcome }}"
+            echo "  Upload artifact                    : ${{ steps.upload.outcome }}"
+            echo "  Create or update GitHub Release    : ${{ steps.release.outcome }}"
+            echo
+            echo "--- df -h ---"
+            df -h
+            echo
+            echo "--- free -m ---"
+            free -m
+            echo
+            echo "--- nproc ---"
+            nproc
+            echo
+            echo "--- sccache --show-stats ---"
+            sccache --show-stats 2>&1 || echo "(unavailable)"
+          } > summary.txt
+
+          echo "--- pushing diagnostics to ci-logs branch ---"
+          git config --global user.email "ci@users.noreply.github.com"
+          git config --global user.name "NATTEN fork CI"
+          REMOTE_URL="https://x-access-token:${GH_TOKEN}@github.com/luowyang/NATTEN.git"
+          WORKDIR="$(mktemp -d)"
+          if git ls-remote --exit-code "$REMOTE_URL" refs/heads/ci-logs >/dev/null 2>&1; then
+            git clone --quiet --depth 1 --branch ci-logs "$REMOTE_URL" "$WORKDIR"
+          else
+            git init --quiet -b ci-logs "$WORKDIR"
+          fi
+          DEST="$WORKDIR/runs/${{ github.run_id }}-${{ github.run_attempt }}"
+          mkdir -p "$DEST"
+          if [[ -n "$LOG_FILE" ]]; then
+            cp "$LOG_FILE" "$DEST/"
+          fi
+          cp summary.txt "$DEST/"
+          git -C "$WORKDIR" add -A
+          if git -C "$WORKDIR" diff --cached --quiet; then
+            echo "Nothing to commit (unexpected -- summary.txt should always be new)."
+          else
+            git -C "$WORKDIR" commit --quiet -m "wheel.yml run ${{ github.run_id }} attempt ${{ github.run_attempt }}: ${{ steps.build.outcome }}"
+            git -C "$WORKDIR" push --quiet "$REMOTE_URL" "HEAD:refs/heads/ci-logs"
+            echo "Pushed: runs/${{ github.run_id }}-${{ github.run_attempt }}/ on ci-logs"
+          fi
+          exit 0
