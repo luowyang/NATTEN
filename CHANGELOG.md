@@ -1,6 +1,9 @@
 # Changelog
 
 ## [Main branch]
+* `na1d`/`na2d`/`na3d` now accept a `kernel_size` of `1` along any axis: that axis mixes nothing,
+  and is lowered away in Python (folded or permuted into the batch dimension, or short-circuited
+  to an identity if every axis is `1`) before reaching a backend kernel.
 
 ## [0.21.7] - 2026-07-26
 * Switched to int64 strides in cutlass-fna to avoid overflows in larger use cases.
