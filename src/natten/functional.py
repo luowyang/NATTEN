@@ -20,7 +20,7 @@
 # SOFTWARE.
 #
 #################################################################################################
-from typing import Dict, Optional, Tuple, Union
+from typing import cast, Dict, List, Optional, Tuple, Union
 
 import torch
 from torch import Tensor
@@ -43,6 +43,7 @@ from natten.types import (
     CausalArg1DTypeOrDed,
     CausalArg2DTypeOrDed,
     CausalArg3DTypeOrDed,
+    CausalArgType,
     CausalArgTypeOrDed,
     Dimension1DType,
     Dimension1DTypeOrDed,
@@ -353,6 +354,199 @@ def attention(
 # Neighborhood Attention
 
 
+_DEGENERATE_AXIS_TILE_KNOB_MESSAGE = (
+    "Explicit tile shapes (q_tile_shape, kv_tile_shape, backward_q_tile_shape, "
+    "backward_kv_tile_shape) and backward_kv_splits are not supported together with a "
+    "kernel_size = 1 axis: lowering folds/permutes the token layout to a lower rank, and an "
+    "explicit tile shape's rank would no longer match it. Omit them (the resolved rank picks "
+    "its own defaults), or drop the kernel_size = 1 axes."
+)
+
+_DEGENERATE_AXIS_ADDITIONAL_CONTEXT_MESSAGE = (
+    "`additional_keys`/`additional_values` are not supported together with a kernel_size = 1 "
+    "axis: lowering folds/permutes the token layout into a lower-rank call, which has no "
+    "notion of the additional context tokens. Drop the kernel_size = 1 axes, or the "
+    "additional keys/values."
+)
+
+_DEGENERATE_AXIS_ATTENTION_KWARGS_MESSAGE = (
+    "`attention_kwargs` is not supported together with a kernel_size = 1 axis: this argument "
+    "only takes effect on the self-attention/cross-attention fast paths, which a call with a "
+    "degenerate axis never reaches. Drop the kernel_size = 1 axes, or `attention_kwargs`."
+)
+
+
+def _degenerate_identity(
+    query: Tensor,
+    key: Tensor,
+    value: Tensor,
+    scale: Optional[float],
+    return_lse: bool,
+) -> Union[Tensor, Tuple[Tensor, Tensor]]:
+    """kernel_size == 1 along every axis: each query's only valid window position is
+    itself, so output is exactly `value`, and logsumexp (if requested) is exactly
+    `scale * (query * key).sum(-1)` in fp32 -- no backend is chosen, no kernel launched.
+
+    GQA (key/value with fewer heads than query) repeats key/value to query's head
+    count first, the same way the backends' own GQA contract does. query/key/value
+    are tied into both outputs through a zero-weighted contribution (`* 0`), so
+    `requires_grad`/`.grad` parity holds for every one of them regardless of which
+    output `backward()` is called through: `output` alone still gives exactly
+    `dv = grad_out`, `dq = dk = 0`, since that link's local gradient is exactly zero.
+    """
+    heads = query.shape[-2]
+    heads_kv = key.shape[-2]
+    if heads != heads_kv:
+        repeats = heads // heads_kv
+        key = torch.repeat_interleave(key, repeats=repeats, dim=-2, output_size=heads)
+        value = torch.repeat_interleave(
+            value, repeats=repeats, dim=-2, output_size=heads
+        )
+
+    resolved_scale = scale if scale is not None else query.shape[-1] ** -0.5
+    zero_link = (query.sum() + key.sum() + value.sum()) * 0
+
+    output = value.clone() + zero_link.to(value.dtype)
+    if not return_lse:
+        return output
+
+    lse = (query.float() * key.float()).sum(-1) * resolved_scale + zero_link.to(
+        torch.float32
+    )
+    return output, lse
+
+
+def _lower_degenerate_axes(
+    na_dim: int,
+    query: Tensor,
+    key: Tensor,
+    value: Tensor,
+    kernel_size: DimensionType,
+    stride: DimensionType,
+    dilation: DimensionType,
+    is_causal: CausalArgType,
+    scale: Optional[float],
+    backend: Optional[str],
+    backward_use_pt_reduction: bool,
+    run_persistent_kernel: bool,
+    kernel_schedule: Optional[KernelSchedule],
+    torch_compile: bool,
+    return_lse: bool,
+) -> Union[Tensor, Tuple[Tensor, Tensor]]:
+    """Lowers every `kernel_size == 1` axis away before a backend is ever chosen: such
+    an axis mixes nothing (each query attends only to the token sharing its
+    coordinate on that axis), so `is_causal`/`dilation` there have no effect, and it
+    never needs to reach a real kernel.
+
+    Called from `neighborhood_attention_generic` once `kernel_size` (already
+    normalized with `allow_ones=True`) is known to contain at least one `1`; tile
+    knobs, `backward_kv_splits`, `additional_keys`/`additional_values`, and
+    `attention_kwargs` have already been rejected by the caller in that case, so none
+    of them are threaded through here.
+
+    If every axis is degenerate, this short-circuits to `_degenerate_identity`.
+    Otherwise, a leading run of degenerate axes is folded into the batch dimension by
+    a reshape (a pure view); any further, non-leading degenerate axes are then moved
+    in front of the (still-)kept axes with `movedim` and folded the same way, after a
+    `.contiguous()` (kept axes retain their relative order throughout). Either way,
+    the residual -- rank reduced, every remaining `kernel_size >= 2` -- recurses into
+    `neighborhood_attention_generic` itself, so it goes through the exact same checks
+    and backend selection as any other call; the output (and logsumexp, if requested)
+    are then reshaped/un-permuted back to the caller's original axis order.
+    """
+    degenerate = tuple(axis for axis in range(na_dim) if kernel_size[axis] == 1)
+    if len(degenerate) == na_dim:
+        return _degenerate_identity(query, key, value, scale, return_lse)
+
+    def fold_leading(t: Tensor, n_axes: int) -> Tensor:
+        batch = 1
+        for size in t.shape[: n_axes + 1]:
+            batch *= size
+        return t.reshape(batch, *t.shape[n_axes + 1 :])
+
+    fold_length = 0
+    while fold_length < na_dim and kernel_size[fold_length] == 1:
+        fold_length += 1
+
+    # Captured before folding: (B, s_0, ..., s_{fold_length-1}), needed to invert the
+    # leading fold (itself a pure view, so its inverse is one too) once the residual
+    # call returns.
+    leading_shape = query.shape[: fold_length + 1]
+
+    if fold_length > 0:
+        query = fold_leading(query, fold_length)
+        key = fold_leading(key, fold_length)
+        value = fold_leading(value, fold_length)
+        kernel_size = cast(DimensionType, kernel_size[fold_length:])
+        stride = cast(DimensionType, stride[fold_length:])
+        dilation = cast(DimensionType, dilation[fold_length:])
+        is_causal = cast(CausalArgType, is_causal[fold_length:])
+        na_dim -= fold_length
+
+    # Every axis folded above is non-degenerate by construction of "leading run", so
+    # any degenerate axis still left is necessarily non-leading.
+    remaining = tuple(axis for axis, k in enumerate(kernel_size) if k == 1)
+    permute_src: Optional[List[int]] = None
+    permute_dst: Optional[List[int]] = None
+    permuted_leading_shape: Optional[Tuple[int, ...]] = None
+
+    if remaining:
+        kept = tuple(axis for axis in range(na_dim) if axis not in remaining)
+        permute_src = [axis + 1 for axis in remaining]
+        permute_dst = list(range(1, 1 + len(remaining)))
+
+        query = query.movedim(permute_src, permute_dst).contiguous()
+        key = key.movedim(permute_src, permute_dst).contiguous()
+        value = value.movedim(permute_src, permute_dst).contiguous()
+        permuted_leading_shape = query.shape[: len(remaining) + 1]
+
+        query = fold_leading(query, len(remaining))
+        key = fold_leading(key, len(remaining))
+        value = fold_leading(value, len(remaining))
+        kernel_size = cast(DimensionType, tuple(kernel_size[axis] for axis in kept))
+        stride = cast(DimensionType, tuple(stride[axis] for axis in kept))
+        dilation = cast(DimensionType, tuple(dilation[axis] for axis in kept))
+        is_causal = cast(CausalArgType, tuple(is_causal[axis] for axis in kept))
+        na_dim = len(kept)
+
+    # Always requested from the residual call regardless of the caller's own return_lse: every
+    # backend already computes it unconditionally (neighborhood_attention_generic's normal path
+    # requests it from the backend the same way), and fixing this to a literal `True` (rather
+    # than threading `return_lse` through, which backends already know) is what gives this call
+    # an unambiguous `Tuple[Tensor, Tensor]` return type instead of a `Union`.
+    output, lse = neighborhood_attention_generic(
+        query,
+        key,
+        value,
+        kernel_size=kernel_size,
+        stride=stride,
+        dilation=dilation,
+        is_causal=is_causal,
+        scale=scale,
+        backend=backend,
+        backward_use_pt_reduction=backward_use_pt_reduction,
+        run_persistent_kernel=run_persistent_kernel,
+        kernel_schedule=kernel_schedule,
+        torch_compile=torch_compile,
+        return_lse=True,
+    )
+
+    if permute_src is not None:
+        assert permute_dst is not None and permuted_leading_shape is not None
+        output = output.reshape(*permuted_leading_shape, *output.shape[1:])
+        output = output.movedim(permute_dst, permute_src)
+        lse = lse.reshape(*permuted_leading_shape, *lse.shape[1:])
+        lse = lse.movedim(permute_dst, permute_src)
+
+    if fold_length > 0:
+        output = output.reshape(*leading_shape, *output.shape[1:])
+        lse = lse.reshape(*leading_shape, *lse.shape[1:])
+
+    if return_lse:
+        return output, lse
+    return output
+
+
 def neighborhood_attention_generic(
     query: Tensor,
     key: Tensor,
@@ -387,8 +581,11 @@ def neighborhood_attention_generic(
 
     assert na_dim in [1, 2, 3]
 
+    # allow_ones=True only normalizes kernel_size here; an axis of 1 is lowered away
+    # (folded/permuted into the batch dimension, or short-circuited to identity) below,
+    # before backend selection, so no backend ever has to handle it.
     kernel_size, stride, dilation, is_causal = check_all_args(
-        na_dim, kernel_size, stride, dilation, is_causal
+        na_dim, kernel_size, stride, dilation, is_causal, allow_ones=True
     )
 
     check_args_against_input(
@@ -398,6 +595,40 @@ def neighborhood_attention_generic(
         dilation=dilation,
         is_causal=is_causal,
     )
+
+    if any(k == 1 for k in kernel_size):
+        if (
+            q_tile_shape is not None
+            or kv_tile_shape is not None
+            or backward_q_tile_shape is not None
+            or backward_kv_tile_shape is not None
+            or backward_kv_splits is not None
+        ):
+            raise ValueError(_DEGENERATE_AXIS_TILE_KNOB_MESSAGE)
+
+        if additional_keys is not None or additional_values is not None:
+            raise ValueError(_DEGENERATE_AXIS_ADDITIONAL_CONTEXT_MESSAGE)
+
+        if attention_kwargs is not None:
+            raise ValueError(_DEGENERATE_AXIS_ATTENTION_KWARGS_MESSAGE)
+
+        return _lower_degenerate_axes(
+            na_dim,
+            query,
+            key,
+            value,
+            kernel_size,
+            stride,
+            dilation,
+            is_causal,
+            scale,
+            backend,
+            backward_use_pt_reduction,
+            run_persistent_kernel,
+            kernel_schedule,
+            torch_compile,
+            return_lse,
+        )
 
     has_additional_attention = (
         additional_keys is not None and additional_values is not None
@@ -616,6 +847,16 @@ def na1d(
             !!! note
                 `kernel_size` must be smaller than or equal to `seqlen`.
 
+            !!! note
+                A `kernel_size` of `1` is allowed: that axis mixes nothing (each query attends
+                only to the token sharing its coordinate on that axis), and `is_causal`/
+                `dilation` have no effect there. Such an axis is lowered away in Python -- folded
+                or permuted into the batch dimension -- before reaching a backend kernel; if
+                `kernel_size` is `1` along every axis, the call short-circuits to `output =
+                value`, with no kernel launch. Explicit tile shapes, `backward_kv_splits`,
+                `additional_keys`/`additional_values`, and `attention_kwargs` are not supported
+                together with a `kernel_size = 1` axis.
+
         stride (Tuple[int] | int): Sliding window step size. Defaults to `1` (standard sliding
             window).
 
@@ -810,6 +1051,16 @@ def na2d(
             !!! note
                 `kernel_size` must be smaller than or equal to token layout shape (`(X, Y)`) along
                 every dimension.
+
+            !!! note
+                A `kernel_size` of `1` is allowed along any axis: that axis mixes nothing (each
+                query attends only to the token sharing its coordinate on that axis), and
+                `is_causal`/`dilation` have no effect there. Such an axis is lowered away in
+                Python -- folded or permuted into the batch dimension -- before reaching a
+                backend kernel; if `kernel_size` is `1` along every axis, the call short-circuits
+                to `output = value`, with no kernel launch. Explicit tile shapes,
+                `backward_kv_splits`, `additional_keys`/`additional_values`, and
+                `attention_kwargs` are not supported together with a `kernel_size = 1` axis.
 
         stride (Tuple[int, int] | int): Sliding window step size/shape. Defaults to `1` (standard
             sliding window). If an integer, it will be repeated for all 2 dimensions. For example
@@ -1009,6 +1260,16 @@ def na3d(
             !!! note
                 `kernel_size` must be smaller than or equal to token layout shape (`(X, Y, Z)`)
                 along every dimension.
+
+            !!! note
+                A `kernel_size` of `1` is allowed along any axis: that axis mixes nothing (each
+                query attends only to the token sharing its coordinate on that axis), and
+                `is_causal`/`dilation` have no effect there. Such an axis is lowered away in
+                Python -- folded or permuted into the batch dimension -- before reaching a
+                backend kernel; if `kernel_size` is `1` along every axis, the call short-circuits
+                to `output = value`, with no kernel launch. Explicit tile shapes,
+                `backward_kv_splits`, `additional_keys`/`additional_values`, and
+                `attention_kwargs` are not supported together with a `kernel_size = 1` axis.
 
         stride (Tuple[int, int, int] | int): Sliding window step size/shape. Defaults to `1`
             (standard sliding window). If an integer, it will be repeated for all 3 dimensions.
