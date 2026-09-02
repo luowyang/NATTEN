@@ -1193,6 +1193,12 @@ def na1d_varlen(
     axes with `dilation > 1` still require the document to fit
     `kernel_size * dilation`.
 
+    A layout whose documents all share the same shape (uniform) runs on the
+    fixed-shape CUTLASS FNA kernels instead of the varlen schedule, and
+    returns results bit-for-bit identical to `na{1,2,3}d(..., backend=
+    "cutlass-fna")` on the equivalent batched view -- including the
+    per-document clamp above, applied once for the whole (shared) shape.
+
     `layout` defines the document order for `query`/`key`/`value`; every
     tensor passed with it must be packed in that same order.
 

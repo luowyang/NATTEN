@@ -20,6 +20,10 @@
   attends over its whole extent on that axis (`effective_kernel_size =
   min(kernel_size, extent)`), as long as `dilation == 1` on that axis; axes
   with `dilation > 1` still require the document to fit `kernel_size * dilation`.
+* A `VarlenLayout` whose documents all share the same shape dispatches to
+  the fixed-shape CUTLASS FNA kernels on a batched view instead of
+  building a varlen schedule, returning results bit-for-bit identical to
+  `na{1,2,3}d(..., backend="cutlass-fna")` on that view.
 
 ## [0.21.7] - 2026-07-26
 * Switched to int64 strides in cutlass-fna to avoid overflows in larger use cases.

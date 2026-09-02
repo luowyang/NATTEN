@@ -60,8 +60,15 @@ def _valid_forward_metadata(na_dim: int, device="cuda"):
     -- so every mutation test below starts from a baseline already proven
     correct, and each case changes exactly one property of it.
     """
-    doc_shape = cast(DimensionType, tuple(4 + axis for axis in range(na_dim)))
-    layouts = (doc_shape, doc_shape)
+    # Two DIFFERENT document shapes -- a non-uniform layout -- so this fixture
+    # keeps exercising the varlen schedule/memo path this file's raw-op
+    # boundary tests are about; a uniform layout (every document sharing one
+    # shape) dispatches straight to the fixed-shape kernels instead
+    # (natten.backends.varlen_fna's uniform-dispatch branch), building no
+    # memo entry for this fixture to read.
+    doc_shape_a = cast(DimensionType, tuple(4 + axis for axis in range(na_dim)))
+    doc_shape_b = cast(DimensionType, tuple(5 + axis for axis in range(na_dim)))
+    layouts = (doc_shape_a, doc_shape_b)
     total_tokens = sum(_prod(s) for s in layouts)
     heads, head_dim = 2, 8
     query = torch.randn(

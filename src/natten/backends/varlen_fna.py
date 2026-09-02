@@ -49,6 +49,7 @@ from natten.backends.configs.cutlass.backward_knobs import (
     get_default_varlen_fna_kv_splits,
     get_max_splits,
 )
+from natten.backends.fna import cutlass_fna_generic
 from natten.context import is_kv_parallelism_in_fused_na_enabled
 from natten.types import (
     CausalArgType,
@@ -866,6 +867,89 @@ def _neighborhood_attention_varlen_generic(
             ) + zero_link.to(torch.float32)
             return output, logsumexp
         return output
+
+    # Uniform layouts (every document sharing the same shape) skip the
+    # varlen schedule entirely and run on the fixed-shape CUTLASS FNA
+    # kernels: batched into one [num_docs, *shape, heads, head_dim] tensor,
+    # dispatch reproduces the exact same math bit-for-bit as
+    # na{1,2,3}d(..., backend="cutlass-fna") on that view, since every
+    # document attends only within itself either way (cross-document
+    # attention was never possible) and the fixed kernels accept any
+    # kernel_size <= extent. Calling the backend-private
+    # `cutlass_fna_generic` (kernel dispatch only) rather than the public
+    # `na{2,3}d` keeps lowering decisions confined to this function -- the
+    # fixed family's own public entry does its own (separate) validation and
+    # lowering, which this call must not repeat. No varlen schedule
+    # (worklists, KV-split selection) is built or memoized for this path;
+    # `layout._resolve` is never reached.
+    if layout.is_uniform:
+        shape = layout.shapes[0]
+        effective_kernel = []
+        for kernel_axis, extent, dilation_axis in zip(kernel_size, shape, dilation):
+            if dilation_axis > 1:
+                # Same fit rule as the varlen kernel's per-document clamp
+                # (_build_varlen_fna_state below): only dilation == 1 axes
+                # are defined to clamp; a dilation > 1 axis must still fit
+                # kernel_size * dilation exactly as before.
+                if extent < kernel_axis * dilation_axis:
+                    raise ValueError(
+                        "kernel_size * dilation must fit every token layout "
+                        f"on any axis with dilation > 1; token_layouts[*]="
+                        f"{shape}, dilation={dilation}."
+                    )
+                effective_kernel.append(kernel_axis)
+            else:
+                effective_kernel.append(min(kernel_axis, extent))
+        effective_kernel_size = cast(DimensionType, tuple(effective_kernel))
+
+        # A clamped axis of 1 is a kernel_size the fixed family still
+        # rejects (kernel_size = 1 lowering is a different feature); decline
+        # and fall through to the varlen kernel path below, unchanged --
+        # its own per-document device-side clamp produces the identical
+        # result on this uniform layout regardless, just without the fixed
+        # kernels' fast path.
+        if all(k >= 2 for k in effective_kernel_size):
+            head_dim = query.shape[-1]
+            heads_kv = key.shape[-2]
+            head_dim_v = value.shape[-1]
+            batched_shape = (layout.num_docs,) + shape
+            # The packed tensor is row-major (documents, then each
+            # document's own row-major spatial axes), so batching a uniform
+            # layout is a pure metadata reshape; `.contiguous()` is a no-op
+            # in the common case where it already is one, and only copies
+            # for a genuinely non-contiguous caller.
+            q_b = query.contiguous().view(*batched_shape, num_heads, head_dim)
+            k_b = key.contiguous().view(*batched_shape, heads_kv, head_dim)
+            v_b = value.contiguous().view(*batched_shape, heads_kv, head_dim_v)
+
+            output, lse = cutlass_fna_generic(
+                q_b,
+                k_b,
+                v_b,
+                kernel_size=effective_kernel_size,
+                stride=stride,
+                dilation=dilation,
+                is_causal=is_causal,
+                scale=scale,
+                q_tile_shape=q_tile_shape,
+                kv_tile_shape=kv_tile_shape,
+                backward_q_tile_shape=backward_q_tile_shape,
+                backward_kv_tile_shape=backward_kv_tile_shape,
+                backward_kv_splits=backward_kv_splits,
+                backward_use_pt_reduction=backward_use_pt_reduction,
+                return_lse=True,
+            )
+            # cutlass_fna_generic's logsumexp is unconditionally fp32 (see
+            # _libnatten/torch_wrappers.py's forward wrappers), same as the
+            # varlen kernel path's -- asserted rather than silently trusted,
+            # since a future dtype divergence here would otherwise surface
+            # only as a downstream precision mismatch.
+            assert lse.dtype == torch.float32
+            output = output.reshape(layout.total_tokens, num_heads, head_dim_v)
+            lse = lse.reshape(layout.total_tokens, num_heads)
+            if return_lse:
+                return output, lse
+            return output
 
     config_input = query if value.shape[-1] <= query.shape[-1] else value
     forward_config = check_cutlass_fna_forward_config(

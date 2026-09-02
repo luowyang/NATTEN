@@ -374,7 +374,18 @@ class VarlenFnaGpuTests(unittest.TestCase):
         for i in range(max_tests):
             torch.manual_seed(4051 + i)
 
-            num_docs = int(torch.randint(1, 5, (1,)).item())
+            # >= 2 documents: this sampler's own reference machinery
+            # (_regular_reference/_resolved_state below) introspects a
+            # resolved varlen schedule, which a uniform layout (every
+            # document sharing one shape -- guaranteed for a single
+            # document) never builds, dispatching straight to the
+            # fixed-shape kernels instead (natten.backends.varlen_fna's
+            # uniform-dispatch branch). That path is correct -- covered
+            # separately and directly by test_varlen_uniform_dispatch.py --
+            # just not introspectable this way; single-document coverage
+            # already exists there (including via EFFECTIVE_KERNEL_CASES'
+            # n=1 case).
+            num_docs = int(torch.randint(2, 5, (1,)).item())
             layouts = tuple(
                 tuple(
                     int(torch.randint(4, axis_cap + 1, (1,)).item())
@@ -382,6 +393,16 @@ class VarlenFnaGpuTests(unittest.TestCase):
                 )
                 for _ in range(num_docs)
             )
+            if all(layout == layouts[0] for layout in layouts):
+                # Coincidentally-identical document shapes: still a uniform
+                # layout by chance. Nudge the last document's first axis to
+                # break the tie without consuming the seeded RNG stream (so
+                # every other sampled parameter below is unaffected).
+                perturbed = list(layouts[-1])
+                perturbed[0] = (
+                    perturbed[0] - 1 if perturbed[0] > 4 else perturbed[0] + 1
+                )
+                layouts = layouts[:-1] + (tuple(perturbed),)
             min_extent = tuple(
                 min(layout[axis] for layout in layouts) for axis in range(na_dim)
             )
@@ -1440,7 +1461,12 @@ class VarlenFnaGpuTests(unittest.TestCase):
         # KV-parallel nondeterminism (a separate concern covered by Scenario C).
         pt_reduction_case = VarlenCase(
             "determinism-flip-pt-reduction",
-            ((17,),),
+            # Two different document sizes (non-uniform): this scenario is
+            # about the varlen schedule's uses_kv_parallelism/memo state
+            # specifically (checked below), which a uniform (here, a single-
+            # document) layout would bypass via the uniform-dispatch branch
+            # in natten.backends.varlen_fna.
+            ((17,), (13,)),
             (5,),
             (1,),
             (1,),
@@ -2599,8 +2625,14 @@ class VarlenFnaGpuTests(unittest.TestCase):
         # 2**31-1 (2_147_483_647) -- the smallest crossing at this
         # heads/head_dim. Legal because element count is not fenced; the
         # two counts that ARE fenced stay far under their limits here
-        # (2_097_153 tokens; 16*64=1024).
-        self._run_large_scale_case(((2_097_153,),), heads=16, head_dim=64)
+        # (2_097_153 tokens; 16*64=1024). Two documents (not one): a single
+        # document is a uniform VarlenLayout and runs on the fixed-shape
+        # kernels (natten.backends.varlen_fna's uniform-dispatch branch);
+        # this test is about the varlen schedule, so splitting off a small
+        # second document keeps the exact total-element-count boundary
+        # (active_tokens is their sum) while also exercising a nonzero
+        # token_start, same as test_extended_multi_document_above_int32.
+        self._run_large_scale_case(((2_096_153,), (1_000,)), heads=16, head_dim=64)
 
     @skip_if_not_running_extended_tests()
     @skip_if_libnatten_is_not_supported()
@@ -2612,15 +2644,21 @@ class VarlenFnaGpuTests(unittest.TestCase):
         # (2**31-1), the largest value int32 holds. Together with
         # test_extended_element_count_exact_int32_crossing (2_097_153,
         # the first unsafe length), this pins the precise boundary of
-        # the coordinate-times-stride fix to the token.
-        self._run_large_scale_case(((2_097_152,),), heads=16, head_dim=64)
+        # the coordinate-times-stride fix to the token. Q is active_tokens
+        # (a packed-tensor-wide, document-boundary-independent flat
+        # address), so splitting into two documents -- needed so this
+        # uniform-shape-free layout still reaches the varlen schedule this
+        # test is about, see test_extended_element_count_exact_int32_
+        # crossing -- preserves the exact boundary while it's at it.
+        self._run_large_scale_case(((2_096_152,), (1_000,)), heads=16, head_dim=64)
 
     @skip_if_not_running_extended_tests()
     @skip_if_libnatten_is_not_supported()
     def test_extended_element_count_well_above_int32(self):
         # tokens=4_000_000, heads=16, head_dim=64 -> ~4.1e9 elements, ~1.9x
-        # the int32 element-count limit (2**31-1).
-        self._run_large_scale_case(((4_000_000,),), heads=16, head_dim=64)
+        # the int32 element-count limit (2**31-1). Two documents (not
+        # one): see test_extended_element_count_exact_int32_crossing.
+        self._run_large_scale_case(((3_999_000,), (1_000,)), heads=16, head_dim=64)
 
     @skip_if_not_running_extended_tests()
     @skip_if_libnatten_is_not_supported()
@@ -2659,7 +2697,9 @@ class VarlenFnaGpuTests(unittest.TestCase):
         # widening itself is evidenced by code review (identical
         # tuple-slot type, identical cast pattern as the dim*heads slot
         # exercised above) rather than by a direct over-threshold run.
-        self._run_large_scale_case(((300_000,),), heads=512, head_dim=8)
+        # Two documents (not one): see
+        # test_extended_element_count_exact_int32_crossing.
+        self._run_large_scale_case(((299_000,), (1_000,)), heads=512, head_dim=8)
 
     @skip_if_not_running_extended_tests()
     @skip_if_libnatten_is_not_supported()
@@ -2707,8 +2747,13 @@ class VarlenFnaGpuTests(unittest.TestCase):
             # the memo key (it's a per-call dispatch flag, not a build-time
             # one), so reusing one layout across both calls would be fine
             # too -- a fresh one per call just keeps this test's two
-            # branches obviously independent.
-            layout = natten.VarlenLayout(((tokens,),), device="cuda")
+            # branches obviously independent. Two documents (not one): a
+            # single document is a uniform VarlenLayout and runs on the
+            # fixed-shape kernels (natten.backends.varlen_fna's
+            # uniform-dispatch branch); this test is about the varlen
+            # backward_use_pt_reduction path, so it uses two documents --
+            # see test_extended_element_count_exact_int32_crossing.
+            layout = natten.VarlenLayout(((tokens - 1_000,), (1_000,)), device="cuda")
             output = natten.na1d_varlen(
                 query,
                 key,
@@ -2741,10 +2786,12 @@ class VarlenFnaGpuTests(unittest.TestCase):
         # at over-2**31-element scale. Routed through the shared
         # VarlenCase/_run_case harness, which asserts the resolved state's
         # uses_kv_parallelism and checks grads against the fixed-path
-        # reference within tolerance for non-deterministic cases.
+        # reference within tolerance for non-deterministic cases. Two
+        # documents (not one): see
+        # test_extended_element_count_exact_int32_crossing.
         case = VarlenCase(
             name="int32-boundary-over-fp16-kv-split",
-            layouts=((2_097_153,),),
+            layouts=((2_096_153,), (1_000,)),
             kernel_size=(7,),
             stride=(1,),
             dilation=(1,),
@@ -2767,10 +2814,11 @@ class VarlenFnaGpuTests(unittest.TestCase):
         # head_dim=64 scale, deterministic=True -- the single-split
         # workspace path, over 2**31 elements. Routed through the shared
         # VarlenCase/_run_case harness (bit-identical check against the
-        # fixed-path reference for deterministic cases).
+        # fixed-path reference for deterministic cases). Two documents
+        # (not one): see test_extended_element_count_exact_int32_crossing.
         case = VarlenCase(
             name="int32-boundary-over-fp16-deterministic",
-            layouts=((2_097_153,),),
+            layouts=((2_096_153,), (1_000,)),
             kernel_size=(7,),
             stride=(1,),
             dilation=(1,),
