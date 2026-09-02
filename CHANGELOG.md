@@ -24,6 +24,15 @@
   the fixed-shape CUTLASS FNA kernels on a batched view instead of
   building a varlen schedule, returning results bit-for-bit identical to
   `na{1,2,3}d(..., backend="cutlass-fna")` on that view.
+* `na{1,2,3}d_varlen`'s `kernel_size` may contain `1`: that axis mixes
+  nothing (each query attends only to tokens sharing its coordinate on that
+  axis), with no effect from `is_causal`/`dilation` there. Such an axis is
+  lowered away in Python (folded or permuted, depending on position) before
+  reaching a CUDA kernel; an all-degenerate call short-circuits to an
+  identity (`output = value`, `logsumexp = scale * (query * key).sum(-1)`)
+  with no kernel launch. Explicit tile shapes and `backward_kv_splits` are
+  not supported together with a `kernel_size = 1` axis. The fixed
+  (non-varlen) family is unchanged and still rejects `kernel_size = 1`.
 
 ## [0.21.7] - 2026-07-26
 * Switched to int64 strides in cutlass-fna to avoid overflows in larger use cases.

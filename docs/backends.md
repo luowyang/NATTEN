@@ -88,7 +88,21 @@ on that axis; axes with `dilation > 1` still require the document to fit
 `kernel_size * dilation`. A layout whose documents all share the same shape
 (uniform) dispatches to the fixed-shape CUTLASS FNA kernels on a batched
 view instead of building a varlen schedule, matching `na{1,2,3}d(...,
-backend="cutlass-fna")` bit-for-bit. All documents in one layout share the
+backend="cutlass-fna")` bit-for-bit.
+
+A `kernel_size` entry may be `1`: that axis mixes nothing (each query
+attends only to tokens sharing its coordinate on that axis), and
+`is_causal`/`dilation` have no effect there. Such an axis is lowered away
+in Python -- folded (zero-copy, for a leading run) or permuted (gather in,
+scatter back, for the rest) -- before reaching a CUDA kernel, which only
+ever sees `kernel_size >= 2`; if every axis ends up `1` the call
+short-circuits to `output = value`, `logsumexp = scale * (query *
+key).sum(-1)`, with no kernel launch. Explicit tile shapes and
+`backward_kv_splits` are not supported together with a `kernel_size = 1`
+axis (lowering changes the call's rank). The fixed (non-varlen) family is
+unaffected -- `na{1,2,3}d` still rejects `kernel_size = 1`.
+
+All documents in one layout share the
 same spatial rank; `kernel_size`, `stride`, `dilation`, and the causal mask are
 per-call arguments, not bound to the layout, so the same layout can be reused
 across different geometries. A `VarlenLayout` defines the document order for
