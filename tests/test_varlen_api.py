@@ -176,9 +176,11 @@ class VarlenFnaValidationTests(unittest.TestCase):
         # Non-empty CPU tensors raise deeper in the function, once device
         # work starts; this only pins that it is the same exception CLASS as
         # the all-empty fast path's check above, not that it is the same
-        # message or raised at the same call site.
-        layout = natten.VarlenLayout(((8,),))
-        query, key, value = self._qkv()
+        # message or raised at the same call site. Two different document
+        # shapes (non-uniform) so this still reaches that device work
+        # instead of the uniform-dispatch branch.
+        layout = natten.VarlenLayout(((8,), (9,)))
+        query, key, value = self._qkv(total_tokens=17)
         with self.assertRaises(ValueError):
             natten.na1d_varlen(query, key, value, layout, kernel_size=3)
 
@@ -222,17 +224,20 @@ class VarlenFnaValidationTests(unittest.TestCase):
         # These two checks (allowed dtypes; kernel_size * dilation fits every
         # document) live inside the memo-miss build, which needs a device
         # capability query -- mocked here so the test still runs without a
-        # real GPU.
+        # real GPU. Both fixtures use two DIFFERENT document shapes (a
+        # non-uniform layout): a uniform layout dispatches straight to the
+        # fixed-shape kernels instead (natten.backends.varlen_fna's
+        # uniform-dispatch branch), which never reaches this build path.
         with (
             mock.patch.object(torch.cuda, "get_device_capability", return_value=(8, 0)),
         ):
-            layout = natten.VarlenLayout(((8,),))
-            query, key, value = self._qkv(total_tokens=8, dtype=torch.int32)
+            layout = natten.VarlenLayout(((8,), (9,)))
+            query, key, value = self._qkv(total_tokens=17, dtype=torch.int32)
             with self.assertRaisesRegex(ValueError, "FP16, BF16, and FP32"):
                 natten.na1d_varlen(query, key, value, layout, kernel_size=3)
 
-            layout = natten.VarlenLayout(((5,),))
-            query, key, value = self._qkv(total_tokens=5)
+            layout = natten.VarlenLayout(((5,), (6,)))
+            query, key, value = self._qkv(total_tokens=11)
             with self.assertRaisesRegex(ValueError, "must fit every token layout"):
                 natten.na1d_varlen(query, key, value, layout, kernel_size=3, dilation=2)
 
@@ -264,8 +269,14 @@ class VarlenFnaValidationTests(unittest.TestCase):
             with mock.patch.object(
                 torch.cuda, "get_device_capability", return_value=capability
             ):
-                layout = natten.VarlenLayout(((8,),))
-                query, key, value = self._qkv(dtype=dtype, device="cuda")
+                # Two different document shapes (non-uniform): this test is
+                # about the varlen build path's own capability gate, which a
+                # uniform layout would bypass via the uniform-dispatch
+                # branch.
+                layout = natten.VarlenLayout(((8,), (9,)))
+                query, key, value = self._qkv(
+                    dtype=dtype, device="cuda", total_tokens=17
+                )
                 natten.na1d_varlen(query, key, value, layout, kernel_size=3)
 
         # Per-dtype floor mirroring the C++ dispatch guard the kernels launch
@@ -676,13 +687,16 @@ class VarlenFnaApiTests(unittest.TestCase):
         previous_kv_parallelism = is_kv_parallelism_in_fused_na_enabled()
         previous_preference = get_memory_usage_preference().name.lower()
         natten.use_kv_parallelism_in_fused_na(True)
-        # Same (layouts, dilation, kernel_size, backward tile) combination
-        # test_default_split_heuristic_respects_rank_and_memory_limits
-        # already proved selects (256,) under "unrestricted"/"default" and
-        # (128,) under "strict" -- reused here so the expected split counts
-        # below are pinned to an independently-verified selector result,
-        # not a value this test invents and could tautologically satisfy.
-        layouts = ((32768,), (32768,))
+        # Two different (non-uniform) document sizes -- a uniform layout
+        # dispatches straight to the fixed-shape kernels instead (natten.
+        # backends.varlen_fna's uniform-dispatch branch), building no memo
+        # entry for this test to read. dilation/backward_tile match
+        # test_default_split_heuristic_respects_rank_and_memory_limits'
+        # (32768,)x2 case; the expected split counts below are independently
+        # verified the same way that test verifies its own (direct
+        # _build_varlen_fna_state probe, not a value this test invents and
+        # could tautologically satisfy against its own na1d_varlen call).
+        layouts = ((32768,), (32769,))
         dilation = (2,)
         kernel_size = (3,)
         backward_tile = (64,)
@@ -718,7 +732,7 @@ class VarlenFnaApiTests(unittest.TestCase):
                 for entry in layout._memo.values()
                 if entry is not unrestricted_entry
             )
-            self.assertEqual(unrestricted_entry.selected_splits, ((256,), (256,)))
+            self.assertEqual(unrestricted_entry.selected_splits, ((256,), (257,)))
             self.assertEqual(strict_entry.selected_splits, ((128,), (128,)))
         finally:
             natten.set_memory_usage_preference(previous_preference)

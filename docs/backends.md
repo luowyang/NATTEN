@@ -85,7 +85,10 @@ empty outputs without a kernel launch. A document narrower than `kernel_size`
 on some axis attends over its whole extent on that axis instead
 (`effective_kernel_size = min(kernel_size, extent)`), as long as `dilation == 1`
 on that axis; axes with `dilation > 1` still require the document to fit
-`kernel_size * dilation`. All documents in one layout share the
+`kernel_size * dilation`. A layout whose documents all share the same shape
+(uniform) dispatches to the fixed-shape CUTLASS FNA kernels on a batched
+view instead of building a varlen schedule, matching `na{1,2,3}d(...,
+backend="cutlass-fna")` bit-for-bit. All documents in one layout share the
 same spatial rank; `kernel_size`, `stride`, `dilation`, and the causal mask are
 per-call arguments, not bound to the layout, so the same layout can be reused
 across different geometries. A `VarlenLayout` defines the document order for

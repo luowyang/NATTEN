@@ -249,6 +249,11 @@ class VarlenLayout:
         self._num_docs = num_docs
         self._total_tokens = total_tokens
         self._max_seqlen = max(math.prod(shape) for shape in shapes)
+        # Cached once here (rather than recomputed per call): every document
+        # sharing the same shape is what lets a call dispatch straight to the
+        # fixed-shape kernels on a batched view (see
+        # _neighborhood_attention_varlen_generic's uniform-dispatch branch).
+        self._is_uniform = all(shape == shapes[0] for shape in shapes)
 
     # -- device materialization --------------------------------------------
 
@@ -362,6 +367,13 @@ class VarlenLayout:
     def rank(self) -> int:
         """Spatial rank (1, 2, or 3) shared by every packed document."""
         return self._rank
+
+    @property
+    def is_uniform(self) -> bool:
+        """Whether every document shares the same spatial shape. Cached at
+        construction; a layout with a single document is trivially
+        uniform."""
+        return self._is_uniform
 
     @property
     def shapes(self) -> Tuple[DimensionType, ...]:
