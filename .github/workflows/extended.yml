@@ -1,0 +1,116 @@
+name: extended
+
+# STATUS (2026-09-02): currently non-functional. This targets a
+# self-hosted GPU runner, and the self-hosted-runner design was dropped
+# (see wheel.yml's header and .github/README-fork-ci.md) -- no such
+# runner will ever register, so a dispatch of this workflow will queue
+# forever. Left as-is (workflow_dispatch only, so nothing triggers it by
+# accident) pending a decision: delete it, or redesign extended test
+# coverage around what's actually available (GitHub-hosted has no GPU,
+# so the NATTEN_RUN_EXTENDED_TESTS runs below are meaningless without
+# one). Not addressed in this pass -- flagged, not decided here.
+#
+# Manually-triggered, longer-running test pass on the self-hosted GPU
+# runner: NATTEN_RUN_EXTENDED_TESTS=1 against tests/test_fna_varlen.py
+# and tests/test_varlen_api.py (the extended/rand-sweep cases those
+# files gate behind that flag -- see src/natten/_environment.py's
+# _RUN_EXTENDED_TESTS).
+#
+# DESIGN CHOICE (asked for explicitly, documented here): this builds a
+# plain **editable install** (`pip install --no-build-isolation --no-deps
+# -e .`, i.e. what natten_dev itself and `make install-dev` do), NOT a
+# packaged wheel via integration/build_wheel.sh. Reasoning:
+#   - This workflow's job is test coverage, not packaging/release
+#     verification -- that's wheel.yml's job, and it already covers "does
+#     the wheel build and install correctly" every tag build.
+#   - build_wheel.sh always does the full build-wheel-then-install round
+#     trip; reusing it here would mean paying that packaging cost (and,
+#     worse, its own env-lifecycle wrapper (integration/ci_build_wheel.sh)
+#     deletes its throwaway env the moment the build finishes -- see that
+#     script's header -- so it can't hand off a live env to a follow-up
+#     test step without changing its "always clean up" contract, which
+#     wheel.yml relies on).
+#   - An editable install skips wheel packaging entirely and gets to
+#     "tests can run" faster, leaving more of the 180-minute budget for
+#     the actual extended run, which is the point of this workflow.
+# Still reuses build_wheel.sh's proven ingredients where they apply
+# (conda ToS accept, clone-from-natten_dev, the CUDA build env vars) --
+# just without its wheel-packaging phase, and with its own throwaway env
+# (not integration/'s), since this is a distinct enough need that
+# folding it into build_wheel.sh's flags would complicate that script
+# for its one real caller (wheel.yml).
+
+on:
+  workflow_dispatch: {}
+
+concurrency:
+  group: extended-tests
+  cancel-in-progress: false
+
+jobs:
+  extended-tests:
+    runs-on: [self-hosted, gpu-sm90]
+    timeout-minutes: 180
+    env:
+      CONDA_BIN: /cpfs/luowenyang/miniconda3/bin/conda
+      SOURCE_ENV: /cpfs/luowenyang/miniconda3/envs/natten_dev
+      ENV_PATH: /cpfs/luowenyang/natten_dev/ci/envs/extended-${{ github.run_id }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Pick an idle GPU
+        id: pick_gpu
+        run: |
+          GPU="$(.github/scripts/pick_idle_gpu.sh)"
+          echo "Selected GPU index: $GPU"
+          echo "CUDA_VISIBLE_DEVICES=$GPU" >> "$GITHUB_ENV"
+
+      - name: Build editable install (throwaway env, cloned from natten_dev)
+        run: |
+          "$CONDA_BIN" tos accept --override-channels --channel https://repo.anaconda.com/pkgs/main
+          "$CONDA_BIN" tos accept --override-channels --channel https://repo.anaconda.com/pkgs/r
+          mkdir -p "$(dirname "$ENV_PATH")"
+          "$CONDA_BIN" create -y --clone "$SOURCE_ENV" -p "$ENV_PATH"
+
+          export CUDA_HOME=/usr/local/cuda
+          export CUDACXX=/usr/local/cuda/bin/nvcc
+          export PATH=/usr/local/cuda/bin:${PATH}
+          export TMPDIR=/cpfs/luowenyang/natten_dev/tmp
+          mkdir -p "$TMPDIR"
+          export NATTEN_CUDA_ARCH="9.0"
+          export NATTEN_N_WORKERS=39
+          export NATTEN_AUTOGEN_POLICY=default
+          export NATTEN_VERBOSE=1
+
+          git submodule update --init --recursive
+          if [[ ! -d third_party/cutlass/include ]] || [[ -z "$(ls -A third_party/cutlass/include 2>/dev/null)" ]]; then
+            echo "ERROR: third_party/cutlass/include is missing or empty after submodule update." >&2
+            exit 1
+          fi
+
+          "$CONDA_BIN" run -p "$ENV_PATH" --no-capture-output \
+            pip install --no-build-isolation --no-deps -e .
+
+          INSTALLED_VERSION="$("$CONDA_BIN" run -p "$ENV_PATH" --no-capture-output python -c 'import natten; print(natten.__version__)')"
+          echo "Editable install OK, natten.__version__ = $INSTALLED_VERSION"
+
+      - name: Extended tests (tests/test_fna_varlen.py tests/test_varlen_api.py)
+        env:
+          NATTEN_RUN_EXTENDED_TESTS: "1"
+          NATTEN_LOG_LEVEL: CRITICAL
+          PYTORCH_NO_CUDA_MEMORY_CACHING: "1"
+          CUBLAS_WORKSPACE_CONFIG: ":4096:8"
+          TRITON_CACHE_DIR: /cpfs/luowenyang/natten_dev/ci/cache/triton
+          TORCHINDUCTOR_CACHE_DIR: /cpfs/luowenyang/natten_dev/ci/cache/inductor
+        run: |
+          mkdir -p "$TRITON_CACHE_DIR" "$TORCHINDUCTOR_CACHE_DIR"
+          "$CONDA_BIN" run -p "$ENV_PATH" --no-capture-output \
+            python -m pytest -v tests/test_fna_varlen.py tests/test_varlen_api.py
+
+      - name: Clean up throwaway env
+        if: always()
+        run: |
+          "$CONDA_BIN" env remove -y -p "$ENV_PATH" || true

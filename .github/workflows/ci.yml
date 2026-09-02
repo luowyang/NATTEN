@@ -1,0 +1,87 @@
+name: ci
+
+# Lint + host-only tests on GitHub-hosted runners. No CUDA build here --
+# see .github/README-fork-ci.md for why (short version: libnatten needs
+# a self-hosted GPU runner, wired up in wheel.yml / extended.yml
+# instead). This workflow must stay green on a plain ubuntu-latest
+# runner with no GPU and no compiled extension.
+
+on:
+  push:
+    branches:
+      - fork-ci
+      - dev
+  workflow_dispatch: {}
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint-and-host-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        # No submodules: nothing linted or run here touches csrc/ or the
+        # cutlass submodule.
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dev dependencies
+        run: pip install -r requirements-dev.txt
+
+      - name: Install natten (pure-Python, no CUDA build)
+        run: pip install --no-build-isolation --no-deps -e .
+        # NATTEN_CUDA_ARCH is deliberately left unset. setup.py: if it's
+        # unset AND torch.cuda.is_available() is False (true on
+        # ubuntu-latest -- no NVIDIA driver at all), CUDA_ARCH stays ""
+        # and BUILD_WITH_CUDA = (CUDA_ARCH != "") is False, so
+        # ext_modules=[] and cmdclass={} -- no CMake/nvcc invocation.
+        # This is upstream's own documented no-GPU install path (setup.py's
+        # "Building WITHOUT libnatten" branch), not a CI-only hack.
+        # natten/_libnatten/__init__.py's `except ImportError: HAS_LIBNATTEN
+        # = False` then lets the rest of natten import cleanly against
+        # stub kernels. Verified locally (CUDA_VISIBLE_DEVICES="" on a
+        # GPU box, to reproduce "no driver visible"): editable install
+        # succeeds with zero CMake invocation.
+
+      - name: ufmt check
+        run: ufmt check src/natten tests scripts setup.py
+
+      - name: flake8
+        run: flake8 src/natten tests scripts setup.py
+
+      - name: mypy (src/natten)
+        run: mypy src/natten
+        # requirements-dev.txt already installs rich==14.0.0, and the
+        # rich 14.0.0 wheel ships a `rich/py.typed` marker (checked by
+        # inspecting the wheel directly) -- so the historically-known
+        # "Cannot find implementation or library stub for module named
+        # rich.console/rich.table" error (src/natten/profiling_utils/
+        # pretty_printer.py:40-41; last seen 2026-08-25 per this fork's
+        # own integration notes, reproduced locally against an env
+        # without rich installed) does not occur once rich is actually
+        # installed. No mypy ignore rule needed; nothing to allow here.
+
+      - name: Host-only tests (tests/test_varlen_layout.py, if present)
+        run: |
+          if [ -f tests/test_varlen_layout.py ]; then
+            pytest -v tests/test_varlen_layout.py
+          else
+            echo "tests/test_varlen_layout.py is not present on this ref."
+            echo "VarlenLayout (and its host-only test classes) is added by this fork's varlen topic branches, not upstream v0.21.7 -- 'fork-ci' itself (branched straight from origin/main) doesn't have it; 'dev' does, once assemble.sh merges those branches in."
+            echo "No other file under tests/ has a class that runs without CUDA/libnatten (checked: everything else needs a real device or the compiled extension), so this job is lint-only on this ref."
+          fi
+        # On a ref that does have the file: VarlenLayoutGpuMechanismTests
+        # is `@unittest.skipUnless(torch.cuda.is_available())`, so it
+        # cleanly skips here; VarlenLayoutConstructionTests,
+        # TileCountMechanismTests, VarlenLayoutMemoMechanismTests, and
+        # VarlenLayoutIdentityAndPicklingTests are genuine host-only
+        # logic (construction, memoization, pickling -- no device
+        # materialization) and actually run. Verified locally (CUDA
+        # hidden): 22 passed, 23 skipped, 0 failed.
