@@ -115,22 +115,27 @@ jobs:
           python-version: "3.11"
           cache: pip
 
-      - name: Free disk space if needed
+      - name: Free disk space
         id: free_disk
         run: |
           set -euo pipefail
           echo "--- df -h (before) ---"
           df -h
-          AVAIL_GB="$(df --output=avail -BG / | tail -1 | tr -dc '0-9')"
-          echo "Available on / : ${AVAIL_GB}G"
-          if [[ "$AVAIL_GB" -lt 12 ]]; then
-            echo "Free space below 12G threshold -- clearing standard hosted-runner preinstalled bulk (dotnet/android/ghc; the usual 'maximize build space' trick) before the CUDA toolkit install."
-            sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc || true
-            echo "--- df -h (after cleanup) ---"
-            df -h
-          else
-            echo "Free space above threshold; skipping cleanup."
-          fi
+          # Unconditional, not threshold-gated: two attempts at this
+          # workflow both had "Build wheel" killed (SIGTERM, exit 143)
+          # deep into the compile with no reachable error text -- disk
+          # exhaustion is the leading hypothesis (see wheel.yml's header
+          # and the Build wheel step's own comments), and none of this
+          # preinstalled bulk is ever needed for a CUDA/C++ build, so
+          # there's no reason to gate its removal behind a threshold
+          # that's only checked this early, before the multi-GB CUDA
+          # toolkit + torch installs that actually consume the space.
+          echo "Clearing standard hosted-runner preinstalled bulk (dotnet/android/ghc/docker images; the usual 'maximize build space' trick)."
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc || true
+          sudo docker image prune -af || true
+          sudo apt-get clean || true
+          echo "--- df -h (after cleanup) ---"
+          df -h
 
       - name: Install CUDA toolkit 12.8
         id: cuda-toolkit
@@ -168,6 +173,61 @@ jobs:
           # `python -m build --no-isolation` (unlike a plain `pip install
           # -e .`) enforces build-system requirements' own declared
           # constraints.
+
+      - name: Push pre-build diagnostics checkpoint (ci-logs branch)
+        id: pre_build_checkpoint
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -uo pipefail
+          # Two prior attempts both had "Build wheel" killed by an
+          # external SIGTERM (exit 143) with no reachable log content,
+          # AND the final always() relay step never got to run either --
+          # `gh api .../actions/runs/<id>` showed conclusion "failure",
+          # not "cancelled", so this isn't an ordinary job cancellation
+          # skipping later steps; something about the process being
+          # signal-killed appears to stop the job before any later step
+          # (even always()) gets a chance to run at all. So: checkpoint
+          # disk/memory state HERE, before the risky step, rather than
+          # only at the end -- if Build wheel dies the same way again,
+          # this is pushed already and survives regardless.
+          {
+            echo "wheel.yml run ${{ github.run_id }} attempt ${{ github.run_attempt }}: pre-build checkpoint"
+            echo "Ref built: ${{ steps.resolve_ref.outputs.build_ref }}"
+            echo
+            echo "--- df -h ---"
+            df -h
+            echo
+            echo "--- free -m ---"
+            free -m
+            echo
+            echo "--- nproc ---"
+            nproc
+          } > pre_build_checkpoint.txt
+          cat pre_build_checkpoint.txt
+
+          git config --global user.email "ci@users.noreply.github.com"
+          git config --global user.name "NATTEN fork CI"
+          REMOTE_URL="https://x-access-token:${GH_TOKEN}@github.com/luowyang/NATTEN.git"
+          WORKDIR="$(mktemp -d)"
+          if git ls-remote --exit-code "$REMOTE_URL" refs/heads/ci-logs >/dev/null 2>&1; then
+            git clone --quiet --depth 1 --branch ci-logs "$REMOTE_URL" "$WORKDIR"
+          else
+            git init --quiet -b ci-logs "$WORKDIR"
+          fi
+          DEST="$WORKDIR/runs/${{ github.run_id }}-${{ github.run_attempt }}"
+          mkdir -p "$DEST"
+          cp pre_build_checkpoint.txt "$DEST/"
+          git -C "$WORKDIR" add -A
+          if git -C "$WORKDIR" diff --cached --quiet; then
+            echo "Nothing to commit."
+          else
+            git -C "$WORKDIR" commit --quiet -m "wheel.yml run ${{ github.run_id }} attempt ${{ github.run_attempt }}: pre-build checkpoint"
+            git -C "$WORKDIR" push --quiet "$REMOTE_URL" "HEAD:refs/heads/ci-logs"
+            echo "Pushed: runs/${{ github.run_id }}-${{ github.run_attempt }}/pre_build_checkpoint.txt on ci-logs"
+          fi
+          exit 0
 
       - name: Build wheel
         id: build
@@ -374,11 +434,12 @@ jobs:
             echo "  Resolve build ref                 : ${{ steps.resolve_ref.outcome }}"
             echo "  Checkout                           : ${{ steps.checkout.outcome }}"
             echo "  Set up Python 3.11                 : ${{ steps.setup_python.outcome }}"
-            echo "  Free disk space if needed          : ${{ steps.free_disk.outcome }}"
+            echo "  Free disk space                    : ${{ steps.free_disk.outcome }}"
             echo "  Install CUDA toolkit 12.8          : ${{ steps.cuda-toolkit.outcome }}"
             echo "  Disk space after CUDA install      : ${{ steps.post_cuda_df.outcome }}"
             echo "  Set up sccache                     : ${{ steps.sccache_setup.outcome }}"
             echo "  Install Python build dependencies  : ${{ steps.deps.outcome }}"
+            echo "  Pre-build diagnostics checkpoint   : ${{ steps.pre_build_checkpoint.outcome }}"
             echo "  Build wheel                        : ${{ steps.build.outcome }}"
             echo "  Install wheel + import smoke test  : ${{ steps.install_smoke.outcome }}"
             echo "  Build manifest                     : ${{ steps.manifest.outcome }}"
