@@ -55,12 +55,22 @@ from natten.context import (
     use_deterministic_algorithms,
     use_kv_parallelism_in_fused_na,
 )
-from natten.functional import attention, merge_attentions, na1d, na2d, na3d
+from natten.functional import (
+    attention,
+    merge_attentions,
+    na1d,
+    na1d_varlen,
+    na2d,
+    na2d_varlen,
+    na3d,
+    na3d_varlen,
+)
 from natten.modules import (
     NeighborhoodAttention1D,
     NeighborhoodAttention2D,
     NeighborhoodAttention3D,
 )
+from natten.varlen import VarlenLayout
 from natten.version import __version__
 
 __all__ = [
@@ -101,6 +111,10 @@ __all__ = [
     "na1d",
     "na2d",
     "na3d",
+    "na1d_varlen",
+    "na2d_varlen",
+    "na3d_varlen",
     "attention",
     "merge_attentions",
+    "VarlenLayout",
 ]
