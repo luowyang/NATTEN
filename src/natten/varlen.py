@@ -97,6 +97,104 @@ def _prefix_offsets(counts: Sequence[int]) -> Tuple[int, ...]:
     return tuple(offsets)
 
 
+def _derive_repeated_shapes(
+    shapes: Tuple[DimensionType, ...],
+    group_axes: Tuple[int, ...],
+    keep_axes: Tuple[int, ...],
+) -> Tuple[DimensionType, ...]:
+    """Shared shape arithmetic behind both VarlenLayout._folded and
+    ._permuted: each document's shape becomes ``prod(shape[group_axes])``
+    documents of shape ``shape[keep_axes]``. A zero extent on a grouped axis
+    contributes zero sub-documents (the parent had zero tokens on that
+    account too); a zero extent on a kept axis instead contributes that
+    many empty (zero-token) sub-documents -- existing empty-document
+    semantics, unaffected either way.
+    """
+    derived: List[DimensionType] = []
+    for shape in shapes:
+        # List comprehensions, not generator expressions, into math.prod/
+        # tuple: torch.compile(fullgraph=True) can trace this function when
+        # `layout` (and so this call) is a plain argument rather than a
+        # closure-captured value, and a bare generator handed to math.prod
+        # is a known dynamo tracing gap a list is not.
+        count = math.prod([shape[axis] for axis in group_axes])
+        kept = cast(DimensionType, tuple([shape[axis] for axis in keep_axes]))
+        derived.extend([kept] * count)
+    return tuple(derived)
+
+
+@torch.library.custom_op("natten::varlen_build_permutation_tensors", mutates_args=())
+def _varlen_build_permutation_tensors(
+    shapes_flat: List[int],
+    rank: int,
+    group_axes: List[int],
+    device: torch.device,
+) -> Tuple[Tensor, Tensor]:
+    """VarlenLayout._permuted's memo-miss device work, behind an opaque
+    custom-op boundary for the same reason as varlen_fna.py's
+    _varlen_build_schedule_tensors (see that docstring): a geometry miss
+    taken at torch.compile trace time records one opaque op call instead of
+    inlining the ATen ops below into the graph, so a later memo hit (a
+    dict lookup) never re-enters or replays this build.
+
+    Host-only shape arithmetic (rank-many ints per document, flattened, so
+    every document's shape is recovered by slicing ``rank`` at a time) plus
+    the per-document index construction the class docstring describes:
+    ``arange(numel).view(shape).permute(group_axes + keep_axes).reshape(-1)
+    + offset``, concatenated across documents into ``perm``, then inverted
+    into ``inv`` by one scatter (``inv[perm] = arange(total)``) -- the
+    inverse of a permutation is its own scatter-built lookup, not a second
+    sort or argsort.
+    """
+    num_docs = len(shapes_flat) // rank
+    shapes = [
+        tuple(shapes_flat[index * rank : (index + 1) * rank])
+        for index in range(num_docs)
+    ]
+    keep_axes = tuple(axis for axis in range(rank) if axis not in group_axes)
+    order = tuple(group_axes) + keep_axes
+    lengths = [math.prod(shape) for shape in shapes]
+    offsets = _prefix_offsets(lengths)
+    with torch.inference_mode(False):
+        parts = []
+        for doc_index, shape in enumerate(shapes):
+            length = lengths[doc_index]
+            if length == 0:
+                # A zero-token document (some axis is 0, group or kept)
+                # contributes no rows to permute -- see
+                # _derive_repeated_shapes's docstring.
+                continue
+            local = torch.arange(length, dtype=torch.int64, device=device).view(shape)
+            parts.append(local.permute(order).reshape(-1) + offsets[doc_index])
+        total = offsets[-1]
+        perm = (
+            torch.cat(parts)
+            if parts
+            else torch.empty((0,), dtype=torch.int64, device=device)
+        )
+        inv = torch.empty_like(perm)
+        inv[perm] = torch.arange(total, dtype=torch.int64, device=device)
+    return perm, inv
+
+
+@_varlen_build_permutation_tensors.register_fake
+def _(
+    shapes_flat: List[int],
+    rank: int,
+    group_axes: List[int],
+    device: torch.device,
+) -> Tuple[Tensor, Tensor]:
+    num_docs = len(shapes_flat) // rank
+    total = sum(
+        math.prod(shapes_flat[index * rank : (index + 1) * rank])
+        for index in range(num_docs)
+    )
+    return (
+        torch.empty((total,), dtype=torch.int64, device=device),
+        torch.empty((total,), dtype=torch.int64, device=device),
+    )
+
+
 class VarlenLayout:
     """Packed-document layout for variable-length neighborhood attention.
 
@@ -211,6 +309,18 @@ class VarlenLayout:
         self._memo: Dict[Hashable, "_VarlenFnaResolvedState"] = {}
         self._cu_seqlens: Optional[Tensor] = None
         self._token_layouts: Optional[Tensor] = None
+        # Degenerate-axis lowering's derived state (see
+        # natten.backends.varlen_lowering): both keyed and owned per-object,
+        # same identity-semantics rationale as _memo above. _fold_memo maps
+        # a leading-fold length to the derived (lower-rank) VarlenLayout;
+        # _permute_memo maps a tuple of degenerate axis indices (in this
+        # layout's own rank) to the derived VarlenLayout plus the (perm,
+        # inv) index tensors gather/scatter the tokens with. Neither
+        # survives pickling (see __getstate__/__setstate__).
+        self._fold_memo: Dict[int, "VarlenLayout"] = {}
+        self._permute_memo: Dict[
+            Tuple[int, ...], Tuple["VarlenLayout", Tensor, Tensor]
+        ] = {}
         if device is not None:
             self._materialize(torch.device(device))
 
@@ -234,7 +344,13 @@ class VarlenLayout:
                 f"Number of documents must not exceed {_VARLEN_INT32_MAX} "
                 f"(worklist document ids are int32), got {num_docs=}."
             )
-        total_tokens = sum(math.prod(shape) for shape in shapes)
+        # List comprehensions, not generator expressions: this constructor
+        # runs under torch.compile(fullgraph=True) whenever a degenerate-
+        # axis lowering call (natten.backends.varlen_lowering) constructs a
+        # derived layout from a directly-passed (not closure-captured)
+        # VarlenLayout argument, and a bare generator handed to sum/max/
+        # math.prod is a dynamo tracing gap a list is not.
+        total_tokens = sum([math.prod(shape) for shape in shapes])
         # The token COUNT must fit int32 because the schedule metadata
         # (cu_seqlens, worklists, document ids) is int32 end to end; element
         # counts (tokens * heads * head_dim) are deliberately unfenced --
@@ -248,7 +364,7 @@ class VarlenLayout:
         self._rank = len(shapes[0])
         self._num_docs = num_docs
         self._total_tokens = total_tokens
-        self._max_seqlen = max(math.prod(shape) for shape in shapes)
+        self._max_seqlen = max([math.prod(shape) for shape in shapes])
         # Cached once here (rather than recomputed per call): every document
         # sharing the same shape is what lets a call dispatch straight to the
         # fixed-shape kernels on a batched view (see
@@ -260,7 +376,7 @@ class VarlenLayout:
     def _materialize(self, device: torch.device) -> None:
         if device.type != "cuda" or not torch.cuda.is_available():
             raise ValueError("Variable-length CUTLASS FNA requires a CUDA device.")
-        lengths = tuple(math.prod(shape) for shape in self._shapes)
+        lengths = tuple([math.prod(shape) for shape in self._shapes])
         with torch.inference_mode(False):
             cu_seqlens = torch.tensor(
                 _prefix_offsets(lengths), dtype=torch.int32, device=device
@@ -310,6 +426,70 @@ class VarlenLayout:
         entry = build()
         self._memo[key] = entry
         return entry
+
+    # -- degenerate-axis lowering (natten.backends.varlen_lowering) -------
+
+    def _folded(self, f: int) -> "VarlenLayout":
+        """Leading-fold derived layout: each document's shape ``s`` becomes
+        ``prod(s[:f])`` consecutive documents of shape ``s[f:]``. Pure
+        metadata repartitioning -- a document's own axes are already
+        row-major, so every leading index's sub-block is already
+        contiguous, and no packed tensor needs a view or copy for this.
+        Memoized per ``f``: a repeated call with the same ``f`` returns the
+        same derived object (so ITS OWN memo/derived state -- schedule,
+        further folds/permutes -- is also reused, not rebuilt per call).
+        """
+        derived = self._fold_memo.get(f)
+        if derived is not None:
+            return derived
+        derived = VarlenLayout(
+            _derive_repeated_shapes(
+                self._shapes, tuple(range(f)), tuple(range(f, self._rank))
+            )
+        )
+        self._fold_memo[f] = derived
+        return derived
+
+    def _permuted(
+        self, group_axes: Tuple[int, ...], device: torch.device
+    ) -> Tuple["VarlenLayout", Tensor, Tensor]:
+        """Non-leading-fold derived layout: each document's shape ``s``
+        becomes ``prod(s[group_axes])`` documents of shape ``s[keep_axes]``
+        (``keep_axes`` = the complement of ``group_axes``, ascending),
+        reordering ``group_axes`` to the front of each document's own token
+        block. Unlike [_folded][natten.varlen.VarlenLayout._folded], the
+        tokens genuinely move (a gather), so this also returns an int64
+        ``perm`` index (forward: ``tokens.index_select(0, perm)``) and its
+        inverse ``inv`` (backward, and un-permuting output/lse back to this
+        layout's order: ``tokens.index_select(0, inv)``) -- see
+        ``natten.backends.varlen_lowering._PermuteTokens``. Memoized per
+        ``group_axes``. Pins/materializes THIS layout on ``device`` as a
+        side effect (perm/inv are device tensors, built once for this
+        layout's lifetime and reused by every later call, same device-pin
+        contract as the rest of the class); the derived layout returned
+        alongside them is left unmaterialized, pinning lazily like any
+        other layout on its first real use.
+        """
+        # Checked unconditionally, before the memo lookup: a cache hit must
+        # not silently skip the device-pin check (_ensure_materialized only
+        # runs on a miss), same as every other entry point's unconditional
+        # _check_device_pin call.
+        self._check_device_pin(device)
+        cached = self._permute_memo.get(group_axes)
+        if cached is not None:
+            return cached
+        self._ensure_materialized(device)
+        keep_axes = tuple(i for i in range(self._rank) if i not in group_axes)
+        derived = VarlenLayout(
+            _derive_repeated_shapes(self._shapes, group_axes, keep_axes)
+        )
+        shapes_flat = [extent for shape in self._shapes for extent in shape]
+        perm, inv = _varlen_build_permutation_tensors(
+            shapes_flat, self._rank, list(group_axes), device
+        )
+        result = (derived, perm, inv)
+        self._permute_memo[group_axes] = result
+        return result
 
     # -- public read-only properties -----------------------------------
     # cu_seqlens and token_layouts return the underlying tensors as-is,
@@ -525,3 +705,5 @@ class VarlenLayout:
         self._memo = {}
         self._cu_seqlens = None
         self._token_layouts = None
+        self._fold_memo = {}
+        self._permute_memo = {}

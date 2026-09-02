@@ -50,6 +50,10 @@ from natten.backends.configs.cutlass.backward_knobs import (
     get_max_splits,
 )
 from natten.backends.fna import cutlass_fna_generic
+from natten.backends.varlen_lowering import (
+    effective_kernel_for_uniform_shape,
+    maybe_lower_degenerate_axes,
+)
 from natten.context import is_kv_parallelism_in_fused_na_enabled
 from natten.types import (
     CausalArgType,
@@ -607,7 +611,11 @@ def _build_varlen_fna_state(
     hit is always consistent with the key it was built under.
     """
     na_dim = len(shapes[0])
-    is_empty_doc = tuple(math.prod(layout) == 0 for layout in shapes)
+    # List comprehension, not a generator expression: this can run under
+    # torch.compile(fullgraph=True) on a derived layout a degenerate-axis
+    # lowering call built (natten.backends.varlen_lowering), and a bare
+    # generator handed to tuple() is a dynamo tracing gap a list is not.
+    is_empty_doc = tuple([math.prod(layout) == 0 for layout in shapes])
     for index, layout in enumerate(shapes):
         # A zero-token document is never scheduled (see the backward_split_
         # counts and forward_q_tiles/backward_q_tiles derivations below, both
@@ -812,8 +820,11 @@ def _neighborhood_attention_varlen_generic(
             and any(isinstance(item, bool) for item in arg_value)
         ):
             raise TypeError(f"{arg_name} must contain integers, not booleans.")
+    # allow_ones=True: unlike the fixed (non-varlen) family, this entry
+    # point accepts kernel_size = 1 -- a degenerate axis, lowered away in
+    # Python below rather than rejected here.
     kernel_size, stride, dilation, is_causal = check_all_args(
-        na_dim, kernel_size, stride, dilation, is_causal
+        na_dim, kernel_size, stride, dilation, is_causal, allow_ones=True
     )
     if any(
         stride_axis > kernel_axis
@@ -835,6 +846,37 @@ def _neighborhood_attention_varlen_generic(
     # so a CPU/meta query can still reach the memo-miss build's dtype/extent
     # checks below without a CUDA device.
     layout._check_device_pin(query.device)
+
+    # kernel_size = 1 axes (this call's own, or a uniform layout's
+    # per-axis clamp) are lowered away in Python before anything below --
+    # tile-config resolution, the empty-layout fast path, uniform dispatch,
+    # or the varlen kernel path -- ever sees them; see that module's
+    # docstring for the full contract. Returns None (falls through
+    # unchanged) when no axis is degenerate, including every all-empty
+    # layout, left entirely to the fast path just below.
+    lowered = maybe_lower_degenerate_axes(
+        na_dim=na_dim,
+        query=query,
+        key=key,
+        value=value,
+        layout=layout,
+        kernel_size=kernel_size,
+        stride=stride,
+        dilation=dilation,
+        is_causal=is_causal,
+        scale=scale,
+        backend=backend,
+        q_tile_shape=q_tile_shape,
+        kv_tile_shape=kv_tile_shape,
+        backward_q_tile_shape=backward_q_tile_shape,
+        backward_kv_tile_shape=backward_kv_tile_shape,
+        backward_kv_splits=backward_kv_splits,
+        backward_use_pt_reduction=backward_use_pt_reduction,
+        return_lse=return_lse,
+        dispatch=_neighborhood_attention_varlen_generic,
+    )
+    if lowered is not None:
+        return lowered
 
     # Empty-layout contract, matching NATTEN's varlen FMHA path (where an
     # all-empty batch launches no attention kernel either): an all-empty
@@ -884,23 +926,14 @@ def _neighborhood_attention_varlen_generic(
     # `layout._resolve` is never reached.
     if layout.is_uniform:
         shape = layout.shapes[0]
-        effective_kernel = []
-        for kernel_axis, extent, dilation_axis in zip(kernel_size, shape, dilation):
-            if dilation_axis > 1:
-                # Same fit rule as the varlen kernel's per-document clamp
-                # (_build_varlen_fna_state below): only dilation == 1 axes
-                # are defined to clamp; a dilation > 1 axis must still fit
-                # kernel_size * dilation exactly as before.
-                if extent < kernel_axis * dilation_axis:
-                    raise ValueError(
-                        "kernel_size * dilation must fit every token layout "
-                        f"on any axis with dilation > 1; token_layouts[*]="
-                        f"{shape}, dilation={dilation}."
-                    )
-                effective_kernel.append(kernel_axis)
-            else:
-                effective_kernel.append(min(kernel_axis, extent))
-        effective_kernel_size = cast(DimensionType, tuple(effective_kernel))
+        # The same host-side clamp maybe_lower_degenerate_axes above computes
+        # to decide whether any axis is degenerate; recomputing it here
+        # (idempotent -- min(k, s) applied twice is min(k, s)) keeps this
+        # branch correct standing alone, without needing to know whether
+        # that call actually ran.
+        effective_kernel_size = effective_kernel_for_uniform_shape(
+            kernel_size, dilation, shape
+        )
 
         # A clamped axis of 1 is a kernel_size the fixed family still
         # rejects (kernel_size = 1 lowering is a different feature); decline

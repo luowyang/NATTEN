@@ -1199,6 +1199,23 @@ def na1d_varlen(
     "cutlass-fna")` on the equivalent batched view -- including the
     per-document clamp above, applied once for the whole (shared) shape.
 
+    `kernel_size` entries may be `1`: that axis mixes nothing -- each query
+    attends only to tokens sharing its coordinate on that axis -- and
+    `is_causal`/`dilation` have no effect there (the window is always just
+    the query itself). Such an axis never reaches a CUDA kernel: it is
+    folded (a leading run of them, zero-copy) or permuted (any others, a
+    gather in and a scatter back) away in Python first, so the kernel only
+    ever sees `kernel_size >= 2`. If every axis is (or becomes, after a
+    uniform layout's per-document clamp) `1`, the call short-circuits to an
+    identity: `output` is exactly `value`, `logsumexp` is exactly `scale *
+    (query * key).sum(-1)`, with no kernel launch. Explicit tile shapes
+    (`q_tile_shape`, `kv_tile_shape`, `backward_q_tile_shape`,
+    `backward_kv_tile_shape`) and `backward_kv_splits` are not supported
+    together with a `kernel_size = 1` axis, since folding/permuting changes
+    the call's rank; omit them (the resolved rank picks its own defaults)
+    or drop the degenerate axes. The fixed (non-varlen) family is
+    unaffected -- `na{1,2,3}d` still rejects `kernel_size = 1`.
+
     `layout` defines the document order for `query`/`key`/`value`; every
     tensor passed with it must be packed in that same order.
 

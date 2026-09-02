@@ -151,7 +151,11 @@ class VarlenFnaValidationTests(unittest.TestCase):
             ({"stride": (True,)}, TypeError, "stride"),
             ({"dilation": True}, TypeError, "dilation"),
             ({"dilation": (True,)}, TypeError, "dilation"),
-            ({"kernel_size": 1}, ValueError, "kernel_size"),
+            # kernel_size = 0 (not 1: for the varlen entry points,
+            # kernel_size = 1 is a valid degenerate axis, lowered away in
+            # Python rather than raising here; test_varlen_degenerate_axes.py
+            # covers it) is still below the floor of 1.
+            ({"kernel_size": 0}, ValueError, "kernel_size"),
             ({"stride": 0}, ValueError, "stride"),
             ({"dilation": 0}, ValueError, "dilation"),
             ({"is_causal": (False, False)}, ValueError, "is_causal"),
