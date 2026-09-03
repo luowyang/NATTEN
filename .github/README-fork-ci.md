@@ -93,14 +93,18 @@ there. Every `wheel.yml` run works around this by pushing its own logs to an orp
 via a plain `git push` over `github.com` (only the *reading* side is blocked; a runner pushing to
 `github.com` is unaffected). Files land under `runs/<run_id>-<attempt>/`:
 
-- `started.txt` — pushed right after dependencies install; confirms the run started and records initial
-  disk/memory/CPU state.
+- `shard-<index>.txt` — one per `warm` shard (`<index>` is `0`..`SHARD_COUNT-1`), pushed when that
+  shard's job ends (`if: always()`): elapsed time, own-shard compiled/failed file counts and names, and
+  `sccache --show-stats` as seen by that shard.
+- `started.txt` — pushed by `build`, right after dependencies install; confirms the run started and
+  records initial disk/memory/CPU state and `warm`'s aggregate result.
 - `sampler.txt` — resource samples (`free -m`, top-10 RSS processes, `df -h /`) taken every minute during
-  the build and pushed every 5 samples, so a run that's still going can be checked without waiting for it
-  to finish.
-- `summary.txt` — pushed at the end (`if: always()`, so this lands even on failure): every step's outcome,
-  final disk/memory state, and `sccache --show-stats`.
-- `build.log` (or `build.log.gz` if over 1 MB) — the full `python -m build` output.
+  `build`'s compile and pushed every 5 samples, so a run that's still going can be checked without
+  waiting for it to finish.
+- `summary.txt` — pushed by `build` at the end (`if: always()`, so this lands even on failure): every
+  step's outcome, `warm`'s aggregate result, final disk/memory state, and `sccache --show-stats`.
+- `build.log` (or `build.log.gz` if over 1 MB) — the full `python -m build` output from `build` (each
+  shard's own build output is not pushed in full, only the tail included in its `shard-<index>.txt`).
 
 Read any of these with:
 
@@ -115,6 +119,59 @@ gh api "repos/luowyang/NATTEN/contents/runs/<run_id>-<attempt>/summary.txt?ref=c
 A clean build's `build.log` also gets scanned for lines matching `error|Error|Killed|No space|fatal`;
 the last 20 matches are emitted as `::error::` workflow annotations, visible in the Actions UI or via
 `gh run view -v` without needing any of the blocked endpoints.
+
+## How a cold build is parallelized
+
+A cold build — nothing in sccache yet — compiling every CUDA translation unit serially, one worker at a
+time (`NATTEN_N_WORKERS=1`, see below), takes about 5 hours on a single runner: slow to iterate on, and
+close to unworkable against even the 6-hour job timeout. `wheel.yml` runs a `warm` job before `build` to
+avoid paying that cost serially:
+
+- **Topology.** `warm` is a `strategy.matrix` of `SHARD_COUNT` (currently 8) parallel runners,
+  `shard: 0..7`. Each shard runs the *same* `python -m build --no-isolation --wheel -o dist/` command as
+  `build`, with the same `NATTEN_*`/`SCCACHE_*` environment, plus two extra variables that only the nvcc
+  wrapper reads: `NATTEN_CI_SHARD_INDEX` and `NATTEN_CI_SHARD_COUNT`. Shared setup (checkout, Python,
+  CUDA 12.8, sccache, the compiler wrapper scripts) lives in one composite action,
+  `.github/actions/prepare-build-env`, used by both jobs — GitHub Actions workflow YAML has no anchors
+  or merge keys, so this is the supported way to keep two jobs' steps from drifting apart; if they did,
+  `warm` and `build` would issue different compile commands for the same file and sccache would miss.
+
+- **Hash sharding.** The nvcc wrapper (`.github/scripts/nvcc-wrapper.sh`) hashes each `csrc/`-tree
+  translation unit's path with `cksum` and reduces it mod `NATTEN_CI_SHARD_COUNT`. A file that reduces to
+  *this* shard's own index compiles for real, through sccache, exactly as `build` would. A file that
+  reduces to a *different* shard's index is compiled instead from a fixed empty `.cu` stand-in, using the
+  real compiler directly — bypassing sccache entirely, so no empty object is ever written into the shared
+  cache under that file's real key. Compiling an empty file costs roughly 1–2 seconds versus the real
+  file's minutes-scale cost, so a shard's wall time is dominated by its own ~1/`SHARD_COUNT` of the real
+  translation units, not by touching everyone else's.
+
+- **Why `build` then hits cache.** Across all shards, every real translation unit gets compiled for real
+  by exactly one shard, landing in sccache (`SCCACHE_GHA_ENABLED=true`, this repo's Actions cache) under
+  the same key `build` will look up later — because `warm`'s own-shard compile commands are byte-for-byte
+  identical to `build`'s (same composite action, same checkout, same environment). When `build` runs
+  afterwards (`needs: warm`), it recompiles every file with that identical command line and hits cache on
+  (almost) all of them, instead of compiling anything cold.
+
+- **Failure handling.** A shard's own `python -m build` very likely fails or produces a useless wheel
+  (most of its objects are empty stand-ins) — that's expected and doesn't matter; that artifact is never
+  used. What decides the shard's own pass/fail is whether it compiled its *own* shard's real files without
+  error: the step fails only if it recorded an own-shard compile failure, or recorded no own-shard compile
+  at all (a sign the wrapper itself is broken). `build` runs even if a shard failed
+  (`if: ${{ !cancelled() }}`) — it then simply compiles whatever that shard would have cached, itself,
+  cold, so a `warm` failure costs time, not correctness. `build` keeps its full 360-minute timeout as a
+  backstop for exactly that case, rather than assuming `warm` succeeded.
+
+- **Forcing a cold build.** Dispatch with a `cache_namespace` that has never been used before — it
+  becomes `SCCACHE_GHA_VERSION`, which sccache folds into every cache key, so a new value means an empty
+  effective cache regardless of what the default namespace already holds:
+
+  ```bash
+  gh workflow run wheel.yml --repo luowyang/NATTEN --ref <branch> -f cache_namespace=<unique-label>
+  ```
+
+  Dispatching again with the *same* `cache_namespace` reuses that namespace's now-warm cache. Leave
+  `cache_namespace` blank for normal use, including every tag-triggered release build — sccache then
+  uses its own default namespace, same as before this input existed.
 
 ## Measured operating facts
 
@@ -162,8 +219,9 @@ and unaffected by anything in `.github/`.
   build.
 
 - **`wheel.yml`** — `ubuntu-latest`, on push of tags matching `fork/*` and on `workflow_dispatch`
-  (input: `ref`). Builds the wheel (see above), uploads it + a manifest as an artifact, and on a
-  `fork/*` tag ref creates/updates that tag's GitHub Release.
+  (inputs: `ref`, `cache_namespace`). Two jobs: `warm` (sharded precompile, see "How a cold build is
+  parallelized" above) then `build`, which builds the wheel (see above), uploads it + a manifest as an
+  artifact, and on a `fork/*` tag ref creates/updates that tag's GitHub Release.
 
 - **`extended.yml`** — **currently non-functional**, see the status note at the top of the file itself.
   It targets a self-hosted runner this fork no longer has; a dispatch will queue forever. Left in
