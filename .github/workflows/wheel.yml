@@ -1,6 +1,6 @@
 name: wheel
 
-# Builds the NATTEN fork wheel on a GitHub-hosted runner, then (tag
+# Builds the NATTEN fork wheel on GitHub-hosted runners, then (tag
 # builds only) publishes a GitHub Release with the wheel attached. See
 # .github/README-fork-ci.md for the full tag -> release flow.
 #
@@ -8,37 +8,52 @@ name: wheel
 # network does not allow self-hosted runners to reach GitHub Actions;
 # there is no GPU on hosted runners, so kernel tests run elsewhere.
 #
-# CONSEQUENCE: no GPU on this runner, so this workflow cannot run
+# CONSEQUENCE: no GPU on these runners, so this workflow cannot run
 # libnatten's actual kernel tests. It still builds a real CUDA extension
 # (nvcc targets sm_90a) and does a CPU-only import smoke test. GPU
 # correctness validation happens outside this CI, via this fork's own
 # build/test tooling (integration/build_wheel.sh and friends) -- unrelated
 # to and unaffected by this workflow.
 #
+# TWO JOBS, `warm` then `build`: a cold, single-worker compile of every
+# CUDA translation unit on one 4-vCPU/16GB runner takes ~5h (see
+# .github/README-fork-ci.md's "How a cold build is parallelized" for the
+# full explanation). `warm` fans a hash-sharded precompile out across
+# SHARD_COUNT parallel runners so sccache ends up with (almost) every
+# object cached; `build` then does the real, unsharded build, which
+# hits that cache instead of compiling cold. Shared setup (checkout,
+# Python, CUDA, sccache, the compiler wrappers) lives in one composite
+# action, .github/actions/prepare-build-env, specifically so the two
+# jobs' compile environments cannot drift apart from each other -- if
+# they did, sccache would see different compile commands and miss.
+#
 # LOG ACCESS: the same organization network that blocks self-hosted
 # runners also blocks reading hosted-run logs and artifacts the normal
 # way (`gh run view --log`, the jobs/logs API, and artifact downloads all
 # redirect through hosts that are unreachable from here) -- confirmed the
 # hard way when a build failed and neither `--log-failed` nor `gh run
-# download` would return anything but "Forbidden". The last step in this
-# job (`Relay build log and diagnostics`) works around that: it captures
-# the build's own output, extracts likely-relevant lines as `::error::`
-# workflow annotations (visible via `gh run view -v` / the Actions UI
-# without needing the blocked hosts), and pushes the full log + a
-# diagnostics summary to an orphan `ci-logs` branch via plain `git` over
-# `github.com` (not blocked -- only the *reading* side, from this
-# network, hits the blocked hosts; a runner pushing to github.com is
-# unaffected).
+# download` would return anything but "Forbidden". Both jobs work around
+# that by pushing their own logs to an orphan `ci-logs` branch via plain
+# `git` over `github.com` (not blocked -- only the *reading* side, from
+# this network, hits the blocked hosts; a runner pushing to github.com is
+# unaffected): `warm`'s last step pushes each shard's own small report
+# (runs/<run_id>-<attempt>/shard-<index>.txt); `build`'s last step
+# (`Relay build log and diagnostics`) captures the build's own output,
+# extracts likely-relevant lines as `::error::` workflow annotations
+# (visible via `gh run view -v` / the Actions UI without needing the
+# blocked hosts), and pushes the full log + a diagnostics summary
+# (runs/<run_id>-<attempt>/{build.log,summary.txt}).
 #
 # Triggers:
 #   - push of a tag matching fork/* (the normal release path: assemble.sh
 #     ... --tag, then `git push origin refs/tags/fork/<version>`)
 #   - workflow_dispatch, with a `ref` input (tag, branch, or commit) to
-#     build. The workflow *definition* always comes from whatever ref the
-#     dispatch itself targets (`gh workflow run wheel.yml --ref ...`);
-#     `inputs.ref` decouples that from what actually gets checked out and
-#     built, so e.g. dispatching from fork-ci can still build and publish
-#     a release for an already-existing tag like fork/0.21.7+fork.2.
+#     build, and a `cache_namespace` input (see below). The workflow
+#     *definition* always comes from whatever ref the dispatch itself
+#     targets (`gh workflow run wheel.yml --ref ...`); `inputs.ref`
+#     decouples that from what actually gets checked out and built, so
+#     e.g. dispatching from fork-ci can still build and publish a release
+#     for an already-existing tag like fork/0.21.7+fork.2.
 
 on:
   push:
@@ -50,6 +65,10 @@ on:
         description: 'Ref (tag/branch/sha) to check out and build. Blank on a manual dispatch = the ref this workflow run itself was dispatched against.'
         required: false
         default: ''
+      cache_namespace:
+        description: 'Optional sccache cache namespace (SCCACHE_GHA_VERSION). Set to a value nothing has used before to force a cold build (e.g. for testing); leave blank for normal use, including tag-triggered releases.'
+        required: false
+        default: ''
 
 concurrency:
   group: wheel-build
@@ -57,60 +76,233 @@ concurrency:
 
 permissions:
   contents: write   # needed for the tag-build release step AND the
-                     # ci-logs branch push below; repo default is
+                     # ci-logs branch pushes (both jobs); repo default is
                      # read-only (checked via `gh api repos/luowyang/
                      # NATTEN/actions/permissions/workflow`), so this
                      # must be declared here to elevate it.
 
+env:
+  SHARD_COUNT: "8"   # Number of jobs.warm.strategy.matrix.shard entries.
+                      # GitHub Actions has no way to derive a matrix list
+                      # from a single integer, so the list below (shard:
+                      # [0, 1, ..., 7]) is maintained by hand and MUST
+                      # have exactly this many entries, 0-indexed.
+  NATTEN_CUDA_ARCH: "9.0"
+  NATTEN_N_WORKERS: "1"     # Measured locally (dev machine 2, CPU
+                             # only, same NATTEN_CUDA_ARCH=9.0
+                             # flags, "fine"-policy autogen
+                             # output): the 3 largest translation
+                             # units are all in hopper_fna_bwd
+                             # (source_3/7/6.cu), each peaking
+                             # ~10.2-10.8GB (process-tree RSS sum,
+                             # sampled every 2s across the whole
+                             # nvcc->cicc->ptxas tree, not just
+                             # ru_maxrss's single-largest-process
+                             # number -- they matched closely here
+                             # since nvcc's stages ran essentially
+                             # sequentially for one TU, but that
+                             # equivalence breaks the moment N>1
+                             # such TUs compile concurrently).
+                             # Two concurrent workers (prior
+                             # attempts' N_WORKERS=2) means ~21GB
+                             # combined if two hopper_fna_bwd TUs
+                             # land together -- doesn't fit a
+                             # 16GB guest. One worker means at
+                             # most ~10.8GB resident at a time,
+                             # which does fit, with headroom. This
+                             # applies equally to `warm` (each shard
+                             # is its own 16GB runner, same
+                             # constraint) and `build`.
+  NATTEN_AUTOGEN_POLICY: fine   # Confirmed smallest-TU policy:
+                             # setup.py's NUM_SPLITS table splits
+                             # every category into MORE pieces
+                             # under "fine" than "default"/"coarse"
+                             # (e.g. hopper-fna-bwd: coarse=2,
+                             # default=4, fine=8) without changing
+                             # which kernels get generated (same
+                             # `categories` dict, same autogen
+                             # scripts) -- more, smaller compile
+                             # units for the identical
+                             # instantiation set.
+  NATTEN_VERBOSE: "1"
+  SCCACHE_GHA_ENABLED: "true"
+  # Defined here (workflow level, not job or step level) so that
+  # `warm`'s and `build`'s build steps -- and, for NATTEN_CUDA_ARCH/
+  # NATTEN_N_WORKERS/NATTEN_AUTOGEN_POLICY, `build`'s manifest step --
+  # all read the exact same values, with no way for the two jobs to end
+  # up compiling under different flags (which is how the manifest
+  # previously ended up lying about NATTEN_N_WORKERS, back when these
+  # were job-level on the one job that existed then).
+
 jobs:
+  warm:
+    # Sharded precompile: SHARD_COUNT parallel runners, each compiling
+    # roughly one SHARD_COUNTth of the real translation units (hash-
+    # selected by the nvcc wrapper, .github/scripts/nvcc-wrapper.sh) for
+    # real through sccache, and every other translation unit as a fast
+    # empty stand-in that bypasses sccache entirely. Every real
+    # translation unit is compiled for real, by exactly one shard, so by
+    # the time all shards finish, sccache holds (almost) every object
+    # `build` will need. See .github/README-fork-ci.md, "How a cold
+    # build is parallelized", for the full design and measured numbers.
+    #
+    # This job's own `python -m build` output/wheel is never used --
+    # only the sccache entries each shard's real compiles wrote are. A
+    # shard's wheel build is very likely to fail (most of its objects
+    # are empty stand-ins), and that is expected and fine; see the
+    # comment on the "Precompile shard" step below for how pass/fail is
+    # actually decided.
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7]   # Must have exactly SHARD_COUNT (8) entries, see env above.
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - name: Prepare build environment
+        id: prepare
+        uses: ./.github/actions/prepare-build-env
+        with:
+          checkout_ref: ${{ inputs.ref }}
+          cache_namespace: ${{ inputs.cache_namespace }}
+
+      - name: Precompile shard
+        id: shard_build
+        env:
+          NATTEN_CI_SHARD_INDEX: ${{ matrix.shard }}
+          NATTEN_CI_SHARD_COUNT: ${{ env.SHARD_COUNT }}
+        run: |
+          set +e -u -o pipefail
+          # +e deliberately: GitHub Actions' default shell invocation for
+          # `run:` steps already runs with errexit on (`bash --noprofile
+          # --norc -eo pipefail {0}`) regardless of this script's own
+          # `set` line, which only ever ADDS flags, never removes ones
+          # already active. This step manages its own pass/fail
+          # explicitly via the shard failure/compiled marker files the
+          # nvcc wrapper writes, not via errexit or python -m build's own
+          # exit code (see below).
+          echo "--- free -m (before build) ---"
+          free -m
+          export TMPDIR="${{ runner.temp }}"
+          echo "nproc=$(nproc) NATTEN_N_WORKERS=$NATTEN_N_WORKERS CUDA_HOME=$CUDA_HOME shard=$NATTEN_CI_SHARD_INDEX/$NATTEN_CI_SHARD_COUNT"
+          nvcc --version
+
+          START_TS=$(date +%s)
+          python -m build --no-isolation --wheel -o dist/ > /tmp/shard-build.log 2>&1
+          BUILD_RC=$?
+          END_TS=$(date +%s)
+          ELAPSED=$((END_TS - START_TS))
+          echo "elapsed_seconds=$ELAPSED" >> "$GITHUB_OUTPUT"
+          echo "python -m build exited $BUILD_RC after ${ELAPSED}s. This step's own pass/fail is decided below by the shard failure/compiled marker files, not this exit code: whether this shard's own python -m build itself succeeds is immaterial (NATTEN links a plain shared library without strict undefined-symbol checking, so empty stand-in objects from other shards typically do not break the link either way), and even if it does fail, this shard's own wheel is never used -- only the sccache entries its own-shard compiles wrote are."
+
+          echo "--- sccache --show-stats ---"
+          sccache --show-stats || true
+
+          if [[ -s /tmp/natten-shard-failures.txt ]]; then
+            echo "::error::Shard $NATTEN_CI_SHARD_INDEX had own-shard compile failures:"
+            cat /tmp/natten-shard-failures.txt
+            exit 1
+          fi
+          if [[ ! -s /tmp/natten-shard-compiled.txt ]]; then
+            echo "::error::Shard $NATTEN_CI_SHARD_INDEX compiled nothing -- the nvcc wrapper is broken."
+            exit 1
+          fi
+          echo "Shard $NATTEN_CI_SHARD_INDEX compiled $(wc -l < /tmp/natten-shard-compiled.txt) own-shard file(s), 0 failures."
+          exit 0
+
+      - name: Push shard log (ci-logs branch)
+        id: push_shard_log
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set +e -u -o pipefail
+          # +e deliberately: see the Precompile shard step's own comment
+          # (GitHub Actions' default shell already runs with errexit on
+          # regardless of this script's own `set` line) -- this step
+          # manages its own pass/fail explicitly via its final exit.
+          SHARD="${{ matrix.shard }}"
+          {
+            echo "wheel.yml run ${{ github.run_id }} attempt ${{ github.run_attempt }}: warm shard $SHARD/${{ env.SHARD_COUNT }}"
+            echo "Precompile shard step outcome : ${{ steps.shard_build.outcome }}"
+            echo "Elapsed (build step)          : ${{ steps.shard_build.outputs.elapsed_seconds }}s"
+            echo "Compiled (own shard)          : $(wc -l < /tmp/natten-shard-compiled.txt 2>/dev/null || echo 0)"
+            echo "Failed (own shard)            :"
+            if [[ -s /tmp/natten-shard-failures.txt ]]; then
+              cat /tmp/natten-shard-failures.txt
+            else
+              echo "  (none)"
+            fi
+            echo
+            echo "--- sccache --show-stats ---"
+            sccache --show-stats 2>&1 || echo "(unavailable)"
+            echo
+            echo "--- last 60 lines of this shard's python -m build output ---"
+            if [[ -f /tmp/shard-build.log ]]; then
+              tail -n 60 /tmp/shard-build.log
+            else
+              echo "(no shard-build.log -- Precompile shard step likely never ran)"
+            fi
+          } > "shard-${SHARD}.txt"
+          cat "shard-${SHARD}.txt"
+
+          git config --global user.email "ci@users.noreply.github.com"
+          git config --global user.name "NATTEN fork CI"
+          REMOTE_URL="https://x-access-token:${GH_TOKEN}@github.com/luowyang/NATTEN.git"
+          WORKDIR="$(mktemp -d)"
+          if git ls-remote --exit-code "$REMOTE_URL" refs/heads/ci-logs >/dev/null 2>&1; then
+            git clone --quiet --depth 1 --branch ci-logs "$REMOTE_URL" "$WORKDIR"
+          else
+            git init --quiet -b ci-logs "$WORKDIR"
+          fi
+          DEST="$WORKDIR/runs/${{ github.run_id }}-${{ github.run_attempt }}"
+          mkdir -p "$DEST"
+          cp "shard-${SHARD}.txt" "$DEST/"
+          git -C "$WORKDIR" add -A
+          if git -C "$WORKDIR" diff --cached --quiet; then
+            echo "Nothing to commit (unexpected -- shard-${SHARD}.txt should always be new)."
+            exit 0
+          fi
+          git -C "$WORKDIR" commit --quiet -m "wheel.yml run ${{ github.run_id }} attempt ${{ github.run_attempt }}: warm shard $SHARD"
+
+          # Up to SHARD_COUNT (8) shards may reach this push at nearly the
+          # same time; retry with fetch+rebase and a random backoff so a
+          # collision doesn't need a human to re-run anything.
+          PUSHED=0
+          for ATTEMPT in 1 2 3 4 5; do
+            if git -C "$WORKDIR" push --quiet "$REMOTE_URL" "HEAD:refs/heads/ci-logs" 2>/dev/null; then
+              echo "Pushed: runs/${{ github.run_id }}-${{ github.run_attempt }}/shard-${SHARD}.txt on ci-logs (attempt $ATTEMPT)"
+              PUSHED=1
+              break
+            fi
+            SLEEP=$(( (RANDOM % 10) + 1 ))
+            echo "Push attempt $ATTEMPT failed (likely a concurrent shard pushing at the same time); fetch+rebase and retry in ${SLEEP}s..."
+            sleep "$SLEEP"
+            git -C "$WORKDIR" fetch --quiet "$REMOTE_URL" ci-logs
+            git -C "$WORKDIR" rebase --quiet FETCH_HEAD || git -C "$WORKDIR" rebase --abort
+          done
+          if [[ "$PUSHED" -ne 1 ]]; then
+            echo "::error::shard-${SHARD}.txt push failed after 5 attempts"
+            exit 1
+          fi
+          exit 0
+
   build:
+    needs: warm
+    if: ${{ !cancelled() }}   # Run even if a shard failed -- `build`
+                               # then simply compiles whatever that shard
+                               # would have primed the cache for, itself,
+                               # cold. Only skip on cancellation.
     runs-on: ubuntu-latest
     timeout-minutes: 360   # a cold, uncached CUDA compile on a 4-vCPU hosted
                             # runner is far slower than the 39-worker dev-
                             # machine builds this fork's tooling was timed
                             # against; sccache (below) makes repeat builds
-                            # much cheaper once its cache is warm, but the
-                            # first run on a given source tree pays full price.
-    env:
-      NATTEN_CUDA_ARCH: "9.0"
-      NATTEN_N_WORKERS: "1"     # Measured locally (dev machine 2, CPU
-                                 # only, same NATTEN_CUDA_ARCH=9.0
-                                 # flags, "fine"-policy autogen
-                                 # output): the 3 largest translation
-                                 # units are all in hopper_fna_bwd
-                                 # (source_3/7/6.cu), each peaking
-                                 # ~10.2-10.8GB (process-tree RSS sum,
-                                 # sampled every 2s across the whole
-                                 # nvcc->cicc->ptxas tree, not just
-                                 # ru_maxrss's single-largest-process
-                                 # number -- they matched closely here
-                                 # since nvcc's stages ran essentially
-                                 # sequentially for one TU, but that
-                                 # equivalence breaks the moment N>1
-                                 # such TUs compile concurrently).
-                                 # Two concurrent workers (prior
-                                 # attempts' N_WORKERS=2) means ~21GB
-                                 # combined if two hopper_fna_bwd TUs
-                                 # land together -- doesn't fit a
-                                 # 16GB guest. One worker means at
-                                 # most ~10.8GB resident at a time,
-                                 # which does fit, with headroom.
-      NATTEN_AUTOGEN_POLICY: fine   # Confirmed smallest-TU policy:
-                                 # setup.py's NUM_SPLITS table splits
-                                 # every category into MORE pieces
-                                 # under "fine" than "default"/"coarse"
-                                 # (e.g. hopper-fna-bwd: coarse=2,
-                                 # default=4, fine=8) without changing
-                                 # which kernels get generated (same
-                                 # `categories` dict, same autogen
-                                 # scripts) -- more, smaller compile
-                                 # units for the identical
-                                 # instantiation set.
-      # Defined here (job level, not step level) so the Build
-      # manifest step below can read the exact values the Build
-      # wheel step used, instead of hardcoding separate copies
-      # that can drift out of sync (which is how the manifest
-      # previously ended up lying about NATTEN_N_WORKERS).
+                            # much cheaper once its cache is warm, and `warm`
+                            # (above) exists to make sure it is warm by the
+                            # time this job starts -- but this timeout stays
+                            # at the full cold-build budget as a backstop in
+                            # case a shard failed or the cache didn't take.
     steps:
       - name: Resolve build ref
         id: resolve_ref
@@ -135,91 +327,12 @@ jobs:
           fi
           echo "Building ref: $BUILD_REF (tag build: $([[ "$BUILD_REF" == fork/* ]] && echo true || echo false))"
 
-      - name: Checkout
-        id: checkout
-        uses: actions/checkout@v7
+      - name: Prepare build environment
+        id: prepare
+        uses: ./.github/actions/prepare-build-env
         with:
-          ref: ${{ inputs.ref }}
-          submodules: recursive
-          # Mandatory: NATTEN's CMake build needs third_party/cutlass/include
-          # populated; there is no assemble.sh step in this workflow to do
-          # it, so actions/checkout must. An empty `ref` (push-tag trigger,
-          # or a dispatch with no explicit input) falls back to actions/
-          # checkout's own default (github.sha), which is exactly right for
-          # both cases.
-
-      - name: Set up Python 3.11
-        id: setup_python
-        uses: actions/setup-python@v7
-        with:
-          python-version: "3.11"
-          cache: pip
-
-      - name: Free disk space
-        id: free_disk
-        run: |
-          set -euo pipefail
-          echo "--- df -h (before) ---"
-          df -h
-          # Unconditional, not threshold-gated: two attempts at this
-          # workflow both had "Build wheel" killed (SIGTERM, exit 143)
-          # deep into the compile with no reachable error text -- disk
-          # exhaustion is the leading hypothesis (see wheel.yml's header
-          # and the Build wheel step's own comments), and none of this
-          # preinstalled bulk is ever needed for a CUDA/C++ build, so
-          # there's no reason to gate its removal behind a threshold
-          # that's only checked this early, before the multi-GB CUDA
-          # toolkit + torch installs that actually consume the space.
-          echo "Clearing standard hosted-runner preinstalled bulk (dotnet/android/ghc/docker images; the usual 'maximize build space' trick)."
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc || true
-          sudo docker image prune -af || true
-          sudo apt-get clean || true
-          echo "--- df -h (after cleanup) ---"
-          df -h
-
-      - name: Install CUDA toolkit 12.8
-        id: cuda-toolkit
-        uses: Jimver/cuda-toolkit@v0.2.36
-        with:
-          cuda: '12.8.0'
-          method: local   # 'network' only installs the sub-packages you
-                           # name, and NATTEN's own build (setup.py/CMake)
-                           # has no documented minimal package list -- full
-                           # 'local' install trades a few extra minutes for
-                           # not having to guess apt sub-package names.
-          linux-local-args: '["--toolkit"]'   # skip samples/docs, keep nvcc + libs
-          use-github-cache: false   # Default (true) caches this ~5.4GB
-                                     # installer download in the repo's
-                                     # 10GB Actions cache budget, crowding
-                                     # out sccache's own cache entries;
-                                     # use-local-cache (still on, default
-                                     # true) already caches it within a
-                                     # single run, which is all this needs.
-
-      - name: Disk space after CUDA toolkit install
-        id: post_cuda_df
-        run: df -h
-
-      - name: Set up sccache
-        id: sccache_setup
-        uses: mozilla-actions/sccache-action@v0.0.11
-
-      - name: Install Python build dependencies
-        id: deps
-        run: |
-          set -euo pipefail
-          # Matches natten_dev's own torch build exactly (confirmed via
-          # `python -c 'import torch; print(torch.__version__)'` there:
-          # 2.11.0+cu128) and is a real wheel on this index for cp311/
-          # manylinux_x86_64 (checked: https://download.pytorch.org/whl/cu128/torch/).
-          pip install "torch==2.11.0" --index-url https://download.pytorch.org/whl/cu128
-          pip install ninja "build>=1.3.0" "setuptools<82"
-          # setuptools<82 for the same reason integration/build_wheel.sh
-          # (this fork's dev-machine build tooling) pins it: torch's
-          # installed metadata declares Requires-Dist: setuptools<82, and
-          # `python -m build --no-isolation` (unlike a plain `pip install
-          # -e .`) enforces build-system requirements' own declared
-          # constraints.
+          checkout_ref: ${{ inputs.ref }}
+          cache_namespace: ${{ inputs.cache_namespace }}
 
       - name: Push started.txt (ci-logs branch)
         id: started_checkpoint
@@ -239,6 +352,7 @@ jobs:
           {
             echo "wheel.yml run ${{ github.run_id }} attempt ${{ github.run_attempt }}: build starting"
             echo "Ref built: ${{ steps.resolve_ref.outputs.build_ref }}"
+            echo "warm job result: ${{ needs.warm.result }}"
             date -u
             echo
             echo "--- df -h ---"
@@ -277,11 +391,6 @@ jobs:
       - name: Build wheel
         id: build
         env:
-          # NATTEN_CUDA_ARCH / NATTEN_N_WORKERS / NATTEN_AUTOGEN_POLICY
-          # are set at job level above (jobs.build.env) and inherited
-          # here as real OS env vars.
-          NATTEN_VERBOSE: "1"
-          SCCACHE_GHA_ENABLED: "true"
           GH_TOKEN: ${{ github.token }}
           # NATTEN_IS_BUILDING_DIST intentionally NOT set: setup.py would
           # append a second "+torch<ver>cu<ver>" local-version segment to
@@ -305,29 +414,7 @@ jobs:
           # via errexit.
           echo "--- free -m (before build) ---"
           free -m
-          export CUDA_HOME="${{ steps.cuda-toolkit.outputs.CUDA_PATH }}"
           export TMPDIR="${{ runner.temp }}"
-
-          # --- sccache compiler masquerade (no setup.py/CMakeLists.txt changes) ---
-          # NATTEN's setup.py builds its `cmake` invocation as a hardcoded
-          # Python list (checked: no CMAKE_ARGS / *_COMPILER_LAUNCHER
-          # support anywhere in setup.py or csrc/CMakeLists.txt), so the
-          # usual `-DCMAKE_CUDA_COMPILER_LAUNCHER=sccache` hook isn't
-          # available here. CMake's own `project()`/`enable_language()`
-          # compiler detection reads the CUDACXX/CXX environment variables
-          # first when locating the CUDA/C++ compilers (standard CMake
-          # behavior, unrelated to NATTEN) -- pointing those at wrapper
-          # scripts that shell out through sccache gets the same effect
-          # with zero repo changes, i.e. exactly the "minimal env-var
-          # plumbing in the workflow only" this was scoped to.
-          REAL_NVCC="$(command -v nvcc)"
-          REAL_CXX="$(command -v c++)"
-          mkdir -p /tmp/sccache-wrappers
-          printf '#!/bin/sh\nexec sccache "%s" "$@"\n' "$REAL_NVCC" > /tmp/sccache-wrappers/nvcc
-          printf '#!/bin/sh\nexec sccache "%s" "$@"\n' "$REAL_CXX"  > /tmp/sccache-wrappers/c++
-          chmod +x /tmp/sccache-wrappers/nvcc /tmp/sccache-wrappers/c++
-          export CUDACXX=/tmp/sccache-wrappers/nvcc
-          export CXX=/tmp/sccache-wrappers/c++
 
           echo "nproc=$(nproc) NATTEN_N_WORKERS=$NATTEN_N_WORKERS CUDA_HOME=$CUDA_HOME"
           nvcc --version | tee /tmp/nvcc-version.txt
@@ -535,16 +622,11 @@ jobs:
             echo "Ref built    : ${{ steps.resolve_ref.outputs.build_ref }}"
             echo "Commit       : ${{ github.sha }}"
             echo "Workflow run : ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            echo "warm job result : ${{ needs.warm.result }}"
             echo
             echo "Step outcomes:"
             echo "  Resolve build ref                 : ${{ steps.resolve_ref.outcome }}"
-            echo "  Checkout                           : ${{ steps.checkout.outcome }}"
-            echo "  Set up Python 3.11                 : ${{ steps.setup_python.outcome }}"
-            echo "  Free disk space                    : ${{ steps.free_disk.outcome }}"
-            echo "  Install CUDA toolkit 12.8          : ${{ steps.cuda-toolkit.outcome }}"
-            echo "  Disk space after CUDA install      : ${{ steps.post_cuda_df.outcome }}"
-            echo "  Set up sccache                     : ${{ steps.sccache_setup.outcome }}"
-            echo "  Install Python build dependencies  : ${{ steps.deps.outcome }}"
+            echo "  Prepare build environment          : ${{ steps.prepare.outcome }}"
             echo "  Push started.txt                   : ${{ steps.started_checkpoint.outcome }}"
             echo "  Build wheel                        : ${{ steps.build.outcome }}"
             echo "  Install wheel + import smoke test  : ${{ steps.install_smoke.outcome }}"
