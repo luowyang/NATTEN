@@ -1,20 +1,20 @@
 name: Prepare NATTEN build environment
 description: >-
-  Checkout, Python 3.11, free disk space, CUDA 12.8, sccache, and the
-  sccache compiler-wrapper scripts shared by wheel.yml's `warm` and
-  `build` jobs. Factored out here so the two jobs cannot drift out of
-  sync with each other -- GitHub Actions workflow YAML has no anchors or
-  merge keys, so a composite action is the supported way to share steps
-  across jobs.
+  Python 3.11, free disk space, CUDA 12.8, sccache, and the sccache
+  compiler-wrapper scripts shared by wheel.yml's `warm` and `build`
+  jobs. Factored out here so the two jobs cannot drift out of sync with
+  each other -- GitHub Actions workflow YAML has no anchors or merge
+  keys, so a composite action is the supported way to share steps
+  across jobs. Does NOT check out the repo: a local composite action is
+  resolved from the checkout that already exists in the job's
+  workspace, so checkout itself must be a separate, ordinary step
+  before this action runs, not a step inside it -- confirmed the hard
+  way (`Can't find 'action.yml' ... Did you forget to run
+  actions/checkout before running your local action?` on every job when
+  an earlier revision of this action tried to do its own checkout
+  first). Callers must check out the repo themselves before `uses:
+  ./.github/actions/prepare-build-env`.
 inputs:
-  checkout_ref:
-    description: >-
-      Ref (tag/branch/sha) to check out. Callers should pass the
-      workflow's own `inputs.ref` straight through unchanged (blank on a
-      push-tag trigger, or a manual dispatch with no override -- both
-      correctly fall back to actions/checkout's own default).
-    required: false
-    default: ''
   cache_namespace:
     description: >-
       Optional SCCACHE_GHA_VERSION value. Callers should pass the
@@ -25,18 +25,6 @@ inputs:
 runs:
   using: composite
   steps:
-    - name: Checkout
-      uses: actions/checkout@v7
-      with:
-        ref: ${{ inputs.checkout_ref }}
-        submodules: recursive
-        # Mandatory: NATTEN's CMake build needs third_party/cutlass/include
-        # populated; there is no assemble.sh step in this workflow to do
-        # it, so actions/checkout must. An empty ref (push-tag trigger, or
-        # a dispatch with no explicit input) falls back to actions/
-        # checkout's own default (github.sha), which is exactly right for
-        # both cases.
-
     - name: Set up Python 3.11
       uses: actions/setup-python@v7
       with:
