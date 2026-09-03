@@ -190,9 +190,35 @@ and shape how the workflow is configured:
   `NATTEN_AUTOGEN_POLICY=fine`), measured locally (dev machine 2, CPU-only compile — no GPU needed to
   compile). The runner has 16 GB of RAM. Two concurrent workers risk two such units landing together for
   roughly 21 GB combined, which does not fit; one worker keeps peak usage under ~11 GB, with headroom.
-- **Cold build: ~5h00m** of the workflow's 6-hour (360 min) job timeout, with an 8.6% sccache hit rate
-  (nothing in cache yet).
-- **Warm rebuild of an unchanged tree: ~26 min**, 100% sccache hits.
+- **Cold build (sharded, `SHARD_COUNT=8`): 1h35m** total wall time (workflow `createdAt` 03:42:28Z ->
+  `updatedAt` 05:17:30Z). `warm` phase (8 shards in parallel): 56 min (earliest shard start to latest
+  shard finish); per-shard elapsed (the `Precompile shard` step's own timer): min 24m57s (shard 0), max
+  48m33s (shard 6), median 29m03s; own-shard compiled-file counts ranged 22-33 (sum 202 across all 8
+  shards), 0 failures on any shard. `build` then took 39 min (`Prepare build environment` 6m24s,
+  `Build wheel` 32m10s), with sccache hitting 800/815 requests overall (98.16%) and, of the 203 CUDA
+  translation units specifically, 198 hits / 5 misses (97.54%) -- `build` simply compiles a miss itself,
+  same as it always compiles everything; a small number of misses do not fail the build, they just cost
+  it a few extra minutes. (`sccache --show-stats` gives aggregate counts only; to see WHICH units a
+  run compiled, read that run's `sampler.txt` on `ci-logs`, which snapshots the running compiler process
+  tree every minute.) Measured on run
+  [`33712330046`](https://github.com/luowyang/NATTEN/actions/runs/33712330046).
+- **Re-dispatch of an unchanged tree: about 56 min** in the steady state -- run
+  [`33729368562`](https://github.com/luowyang/NATTEN/actions/runs/33729368562) took 55m52s with sccache
+  at 815/815 (100.00%, 203 of 203 CUDA translation units) and every shard also at 100%. This is slower
+  than the pre-sharding warm rebuild below, because a re-dispatch still runs the whole `warm` phase even
+  when nothing needs compiling.
+- **One caveat, cause not yet identified.** The FIRST re-dispatch after the sharded cold build, run
+  [`33719144384`](https://github.com/luowyang/NATTEN/actions/runs/33719144384), took 2h09m: `build` hit
+  only 164 of 203 CUDA translation units and recompiled 39, all of them in the four `hopper_*` families
+  (the largest objects); all 128 `fna` units hit, and sccache reported zero read errors, write errors and
+  timeouts. Every shard in that same run hit 100%, including files `build` missed. The next re-dispatch,
+  same commit and same `cache_namespace` with nothing changed, hit 100%. So the recompiles were a
+  one-time event rather than a per-run tax, but why they happened is still open. It costs time only: a
+  miss makes `build` compile that unit from source, which is what it would do without any cache.
+- **Pre-sharding baseline** (single unsharded job, everything compiled serially by one job): ~5h00m
+  cold (8.6% sccache hit rate, nothing in cache yet), ~26 min warm (100% sccache hits) -- see commit
+  `a5be24b` on this branch for that methodology. Kept for context on how much sharding helped; the
+  numbers above are the ones that describe how this workflow actually runs today.
 - **If a run hits the 6-hour limit:** re-dispatch the identical command
   (`gh workflow run wheel.yml --ref fork-ci -f ref=<tag>`). sccache
   (`SCCACHE_GHA_ENABLED=true`, scoped to this repo's Actions cache) writes each compiled object to
