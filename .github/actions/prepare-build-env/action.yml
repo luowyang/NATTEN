@@ -75,21 +75,18 @@ runs:
       shell: bash
       run: df -h
 
-    - name: Set up sccache
-      id: sccache_setup
-      uses: mozilla-actions/sccache-action@v0.0.11
-
     - name: Set sccache cache namespace
       if: ${{ inputs.cache_namespace != '' }}
       shell: bash
       run: echo "SCCACHE_GHA_VERSION=${{ inputs.cache_namespace }}" >> "$GITHUB_ENV"
-      # `warm` and `build` both call this action with the same
-      # inputs.cache_namespace (the workflow's own dispatch input), so
-      # this can only be identical between them, never drift. Used to
-      # force a cold build for testing (a namespace nothing has used
-      # before) or to abandon/purge a cache generation; left blank on
-      # normal tag-triggered releases, in which case sccache uses its
-      # own default namespace, same as before this input existed.
+      # The action below starts the server, which inherits its namespace
+      # only at startup. `warm` and `build` receive the same input.
+
+    - name: Set up sccache
+      id: sccache_setup
+      uses: mozilla-actions/sccache-action@v0.0.11
+      # Starts the sccache server as part of its connectivity check, so
+      # it must come after the namespace step above.
 
     - name: Install Python build dependencies
       shell: bash

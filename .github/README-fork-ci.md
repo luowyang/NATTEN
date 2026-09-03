@@ -178,10 +178,34 @@ avoid paying that cost serially:
   `cache_namespace` blank for normal use, including every tag-triggered release build — sccache then
   uses its own default namespace, same as before this input existed.
 
+## Skipping the warm phase on an unchanged fingerprint
+
+`wheel.yml` starts with a `gate` job. It hashes the `csrc/` tree, the CUTLASS submodule commit,
+`setup.py`, `csrc/CMakeLists.txt`, every `scripts/autogen_*.py` file, the pinned torch and CUDA
+versions, the three `NATTEN_*` build variables, `SHARD_COUNT`, and `cache_namespace`. The resulting
+fingerprint names a tiny marker cache entry.
+
+- A marker miss runs all warm shards. After the real build installs and imports successfully, the build
+  job saves `gate-marker.txt` under that fingerprint's cache key.
+- A marker hit skips all warm shards and starts the real build directly.
+- The real build always compiles every missing object from source. sccache keys objects from the actual
+  preprocessed source, independently of the gate fingerprint, so a stale marker can waste time but
+  cannot make the build reuse a stale object.
+
+The gate prints its fingerprint and decision in the Actions log; the build repeats them in
+`runs/<run_id>-<attempt>/summary.txt` on `ci-logs`.
+
 ## Measured operating facts
 
 These were established by measurement (see commit `a5be24b` on this branch for the full methodology)
 and shape how the workflow is configured:
+
+- **Warm-fingerprint hit: 32m05s.** Workflow
+  [33778616697](https://github.com/luowyang/NATTEN/actions/runs/33778616697) skipped `warm`, then built,
+  installed, imported, and uploaded the wheel successfully in 32m05s. The comparable warm-cache
+  baseline [33729368562](https://github.com/luowyang/NATTEN/actions/runs/33729368562) took 55m52s.
+  A marker hit is only a scheduling hint: if the underlying sccache objects have expired, `build`
+  recompiles them safely and the run may be slower.
 
 - **`NATTEN_N_WORKERS=1`.** The build compiles with a single worker, not the runner's 4 vCPUs, because
   memory — not CPU — is the binding constraint. The three largest translation units (all in
@@ -250,9 +274,10 @@ and unaffected by anything in `.github/`.
   build.
 
 - **`wheel.yml`** — `ubuntu-latest`, on push of tags matching `fork/*` and on `workflow_dispatch`
-  (inputs: `ref`, `cache_namespace`). Two jobs: `warm` (sharded precompile, see "How a cold build is
-  parallelized" above) then `build`, which builds the wheel (see above), uploads it + a manifest as an
-  artifact, and on a `fork/*` tag ref creates/updates that tag's GitHub Release.
+  (inputs: `ref`, `cache_namespace`). Three jobs: `gate` checks whether this exact build fingerprint is
+  already warm; `warm` conditionally runs the sharded precompile described above; `build` always builds
+  the wheel, uploads it + a manifest as an artifact, and on a `fork/*` tag ref creates/updates that tag's
+  GitHub Release.
 
 - **`extended.yml`** — **currently non-functional**, see the status note at the top of the file itself.
   It targets a self-hosted runner this fork no longer has; a dispatch will queue forever. Left in
