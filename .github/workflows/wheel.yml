@@ -71,6 +71,46 @@ jobs:
                             # against; sccache (below) makes repeat builds
                             # much cheaper once its cache is warm, but the
                             # first run on a given source tree pays full price.
+    env:
+      NATTEN_CUDA_ARCH: "9.0"
+      NATTEN_N_WORKERS: "1"     # Measured locally (dev machine 2, CPU
+                                 # only, same NATTEN_CUDA_ARCH=9.0
+                                 # flags, "fine"-policy autogen
+                                 # output): the 3 largest translation
+                                 # units are all in hopper_fna_bwd
+                                 # (source_3/7/6.cu), each peaking
+                                 # ~10.2-10.8GB (process-tree RSS sum,
+                                 # sampled every 2s across the whole
+                                 # nvcc->cicc->ptxas tree, not just
+                                 # ru_maxrss's single-largest-process
+                                 # number -- they matched closely here
+                                 # since nvcc's stages ran essentially
+                                 # sequentially for one TU, but that
+                                 # equivalence breaks the moment N>1
+                                 # such TUs compile concurrently).
+                                 # Two concurrent workers (prior
+                                 # attempts' N_WORKERS=2) means ~21GB
+                                 # combined if two hopper_fna_bwd TUs
+                                 # land together -- doesn't fit a
+                                 # 16GB guest. One worker means at
+                                 # most ~10.8GB resident at a time,
+                                 # which does fit, with headroom.
+      NATTEN_AUTOGEN_POLICY: fine   # Confirmed smallest-TU policy:
+                                 # setup.py's NUM_SPLITS table splits
+                                 # every category into MORE pieces
+                                 # under "fine" than "default"/"coarse"
+                                 # (e.g. hopper-fna-bwd: coarse=2,
+                                 # default=4, fine=8) without changing
+                                 # which kernels get generated (same
+                                 # `categories` dict, same autogen
+                                 # scripts) -- more, smaller compile
+                                 # units for the identical
+                                 # instantiation set.
+      # Defined here (job level, not step level) so the Build
+      # manifest step below can read the exact values the Build
+      # wheel step used, instead of hardcoding separate copies
+      # that can drift out of sync (which is how the manifest
+      # previously ended up lying about NATTEN_N_WORKERS).
     steps:
       - name: Resolve build ref
         id: resolve_ref
@@ -148,6 +188,13 @@ jobs:
                            # 'local' install trades a few extra minutes for
                            # not having to guess apt sub-package names.
           linux-local-args: '["--toolkit"]'   # skip samples/docs, keep nvcc + libs
+          use-github-cache: false   # Default (true) caches this ~5.4GB
+                                     # installer download in the repo's
+                                     # 10GB Actions cache budget, crowding
+                                     # out sccache's own cache entries;
+                                     # use-local-cache (still on, default
+                                     # true) already caches it within a
+                                     # single run, which is all this needs.
 
       - name: Disk space after CUDA toolkit install
         id: post_cuda_df
@@ -230,40 +277,9 @@ jobs:
       - name: Build wheel
         id: build
         env:
-          NATTEN_CUDA_ARCH: "9.0"
-          NATTEN_N_WORKERS: "1"     # Measured locally (dev machine 2, CPU
-                                     # only, same NATTEN_CUDA_ARCH=9.0
-                                     # flags, "fine"-policy autogen
-                                     # output): the 3 largest translation
-                                     # units are all in hopper_fna_bwd
-                                     # (source_3/7/6.cu), each peaking
-                                     # ~10.2-10.8GB (process-tree RSS sum,
-                                     # sampled every 2s across the whole
-                                     # nvcc->cicc->ptxas tree, not just
-                                     # ru_maxrss's single-largest-process
-                                     # number -- they matched closely here
-                                     # since nvcc's stages ran essentially
-                                     # sequentially for one TU, but that
-                                     # equivalence breaks the moment N>1
-                                     # such TUs compile concurrently).
-                                     # Two concurrent workers (prior
-                                     # attempts' N_WORKERS=2) means ~21GB
-                                     # combined if two hopper_fna_bwd TUs
-                                     # land together -- doesn't fit a
-                                     # 16GB guest. One worker means at
-                                     # most ~10.8GB resident at a time,
-                                     # which does fit, with headroom.
-          NATTEN_AUTOGEN_POLICY: fine   # Confirmed smallest-TU policy:
-                                     # setup.py's NUM_SPLITS table splits
-                                     # every category into MORE pieces
-                                     # under "fine" than "default"/"coarse"
-                                     # (e.g. hopper-fna-bwd: coarse=2,
-                                     # default=4, fine=8) without changing
-                                     # which kernels get generated (same
-                                     # `categories` dict, same autogen
-                                     # scripts) -- more, smaller compile
-                                     # units for the identical
-                                     # instantiation set.
+          # NATTEN_CUDA_ARCH / NATTEN_N_WORKERS / NATTEN_AUTOGEN_POLICY
+          # are set at job level above (jobs.build.env) and inherited
+          # here as real OS env vars.
           NATTEN_VERBOSE: "1"
           SCCACHE_GHA_ENABLED: "true"
           GH_TOKEN: ${{ github.token }}
@@ -403,6 +419,7 @@ jobs:
           set -euo pipefail
           SHA256="$(sha256sum "$WHEEL" | awk '{print $1}')"
           VERSION="$(python -c 'import natten; print(natten.__version__)')"
+          BUILT_COMMIT="$(git rev-parse HEAD)"
           MANIFEST="dist/MANIFEST-${VERSION}.txt"
           {
             echo "NATTEN fork CI build manifest"
@@ -412,7 +429,8 @@ jobs:
             echo "Built (UTC)        : $(date -u +%Y-%m-%dT%H:%M:%SZ)"
             echo "natten.__version__ : $VERSION"
             echo
-            echo "Git commit         : ${{ github.sha }}"
+            echo "Built from commit  : $BUILT_COMMIT"
+            echo "Workflow commit    : ${{ github.sha }}"
             echo "Ref built          : ${{ steps.resolve_ref.outputs.build_ref }}"
             echo "Workflow run       : ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
             echo
@@ -422,9 +440,9 @@ jobs:
             echo "  torch            : $(python -c 'import torch; print(torch.__version__)')"
             echo "  torch CUDA       : $(python -c 'import torch; print(torch.version.cuda)')"
             echo "  nvcc             : $(tr '\n' ' ' < /tmp/nvcc-version.txt)"
-            echo "  NATTEN_CUDA_ARCH : 9.0"
-            echo "  NATTEN_N_WORKERS : 2"
-            echo "  NATTEN_AUTOGEN_POLICY : fine"
+            echo "  NATTEN_CUDA_ARCH : $NATTEN_CUDA_ARCH"
+            echo "  NATTEN_N_WORKERS : $NATTEN_N_WORKERS"
+            echo "  NATTEN_AUTOGEN_POLICY : $NATTEN_AUTOGEN_POLICY"
             echo
             echo "GPU kernel tests: NOT run in this workflow (no GPU on"
             echo "ubuntu-latest). Only the CPU-only import smoke test above"
@@ -545,6 +563,13 @@ jobs:
             echo
             echo "--- sccache --show-stats ---"
             sccache --show-stats 2>&1 || echo "(unavailable)"
+            echo
+            echo "--- build manifest ---"
+            if [[ -n "${MANIFEST:-}" && -f "$MANIFEST" ]]; then
+              cat "$MANIFEST"
+            else
+              echo "(no manifest -- Build manifest step likely never ran)"
+            fi
           } > summary.txt
 
           echo "--- pushing diagnostics to ci-logs branch ---"
