@@ -1,0 +1,79 @@
+wheel.yml run 33680769628 attempt 1
+Ref built    : fork/0.21.7+fork.2
+Commit       : c57f6eee7d7919483d779e80e5281e3fbc5089cf
+Workflow run : https://github.com/luowyang/NATTEN/actions/runs/33680769628
+
+Step outcomes:
+  Resolve build ref                 : success
+  Checkout                           : success
+  Set up Python 3.11                 : success
+  Free disk space                    : success
+  Install CUDA toolkit 12.8          : success
+  Disk space after CUDA install      : success
+  Set up sccache                     : success
+  Install Python build dependencies  : success
+  Push started.txt                   : success
+  Build wheel                        : success
+  Install wheel + import smoke test  : success
+  Build manifest                     : success
+  Upload artifact                    : success
+  Create or update GitHub Release    : success
+
+--- df -h ---
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/root       145G   62G   83G  43% /
+tmpfs           7.9G   84K  7.9G   1% /dev/shm
+tmpfs           3.2G 1008K  3.2G   1% /run
+tmpfs           5.0M     0  5.0M   0% /run/lock
+efivarfs        128M   32K  128M   1% /sys/firmware/efi/efivars
+/dev/sda16      881M   64M  756M   8% /boot
+/dev/sda15      105M  6.2M   99M   6% /boot/efi
+tmpfs           1.6G   12K  1.6G   1% /run/user/1001
+
+--- free -m ---
+               total        used        free      shared  buff/cache   available
+Mem:           15989        1244       10817          53        4328       14745
+Swap:           3071           0        3071
+
+--- nproc ---
+4
+
+--- sccache --show-stats ---
+Compile requests                          342
+Compile requests executed                1658
+Cache hits                                114
+Cache hits (C/C++)                          2
+Cache hits (CUBIN)                         73
+Cache hits (CUDA)                          13
+Cache hits (CUDA (Device code))            13
+Cache hits (PTX)                           13
+Cache misses                             1213
+Cache misses (C/C++)                        1
+Cache misses (CUBIN)                      258
+Cache misses (CUDA)                       318
+Cache misses (CUDA (Device code))         318
+Cache misses (PTX)                        318
+Cache hits rate                          8.59 %
+Cache hits rate (C/C++)                 66.67 %
+Cache hits rate (CUBIN)                 22.05 %
+Cache hits rate (CUDA)                   3.93 %
+Cache hits rate (CUDA (Device code))     3.93 %
+Cache hits rate (PTX)                    3.93 %
+Cache timeouts                              0
+Cache read errors                           0
+Forced recaches                             0
+Cache write errors                          1
+Cache errors                                0
+Compilations                             1544
+Compilation failures                        0
+Non-cacheable compilations                331
+Non-cacheable calls                         0
+Non-compilation calls                       8
+Unsupported compiler calls                  0
+Average cache write                     0.169 s
+Average compiler                       21.537 s
+Average cache read hit                  0.081 s
+Failed distributed compilations             0
+Cache location                       ghac, name: cb1f7e366526abf6ae1eead078b47c23b3cb3bd4371944adbb7fae50b8e89210, prefix: /sccache/
+Base directories                     (none)
+Version (client)                     0.17.0
