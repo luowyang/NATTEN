@@ -15,20 +15,14 @@ name: wheel
 # build/test tooling (integration/build_wheel.sh and friends) -- unrelated
 # to and unaffected by this workflow.
 #
-# TWO JOBS, `warm` then `build`: a cold, single-worker compile of every
-# CUDA translation unit on one 4-vCPU/16GB runner takes ~5h (see
-# .github/README-fork-ci.md's "How a cold build is parallelized" for the
-# full explanation). `warm` fans a hash-sharded precompile out across
-# SHARD_COUNT parallel runners so sccache ends up with (almost) every
-# object cached; `build` then does the real, unsharded build, which
-# hits that cache instead of compiling cold. Both jobs check out the
-# same ref identically as their own first step (a local composite
-# action can't do its own checkout -- see prepare-build-env's
-# description); shared setup after that (Python, CUDA, sccache, the
-# compiler wrappers) lives in one composite action,
-# .github/actions/prepare-build-env, specifically so the two jobs'
-# compile environments cannot drift apart from each other -- if they
-# did, sccache would see different compile commands and miss.
+# THREE JOBS, `gate` then (conditionally) `warm` then `build`. `warm`
+# fans a cold compile across SHARD_COUNT runners to prime sccache;
+# `build` produces the real wheel. `gate` skips `warm` when an earlier
+# successful build recorded the same compilation fingerprint. A stale
+# marker can only cost time: sccache independently keys every object
+# from its real compiler inputs, and `build` compiles any miss from
+# source. Shared setup for `warm` and `build` lives in
+# .github/actions/prepare-build-env so their compile environments match.
 #
 # LOG ACCESS: the same organization network that blocks self-hosted
 # runners also blocks reading hosted-run logs and artifacts the normal
@@ -138,7 +132,93 @@ env:
   # were job-level on the one job that existed then).
 
 jobs:
+  gate:
+    # This is a scheduling hint only. Fingerprint or cache lookup errors
+    # fall back to running `warm`; `build` still handles every cache miss.
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      warm_needed: ${{ steps.decide.outputs.warm_needed }}
+      cache_key: ${{ steps.fingerprint.outputs.cache_key }}
+      fingerprint: ${{ steps.fingerprint.outputs.fingerprint }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref }}
+          submodules: false
+
+      - name: Compute fingerprint
+        id: fingerprint
+        env:
+          CACHE_NAMESPACE: ${{ inputs.cache_namespace }}
+        run: |
+          set -euo pipefail
+          CSRC_TREE="$(git rev-parse HEAD:csrc)"
+          CUTLASS_COMMIT="$(git rev-parse HEAD:third_party/cutlass)"
+          SETUP_PY_SHA="$(sha256sum setup.py | cut -d' ' -f1)"
+          CMAKELISTS_SHA="$(sha256sum csrc/CMakeLists.txt | cut -d' ' -f1)"
+          AUTOGEN_FILES=(scripts/autogen_*.py)
+          AUTOGEN_SHA="$(sha256sum "${AUTOGEN_FILES[@]}" | sha256sum | cut -d' ' -f1)"
+
+          TORCH_VERSION="$(grep -oE 'torch==[0-9][0-9.]*' .github/actions/prepare-build-env/action.yml | head -1 | cut -d= -f3)"
+          CUDA_VERSION="$(grep -oE "cuda: '[0-9][0-9.]*'" .github/actions/prepare-build-env/action.yml | head -1 | grep -oE '[0-9]+(\.[0-9]+)*')"
+          if [[ -z "$TORCH_VERSION" || -z "$CUDA_VERSION" ]]; then
+            echo "::error::gate: could not extract torch/CUDA version pins from .github/actions/prepare-build-env/action.yml -- its format may have changed since these grep patterns were written"
+            exit 1
+          fi
+
+          {
+            echo "csrc_tree                = $CSRC_TREE"
+            echo "cutlass_submodule_commit = $CUTLASS_COMMIT"
+            echo "setup_py_sha256          = $SETUP_PY_SHA"
+            echo "cmakelists_sha256        = $CMAKELISTS_SHA  (csrc/CMakeLists.txt; this repo has no separate root CMakeLists.txt)"
+            echo "autogen_scripts_sha256   = $AUTOGEN_SHA  (${#AUTOGEN_FILES[@]} files: ${AUTOGEN_FILES[*]})"
+            echo "torch_version            = $TORCH_VERSION"
+            echo "cuda_toolkit_version     = $CUDA_VERSION"
+            echo "NATTEN_CUDA_ARCH         = $NATTEN_CUDA_ARCH"
+            echo "NATTEN_N_WORKERS         = $NATTEN_N_WORKERS"
+            echo "NATTEN_AUTOGEN_POLICY    = $NATTEN_AUTOGEN_POLICY"
+            echo "SHARD_COUNT              = $SHARD_COUNT"
+            echo "cache_namespace          = ${CACHE_NAMESPACE:-(blank)}"
+          } > /tmp/gate-inputs.txt
+
+          FINGERPRINT="$(sha256sum /tmp/gate-inputs.txt | cut -d' ' -f1)"
+          echo "fingerprint=$FINGERPRINT" >> "$GITHUB_OUTPUT"
+          echo "cache_key=natten-warm-$FINGERPRINT" >> "$GITHUB_OUTPUT"
+
+      - name: Look up marker cache entry
+        id: lookup
+        uses: actions/cache/restore@v4
+        with:
+          path: gate-marker.txt   # Must match the save action's path:
+                                  # cache version includes the path even
+                                  # when lookup-only skips the download.
+          key: ${{ steps.fingerprint.outputs.cache_key }}
+          lookup-only: true
+
+      - name: Decide
+        id: decide
+        if: always()
+        run: |
+          set +e -u -o pipefail
+          FP="${{ steps.fingerprint.outputs.fingerprint }}"
+          KEY="${{ steps.fingerprint.outputs.cache_key }}"
+          LOOKUP_OUTCOME="${{ steps.lookup.outcome }}"
+          CACHE_HIT="${{ steps.lookup.outputs.cache-hit }}"
+
+          WARM_NEEDED=true
+          if [[ -n "$KEY" && "$LOOKUP_OUTCOME" == "success" && "$CACHE_HIT" == "true" ]]; then
+            WARM_NEEDED=false
+          fi
+          echo "warm_needed=$WARM_NEEDED" >> "$GITHUB_OUTPUT"
+          cat /tmp/gate-inputs.txt 2>/dev/null || true
+          echo "fingerprint=${FP:-N/A} marker_key=${KEY:-N/A} cache_hit=${CACHE_HIT:-N/A} warm_needed=$WARM_NEEDED"
+          exit 0
+
   warm:
+    needs: gate
+    if: needs.gate.outputs.warm_needed == 'true'
     # Sharded precompile: SHARD_COUNT parallel runners, each compiling
     # roughly one SHARD_COUNTth of the real translation units (hash-
     # selected by the nvcc wrapper, .github/scripts/nvcc-wrapper.sh) for
@@ -308,11 +388,14 @@ jobs:
           exit 0
 
   build:
-    needs: warm
-    if: ${{ !cancelled() }}   # Run even if a shard failed -- `build`
-                               # then simply compiles whatever that shard
-                               # would have primed the cache for, itself,
-                               # cold. Only skip on cancellation.
+    needs: [gate, warm]   # gate: this job reads its marker outputs below.
+                            # warm: the cache it was meant to prime, if it ran.
+    if: ${{ !cancelled() }}   # Run even if warm was skipped (gate decided
+                               # it wasn't needed) or a shard failed --
+                               # `build` then simply compiles whatever
+                               # that shard would have primed the cache
+                               # for, itself, cold. Only skip on
+                               # cancellation.
     runs-on: ubuntu-latest
     timeout-minutes: 360   # a cold, uncached CUDA compile on a 4-vCPU hosted
                             # runner is far slower than the 39-worker dev-
@@ -537,6 +620,30 @@ jobs:
           # correctness is validated on the dev machines, not here.
           python -c "import natten; print('natten.__version__ =', natten.__version__)"
 
+      - name: Save warm marker
+        id: save_marker
+        if: needs.gate.outputs.warm_needed == 'true'
+        # Only when gate told us no marker existed yet for this
+        # fingerprint (a MISS) -- when it told us the opposite (a HIT),
+        # the marker is already there and actions/cache/save would just
+        # fail on "cache already exists" for no benefit. No `if:
+        # always()`: this step should only run, and only mean anything,
+        # once the build has actually proven itself by compiling,
+        # installing and importing above -- an unrelated failure in a
+        # later step (manifest/upload/release) has nothing to do with
+        # whether sccache is warm, and must not block recording that it
+        # is.
+        run: |
+          set -euo pipefail
+          echo "natten fork CI warm marker -- fingerprint ${{ needs.gate.outputs.fingerprint }}, built by run ${{ github.run_id }} attempt ${{ github.run_attempt }}" > gate-marker.txt
+
+      - name: Save warm marker (cache write)
+        if: needs.gate.outputs.warm_needed == 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: gate-marker.txt
+          key: ${{ needs.gate.outputs.cache_key }}
+
       - name: Build manifest
         id: manifest
         run: |
@@ -615,6 +722,9 @@ jobs:
         if: always()
         env:
           GH_TOKEN: ${{ github.token }}
+          GATE_WARM_NEEDED: ${{ needs.gate.outputs.warm_needed }}
+          GATE_FINGERPRINT: ${{ needs.gate.outputs.fingerprint }}
+          GATE_CACHE_KEY: ${{ needs.gate.outputs.cache_key }}
         run: |
           set +e -u -o pipefail
           # +e deliberately: GitHub Actions' default shell invocation
@@ -660,6 +770,7 @@ jobs:
             echo "Commit       : ${{ github.sha }}"
             echo "Workflow run : ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
             echo "warm job result : ${{ needs.warm.result }}"
+            echo "gate decision   : warm_needed=$GATE_WARM_NEEDED fingerprint=$GATE_FINGERPRINT marker_key=$GATE_CACHE_KEY"
             echo
             echo "Step outcomes:"
             echo "  Resolve build ref                 : ${{ steps.resolve_ref.outcome }}"
@@ -667,6 +778,7 @@ jobs:
             echo "  Push started.txt                   : ${{ steps.started_checkpoint.outcome }}"
             echo "  Build wheel                        : ${{ steps.build.outcome }}"
             echo "  Install wheel + import smoke test  : ${{ steps.install_smoke.outcome }}"
+            echo "  Save warm marker                   : ${{ steps.save_marker.outcome }}"
             echo "  Build manifest                     : ${{ steps.manifest.outcome }}"
             echo "  Upload artifact                    : ${{ steps.upload.outcome }}"
             echo "  Create or update GitHub Release    : ${{ steps.release.outcome }}"
