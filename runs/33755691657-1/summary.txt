@@ -1,0 +1,92 @@
+wheel.yml run 33755691657 attempt 1
+Ref built    : fork-ci-gate
+Commit       : 80bf7eedfd930eb34a41fa2055fb5601ec21a330
+Workflow run : https://github.com/luowyang/NATTEN/actions/runs/33755691657
+warm job result : success
+gate decision   : warm_needed=true fingerprint=d54a5291e7afb0df70ca311a84f071a244b43c4d7726cad58fa21808ebf58e76 marker_key=natten-warm-d54a5291e7afb0df70ca311a84f071a244b43c4d7726cad58fa21808ebf58e76
+
+Step outcomes:
+  Resolve build ref                 : success
+  Prepare build environment          : success
+  Push started.txt                   : success
+  Build wheel                        : cancelled
+  Install wheel + import smoke test  : skipped
+  Save warm marker                   : skipped
+  Build manifest                     : skipped
+  Upload artifact                    : skipped
+  Create or update GitHub Release    : skipped
+  Parse sccache per-file log         : success
+
+--- Project CUDA cache decisions this build (from the per-file sccache log; see sccache-compiles.txt) ---
+log_worked=false decisions=193 hits=186 misses=7 other_stage_results=194 miss_pct=3.63%
+
+--- sccache namespace/server initialization ---
+[2026-09-03T14:08:00Z DEBUG sccache::cache::cache] Init gha cache with version gate-keys-1
+
+--- runner/toolchain identity ---
+Runner image: ubuntu24 20260823.283.1
+Host compiler: g++ (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0
+Host compiler SHA256: 1353e9bdd29a7295c7226bf6c63abccce056d8cac31f112e5cdbecc3f28c2769
+
+--- df -h ---
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/root       145G   68G   77G  47% /
+tmpfs           7.9G     0  7.9G   0% /dev/shm
+tmpfs           3.2G 1004K  3.2G   1% /run
+tmpfs           5.0M     0  5.0M   0% /run/lock
+efivarfs        128M   26K  128M   1% /sys/firmware/efi/efivars
+/dev/sda16      881M   64M  756M   8% /boot
+/dev/sda15      105M  6.2M   99M   6% /boot/efi
+tmpfs           1.6G   12K  1.6G   1% /run/user/1001
+
+--- free -m ---
+               total        used        free      shared  buff/cache   available
+Mem:           15993        1536       10832          51        4022       14457
+Swap:           3071           0        3071
+
+--- nproc ---
+4
+
+--- sccache --show-stats ---
+[2026-09-03T14:39:32Z DEBUG sccache::config] Attempting to read config file at "/home/runner/.config/sccache/config"
+[2026-09-03T14:39:32Z DEBUG sccache::config] Couldn't open config file: failed to open file `/home/runner/.config/sccache/config`: No such file or directory (os error 2)
+[2026-09-03T14:39:32Z DEBUG sccache::commands] request_stats
+Compile requests                          205
+Compile requests executed                 974
+Cache hits                                757
+Cache hits (C/C++)                          3
+Cache hits (CUBIN)                        194
+Cache hits (CUDA)                         187
+Cache hits (CUDA (Device code))           187
+Cache hits (PTX)                          186
+Cache misses                               22
+Cache misses (CUDA)                         7
+Cache misses (CUDA (Device code))           7
+Cache misses (PTX)                          8
+Cache hits rate                         97.18 %
+Cache hits rate (C/C++)                100.00 %
+Cache hits rate (CUBIN)                100.00 %
+Cache hits rate (CUDA)                  96.39 %
+Cache hits rate (CUDA (Device code))    96.39 %
+Cache hits rate (PTX)                   95.88 %
+Cache timeouts                              0
+Cache read errors                           0
+Forced recaches                             0
+Cache write errors                          1
+Cache errors                                0
+Compilations                              216
+Compilation failures                        0
+Non-cacheable compilations                194
+Non-cacheable calls                         0
+Non-compilation calls                       7
+Unsupported compiler calls                  0
+Average cache write                     0.289 s
+Average compiler                       10.179 s
+Average cache read hit                  0.073 s
+Failed distributed compilations             0
+Cache location                       ghac, name: 38053c6f688bbafbd074145ba95944a8523765c130f5b6c60dfa5e877bf4dff1, prefix: /sccache/
+Base directories                     (none)
+Version (client)                     0.17.0
+
+--- build manifest ---
+(no manifest -- Build manifest step likely never ran)
