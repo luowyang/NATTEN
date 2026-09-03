@@ -1,0 +1,21 @@
+wheel.yml run 33778616697 attempt 1: gate
+
+Fingerprint inputs:
+  csrc_tree                = 131cf3ec3345a781ed6b5b2778fb28d8c72d8537
+  cutlass_submodule_commit = 6b3e607b852f1543dc21323155a2ad71473c8642
+  setup_py_sha256          = 0539d7bc2823a2b39afd4614d816c75ddad1cd7a3bd763c287305ee046aca5a0
+  cmakelists_sha256        = 4f6a9eacb5aedccae8f4933397bde79158307ba442946f54dc1d22a9db42d272  (csrc/CMakeLists.txt; this repo has no separate root CMakeLists.txt)
+  autogen_scripts_sha256   = bd98459498939832e5750e0c94af7a4dda940a910e20deb9821463c5c57e9deb  (11 files: scripts/autogen_blackwell_fmha.py scripts/autogen_blackwell_fmha_bwd.py scripts/autogen_blackwell_fna.py scripts/autogen_blackwell_fna_bwd.py scripts/autogen_fmha.py scripts/autogen_fna.py scripts/autogen_hopper_fmha.py scripts/autogen_hopper_fmha_bwd.py scripts/autogen_hopper_fna.py scripts/autogen_hopper_fna_bwd.py scripts/autogen_reference_fna.py)
+  torch_version            = 2.11.0
+  cuda_toolkit_version     = 12.8.0
+  NATTEN_CUDA_ARCH         = 9.0
+  NATTEN_N_WORKERS         = 1
+  NATTEN_AUTOGEN_POLICY    = fine
+  SHARD_COUNT              = 8
+  cache_namespace          = gate-cold-1
+
+Fingerprint  : a7f7c9b169ae85f48fc6d32162ed7cf2f889152e981d191e6d4fd8320e3976e6
+Marker key   : natten-warm-a7f7c9b169ae85f48fc6d32162ed7cf2f889152e981d191e6d4fd8320e3976e6
+Cache lookup : HIT
+Decision     : warm_needed=false
+Reason       : marker cache HIT for this fingerprint -- an earlier build with the exact same inputs already primed sccache, so warm is skipped
