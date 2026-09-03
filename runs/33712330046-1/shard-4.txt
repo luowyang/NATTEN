@@ -1,0 +1,107 @@
+wheel.yml run 33712330046 attempt 1: warm shard 4/8
+Precompile shard step outcome : success
+Elapsed (build step)          : 1669s
+Compiled (own shard)          : 24
+Failed (own shard)            :
+  (none)
+
+--- sccache --show-stats ---
+Compile requests                           36
+Compile requests executed                 128
+Cache hits                                  7
+Cache hits (C/C++)                          3
+Cache hits (CUBIN)                          1
+Cache hits (CUDA)                           1
+Cache hits (CUDA (Device code))             1
+Cache hits (PTX)                            1
+Cache misses                               96
+Cache misses (CUBIN)                       24
+Cache misses (CUDA)                        24
+Cache misses (CUDA (Device code))          24
+Cache misses (PTX)                         24
+Cache hits rate                          6.80 %
+Cache hits rate (C/C++)                100.00 %
+Cache hits rate (CUBIN)                  4.00 %
+Cache hits rate (CUDA)                   4.00 %
+Cache hits rate (CUDA (Device code))     4.00 %
+Cache hits rate (PTX)                    4.00 %
+Cache timeouts                              0
+Cache read errors                           0
+Forced recaches                             0
+Cache write errors                          0
+Cache errors                                0
+Compilations                              121
+Compilation failures                        0
+Non-cacheable compilations                 25
+Non-cacheable calls                         0
+Non-compilation calls                       8
+Unsupported compiler calls                  0
+Average cache write                     0.574 s
+Average compiler                       22.677 s
+Average cache read hit                  0.363 s
+Failed distributed compilations             0
+Cache location                       ghac, name: 0fcac26b9e2c537103823aeb54533dda17b75515f7ac7186c4303ec5e0c02201, prefix: /sccache/
+Base directories                     (none)
+Version (client)                     0.17.0
+
+--- last 60 lines of this shard's python -m build output ---
+adding 'natten/functional.py'
+adding 'natten/libnatten.cpython-311-x86_64-linux-gnu.so'
+adding 'natten/modules.py'
+adding 'natten/profiler.py'
+adding 'natten/types.py'
+adding 'natten/version.py'
+adding 'natten/_libnatten/__init__.py'
+adding 'natten/_libnatten/stubs.py'
+adding 'natten/_libnatten/torch_wrappers.py'
+adding 'natten/backends/__init__.py'
+adding 'natten/backends/blackwell_fmha.py'
+adding 'natten/backends/blackwell_fna.py'
+adding 'natten/backends/flex.py'
+adding 'natten/backends/fmha.py'
+adding 'natten/backends/fna.py'
+adding 'natten/backends/hopper_fmha.py'
+adding 'natten/backends/hopper_fna.py'
+adding 'natten/backends/reference.py'
+adding 'natten/backends/configs/__init__.py'
+adding 'natten/backends/configs/checks.py'
+adding 'natten/backends/configs/cutlass/__init__.py'
+adding 'natten/backends/configs/cutlass/backward_knobs.py'
+adding 'natten/backends/configs/cutlass/fna_backward_128x128.py'
+adding 'natten/backends/configs/cutlass/fna_backward_128x64.py'
+adding 'natten/backends/configs/cutlass/fna_backward_64x64.py'
+adding 'natten/backends/configs/cutlass/fna_forward_32x128.py'
+adding 'natten/backends/configs/cutlass/fna_forward_64x128.py'
+adding 'natten/backends/configs/cutlass/fna_forward_64x64.py'
+adding 'natten/backends/configs/cutlass_blackwell/__init__.py'
+adding 'natten/backends/configs/cutlass_hopper/__init__.py'
+adding 'natten/backends/configs/flex/__init__.py'
+adding 'natten/profiling_utils/__init__.py'
+adding 'natten/profiling_utils/dry_run.py'
+adding 'natten/profiling_utils/formatting.py'
+adding 'natten/profiling_utils/ops.py'
+adding 'natten/profiling_utils/pretty_printer.py'
+adding 'natten/profiling_utils/problem.py'
+adding 'natten/profiling_utils/profiling.py'
+adding 'natten/token_permute/__init__.py'
+adding 'natten/token_permute/cutlass_impl.py'
+adding 'natten/token_permute/frontend.py'
+adding 'natten/token_permute/torch_impl.py'
+adding 'natten/utils/__init__.py'
+adding 'natten/utils/checks.py'
+adding 'natten/utils/device.py'
+adding 'natten/utils/dtype.py'
+adding 'natten/utils/environment.py'
+adding 'natten/utils/log.py'
+adding 'natten/utils/tensor.py'
+adding 'natten/utils/testing.py'
+adding 'natten/utils/tuples.py'
+adding 'natten/utils/varlen.py'
+adding 'natten-0.21.7.dist-info/licenses/LICENSE'
+adding 'natten-0.21.7.dist-info/licenses/NOTICE'
+adding 'natten-0.21.7.dist-info/METADATA'
+adding 'natten-0.21.7.dist-info/WHEEL'
+adding 'natten-0.21.7.dist-info/top_level.txt'
+adding 'natten-0.21.7.dist-info/RECORD'
+removing build/bdist.linux-x86_64/wheel
+Successfully built natten-0.21.7-cp311-cp311-linux_x86_64.whl
