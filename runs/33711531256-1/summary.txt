@@ -1,0 +1,41 @@
+wheel.yml run 33711531256 attempt 1
+Ref built    : fork-ci-shards
+Commit       : 7109983fa3df3a00d29fea9ac90076774255bae0
+Workflow run : https://github.com/luowyang/NATTEN/actions/runs/33711531256
+warm job result : failure
+
+Step outcomes:
+  Resolve build ref                 : success
+  Prepare build environment          : failure
+  Push started.txt                   : success
+  Build wheel                        : skipped
+  Install wheel + import smoke test  : skipped
+  Build manifest                     : skipped
+  Upload artifact                    : skipped
+  Create or update GitHub Release    : skipped
+
+--- df -h ---
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/root       145G   58G   87G  41% /
+tmpfs           7.9G     0  7.9G   0% /dev/shm
+tmpfs           3.2G 1008K  3.2G   1% /run
+tmpfs           5.0M     0  5.0M   0% /run/lock
+efivarfs        128M   32K  128M   1% /sys/firmware/efi/efivars
+/dev/sda16      881M   64M  756M   8% /boot
+/dev/sda15      105M  6.2M   99M   6% /boot/efi
+tmpfs           1.6G   12K  1.6G   1% /run/user/1001
+
+--- free -m ---
+               total        used        free      shared  buff/cache   available
+Mem:           15989         927       12970          41        2449       15062
+Swap:           3071           0        3071
+
+--- nproc ---
+4
+
+--- sccache --show-stats ---
+/home/runner/work/_temp/024dc94d-a53d-4ac4-9ee8-a610f5a25578.sh: line 66: sccache: command not found
+(unavailable)
+
+--- build manifest ---
+(no manifest -- Build manifest step likely never ran)
