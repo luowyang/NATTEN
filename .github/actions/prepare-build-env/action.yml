@@ -1,0 +1,157 @@
+name: Prepare NATTEN build environment
+description: >-
+  Checkout, Python 3.11, free disk space, CUDA 12.8, sccache, and the
+  sccache compiler-wrapper scripts shared by wheel.yml's `warm` and
+  `build` jobs. Factored out here so the two jobs cannot drift out of
+  sync with each other -- GitHub Actions workflow YAML has no anchors or
+  merge keys, so a composite action is the supported way to share steps
+  across jobs.
+inputs:
+  checkout_ref:
+    description: >-
+      Ref (tag/branch/sha) to check out. Callers should pass the
+      workflow's own `inputs.ref` straight through unchanged (blank on a
+      push-tag trigger, or a manual dispatch with no override -- both
+      correctly fall back to actions/checkout's own default).
+    required: false
+    default: ''
+  cache_namespace:
+    description: >-
+      Optional SCCACHE_GHA_VERSION value. Callers should pass the
+      workflow's own `inputs.cache_namespace` straight through unchanged.
+      Left blank, sccache uses its own default cache namespace.
+    required: false
+    default: ''
+runs:
+  using: composite
+  steps:
+    - name: Checkout
+      uses: actions/checkout@v7
+      with:
+        ref: ${{ inputs.checkout_ref }}
+        submodules: recursive
+        # Mandatory: NATTEN's CMake build needs third_party/cutlass/include
+        # populated; there is no assemble.sh step in this workflow to do
+        # it, so actions/checkout must. An empty ref (push-tag trigger, or
+        # a dispatch with no explicit input) falls back to actions/
+        # checkout's own default (github.sha), which is exactly right for
+        # both cases.
+
+    - name: Set up Python 3.11
+      uses: actions/setup-python@v7
+      with:
+        python-version: "3.11"
+        cache: pip
+
+    - name: Free disk space
+      shell: bash
+      run: |
+        set -euo pipefail
+        echo "--- df -h (before) ---"
+        df -h
+        # Unconditional, not threshold-gated: two attempts at this
+        # workflow both had "Build wheel" killed (SIGTERM, exit 143)
+        # deep into the compile with no reachable error text -- disk
+        # exhaustion is the leading hypothesis, and none of this
+        # preinstalled bulk is ever needed for a CUDA/C++ build, so
+        # there's no reason to gate its removal behind a threshold
+        # that's only checked this early, before the multi-GB CUDA
+        # toolkit + torch installs that actually consume the space.
+        echo "Clearing standard hosted-runner preinstalled bulk (dotnet/android/ghc/docker images; the usual 'maximize build space' trick)."
+        sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc || true
+        sudo docker image prune -af || true
+        sudo apt-get clean || true
+        echo "--- df -h (after cleanup) ---"
+        df -h
+
+    - name: Install CUDA toolkit 12.8
+      id: cuda-toolkit
+      uses: Jimver/cuda-toolkit@v0.2.36
+      with:
+        cuda: '12.8.0'
+        method: local   # 'network' only installs the sub-packages you
+                         # name, and NATTEN's own build (setup.py/CMake)
+                         # has no documented minimal package list -- full
+                         # 'local' install trades a few extra minutes for
+                         # not having to guess apt sub-package names.
+        linux-local-args: '["--toolkit"]'   # skip samples/docs, keep nvcc + libs
+        use-github-cache: false   # Default (true) caches this ~5.4GB
+                                   # installer download in the repo's
+                                   # 10GB Actions cache budget, crowding
+                                   # out sccache's own cache entries;
+                                   # use-local-cache (still on, default
+                                   # true) already caches it within a
+                                   # single run, which is all this needs.
+
+    - name: Disk space after CUDA toolkit install
+      shell: bash
+      run: df -h
+
+    - name: Set up sccache
+      id: sccache_setup
+      uses: mozilla-actions/sccache-action@v0.0.11
+
+    - name: Set sccache cache namespace
+      if: ${{ inputs.cache_namespace != '' }}
+      shell: bash
+      run: echo "SCCACHE_GHA_VERSION=${{ inputs.cache_namespace }}" >> "$GITHUB_ENV"
+      # `warm` and `build` both call this action with the same
+      # inputs.cache_namespace (the workflow's own dispatch input), so
+      # this can only be identical between them, never drift. Used to
+      # force a cold build for testing (a namespace nothing has used
+      # before) or to abandon/purge a cache generation; left blank on
+      # normal tag-triggered releases, in which case sccache uses its
+      # own default namespace, same as before this input existed.
+
+    - name: Install Python build dependencies
+      shell: bash
+      run: |
+        set -euo pipefail
+        # Matches natten_dev's own torch build exactly (confirmed via
+        # `python -c 'import torch; print(torch.__version__)'` there:
+        # 2.11.0+cu128) and is a real wheel on this index for cp311/
+        # manylinux_x86_64 (checked: https://download.pytorch.org/whl/cu128/torch/).
+        pip install "torch==2.11.0" --index-url https://download.pytorch.org/whl/cu128
+        pip install ninja "build>=1.3.0" "setuptools<82"
+        # setuptools<82 for the same reason integration/build_wheel.sh
+        # (this fork's dev-machine build tooling) pins it: torch's
+        # installed metadata declares Requires-Dist: setuptools<82, and
+        # `python -m build --no-isolation` (unlike a plain `pip install
+        # -e .`) enforces build-system requirements' own declared
+        # constraints.
+
+    - name: Install sccache compiler wrappers
+      shell: bash
+      run: |
+        set -euo pipefail
+        # --- sccache compiler masquerade (no setup.py/CMakeLists.txt changes) ---
+        # NATTEN's setup.py builds its `cmake` invocation as a hardcoded
+        # Python list (checked: no CMAKE_ARGS / *_COMPILER_LAUNCHER
+        # support anywhere in setup.py or csrc/CMakeLists.txt), so the
+        # usual `-DCMAKE_CUDA_COMPILER_LAUNCHER=sccache` hook isn't
+        # available here. CMake's own `project()`/`enable_language()`
+        # compiler detection reads the CUDACXX/CXX environment variables
+        # first when locating the CUDA/C++ compilers (standard CMake
+        # behavior, unrelated to NATTEN) -- pointing those at wrapper
+        # scripts that shell out through sccache gets the same effect
+        # with zero repo changes.
+        #
+        # The nvcc wrapper is a committed script (.github/scripts/
+        # nvcc-wrapper.sh) rather than generated inline here, because it
+        # now carries the shard-hashing logic (see that file) -- it
+        # needs REAL_NVCC as an environment variable, exported below via
+        # $GITHUB_ENV so it is visible in the later step that actually
+        # invokes it. The c++ wrapper has no such logic (sccache only,
+        # per design) and stays a two-line generated script.
+        REAL_NVCC="$(command -v nvcc)"
+        REAL_CXX="$(command -v c++)"
+        mkdir -p /tmp/sccache-wrappers
+        cp .github/scripts/nvcc-wrapper.sh /tmp/sccache-wrappers/nvcc
+        printf '#!/bin/sh\nexec sccache "%s" "$@"\n' "$REAL_CXX"  > /tmp/sccache-wrappers/c++
+        chmod +x /tmp/sccache-wrappers/nvcc /tmp/sccache-wrappers/c++
+        {
+          echo "REAL_NVCC=$REAL_NVCC"
+          echo "CUDA_HOME=${{ steps.cuda-toolkit.outputs.CUDA_PATH }}"
+          echo "CUDACXX=/tmp/sccache-wrappers/nvcc"
+          echo "CXX=/tmp/sccache-wrappers/c++"
+        } >> "$GITHUB_ENV"
