@@ -14,7 +14,7 @@ Each build targets exactly one combination:
 
 - **CUDA 12.8**
 - **PyTorch 2.11**
-- **Python 3.11** (cp311, `manylinux_x86_64`)
+- **Python 3.11** (cp311, `linux_x86_64`)
 - **sm90 only** (`NATTEN_CUDA_ARCH=9.0`, i.e. Hopper; the wheel has no other architecture's kernels)
 
 The build runs on a GitHub-hosted runner, which has no GPU. It compiles a real CUDA extension and
