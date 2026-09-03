@@ -130,8 +130,13 @@ avoid paying that cost serially:
 - **Topology.** `warm` is a `strategy.matrix` of `SHARD_COUNT` (currently 8) parallel runners,
   `shard: 0..7`. Each shard runs the *same* `python -m build --no-isolation --wheel -o dist/` command as
   `build`, with the same `NATTEN_*`/`SCCACHE_*` environment, plus two extra variables that only the nvcc
-  wrapper reads: `NATTEN_CI_SHARD_INDEX` and `NATTEN_CI_SHARD_COUNT`. Shared setup (checkout, Python,
-  CUDA 12.8, sccache, the compiler wrapper scripts) lives in one composite action,
+  wrapper reads: `NATTEN_CI_SHARD_INDEX` and `NATTEN_CI_SHARD_COUNT`. Both jobs check out the same ref
+  identically as their own first step (a local composite action can't do its own checkout — GitHub
+  Actions resolves `uses: ./path` from whatever checkout already exists in the job's workspace, so
+  checkout can't be a step inside the very composite action being referenced; confirmed the hard way,
+  every job failing in seconds with "Can't find 'action.yml' ... Did you forget to run actions/checkout
+  before running your local action?" when an earlier revision tried it). Shared setup after that
+  (Python, CUDA 12.8, sccache, the compiler wrapper scripts) lives in one composite action,
   `.github/actions/prepare-build-env`, used by both jobs — GitHub Actions workflow YAML has no anchors
   or merge keys, so this is the supported way to keep two jobs' steps from drifting apart; if they did,
   `warm` and `build` would issue different compile commands for the same file and sccache would miss.
