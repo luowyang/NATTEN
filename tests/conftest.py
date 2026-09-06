@@ -33,3 +33,26 @@ def dynamo_recompile_budget():
     yield
     for name, value in saved.items():
         setattr(torch._dynamo.config, name, value)
+
+
+@pytest.fixture(autouse=True)
+def default_device():
+    """Keep one test's default device out of the next test.
+
+    Eight modules switch the process-global default device to cuda so their own
+    unqualified tensors land there, and leave it switched. A later test that builds
+    a generator or a tensor without naming a device then inherits cuda from whoever
+    ran first, and fails on the mismatch with the ones it does name.
+
+    Clearing first is what keeps this fixture from leaving global state of its own:
+    torch.set_default_device installs a mode that every subsequent torch call is
+    dispatched through, and passing it the cpu that get_default_device reports for a
+    session which never set a default device would install one where there was none.
+    set_default_device(None) is that session's actual state, and the restore below it
+    runs only for a test that inherited a default device to go back to.
+    """
+    saved = torch.get_default_device()
+    yield
+    torch.set_default_device(None)
+    if torch.get_default_device() != saved:
+        torch.set_default_device(saved)
