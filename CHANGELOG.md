@@ -33,6 +33,14 @@
   with no kernel launch. Explicit tile shapes and `backward_kv_splits` are
   not supported together with a `kernel_size = 1` axis. The fixed
   (non-varlen) family is unchanged and still rejects `kernel_size = 1`.
+* A variable-length pack whose documents do not all share a shape reaches the
+  CUDA kernel in a single launch: only the caller's own `kernel_size = 1` axes
+  are lowered away in Python -- the same fold or permute for every document --
+  and each document's own narrower-than-`kernel_size` window is clamped by the
+  kernel, where that clamp already lived. A document whose isolated call lowers
+  to a different kernel family than the pack does (an image beside videos, say)
+  therefore answers to within rounding of that isolated call rather than
+  matching it bit for bit; every other document stays bitwise identical.
 * Fixed three defects in that lowering: the all-degenerate identity path
   returned NaN once its inputs were large enough for a whole-tensor sum to
   overflow; that path backpropagated real query/key derivatives through

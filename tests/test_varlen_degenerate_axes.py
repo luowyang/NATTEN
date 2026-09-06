@@ -42,9 +42,10 @@ of degenerate axes, so (a)/(b)/(c)'s different degenerate-axis positions
 through one shared runner rather than three separately hand-built oracles.
 """
 
+import itertools
 import pickle
 import unittest
-from typing import Any, Callable, Dict, Tuple
+from typing import Any, Callable, Dict, List, Tuple
 from unittest import mock
 
 import natten
@@ -62,10 +63,12 @@ from torch._dynamo.testing import CompileCounter
 from .utils import (
     _dtype_is_supported,
     _explicit_oracle,
+    _flatten_index,
     _make_layout,
     _prod,
     _set_deterministic,
     _tolerances,
+    _window_positions,
     VarlenCase,
 )
 
@@ -77,6 +80,220 @@ _VARLEN_FN_BY_RANK: Dict[int, Callable[..., Any]] = {
 
 _FP32_FWD_ATOL = 3e-4
 _FP32_GRAD_ATOL = 4e-4
+
+# The FP32 kernels' GEMMs are OpMultiplyAddFastF32 (3xTF32), so a product
+# of one costs up to 2**-21 relative -- FP16/BF16 products of one are exact.
+_TF32_RELATIVE = 2.0**-21
+_TF32_ABSOLUTE = 2.0**-30
+
+_DENSE_MASK_CACHE: Dict[Any, torch.Tensor] = {}
+
+
+def _ulp32(value: float) -> float:
+    """Spacing of float32 above ``abs(value)``."""
+    magnitude = torch.tensor(abs(value), dtype=torch.float32)
+    above = torch.nextafter(magnitude, torch.tensor(torch.inf, dtype=torch.float32))
+    return float(above.double() - magnitude.double())
+
+
+def _dtype_ulp(magnitude: float, dtype: torch.dtype) -> float:
+    """Spacing of ``dtype`` above ``magnitude``."""
+    value = torch.tensor(abs(magnitude), dtype=dtype)
+    above = torch.nextafter(value, torch.tensor(torch.inf, dtype=dtype))
+    return float(above.double() - value.double())
+
+
+def _rounding_radius(values: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    """Half an ulp of ``dtype`` at each element's own magnitude."""
+    magnitude = values.detach().cpu().abs().to(dtype)
+    above = torch.nextafter(magnitude, torch.full_like(magnitude, torch.inf))
+    return (above.double() - magnitude.double()) * 0.5
+
+
+def _product_radius(values: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    """How far one kernel-computed product of this magnitude may land from the
+    exact answer: the 3xTF32 interval on FP32, half a storage ulp otherwise."""
+    if dtype == torch.float32:
+        return values.detach().cpu().double().abs() * _TF32_RELATIVE + _TF32_ABSOLUTE
+    return _rounding_radius(values, dtype)
+
+
+def _prefix_sum_bound(left: torch.Tensor, right: torch.Tensor) -> float:
+    """Largest sequential prefix sum of ``left * right``, the full dot
+    product included."""
+    products = left.detach().cpu().double() * right.detach().cpu().double()
+    return float(products.cumsum(0).abs().max()) if products.numel() else 0.0
+
+
+def _fit_rank_one(
+    values: torch.Tensor, basis: torch.Tensor, dtype: torch.dtype
+) -> float:
+    """Least-squares scalar in float64, stored back in the kernel's dtype."""
+    y = values.detach().cpu().double().flatten()
+    x = basis.detach().cpu().double().flatten()
+    denominator = float(x @ x)
+    fitted = float(x @ y) / denominator if denominator else 0.0
+    return float(torch.tensor([fitted], dtype=torch.float64).to(dtype).double()[0])
+
+
+def _assert_product_close(
+    test, actual, expected, dtype, message: str, magnitude=None
+) -> None:
+    """Equality for a quantity the kernel obtains by multiplying by one:
+    bitwise on FP16/BF16, within the 3xTF32 interval on FP32. ``magnitude``
+    carries the relative term when ``expected`` is a sum of such products
+    (GQA folds one per query head into each key/value head), since the
+    interval belongs to each product, not to what they add up to.
+    """
+    a = actual.detach().cpu().double()
+    b = expected.detach().cpu().double()
+    if dtype != torch.float32:
+        test.assertTrue(torch.equal(a, b), message)
+        return
+    scale = b.abs() if magnitude is None else magnitude.detach().cpu().double()
+    allowed = scale * _TF32_RELATIVE + _TF32_ABSOLUTE
+    outside = int(((a - b).abs() > allowed).sum())
+    test.assertEqual(outside, 0, f"{message}: {outside} outside the 3xTF32 interval")
+
+
+def _assert_rank_one(test, values, basis, coefficient, dtype, message: str) -> None:
+    expected = (
+        torch.tensor([coefficient], dtype=torch.float64)
+        * basis.detach().cpu().double().flatten()
+    )
+    if dtype != torch.float32:
+        expected = expected.float().to(dtype).double()
+    _assert_product_close(
+        test, values.detach().cpu().flatten(), expected, dtype, message
+    )
+
+
+def _assert_single_key_rows(
+    test, rows: List[int], query, key, value, upstream, dq, dk, dtype, scale: float
+) -> None:
+    """Gate for a query whose only visible key is itself, computed in the
+    kernel rather than on the Python identity path.
+
+    Its exact gradients are zero, and what the kernel returns instead is the
+    rank-1 image of one scalar per head: the residual of the same head_dim-term
+    dot product taken over the backward GEMM's and the delta reduction's
+    different summation orders. The scalar is bounded by 8 float32 ulps of that
+    dot product's largest sequential partial sum.
+    """
+    heads = query.shape[-2]
+    heads_kv = key.shape[-2]
+    repeats = heads // heads_kv
+    for row in rows:
+        coefficients, bounds = [], []
+        for head in range(heads):
+            kv_head = head // repeats
+            bound = 8 * _ulp32(
+                _prefix_sum_bound(upstream[row, head], value[row, kv_head])
+            )
+            coefficient = _fit_rank_one(dq[row, head], key[row, kv_head], dtype)
+            label = f"row {row} head {head}"
+            test.assertLessEqual(abs(coefficient / scale), bound, f"dQ {label} scalar")
+            _assert_rank_one(
+                test,
+                dq[row, head],
+                key[row, kv_head],
+                coefficient,
+                dtype,
+                f"dQ {label}",
+            )
+            coefficients.append(coefficient)
+            bounds.append(bound)
+        if heads == heads_kv:
+            for head in range(heads):
+                coefficient = _fit_rank_one(dk[row, head], query[row, head], dtype)
+                label = f"row {row} head {head}"
+                test.assertLessEqual(
+                    abs(coefficient / scale), bounds[head], f"dK {label} scalar"
+                )
+                _assert_rank_one(
+                    test,
+                    dk[row, head],
+                    query[row, head],
+                    coefficient,
+                    dtype,
+                    f"dK {label}",
+                )
+            continue
+        # GQA repeats key/value in Python, so dK comes back as a sum of
+        # per-Q-head rounded products; only that sum is observable here.
+        predicted = torch.zeros(heads_kv, query.shape[-1], dtype=torch.float64)
+        radius = torch.zeros_like(predicted)
+        for head in range(heads):
+            term = (
+                torch.tensor([coefficients[head]], dtype=torch.float64)
+                * query[row, head].detach().cpu().double()
+            )
+            predicted[head // repeats] += term
+            radius[head // repeats] += _product_radius(term, dtype)
+        radius += _rounding_radius(predicted, dtype) * repeats
+        difference = (dk[row].detach().cpu().double() - predicted).abs()
+        test.assertTrue(bool((difference <= radius).all()), f"dK row {row}")
+
+
+def _dense_mask(shape, kernel_size, stride, dilation, is_causal, device):
+    """``[tokens, tokens]`` bool: is key n in query m's neighborhood, from
+    tests/utils.py's per-axis window rule with each axis's kernel clamped to
+    this document's own extent -- the clamp the CUDA kernel applies per
+    document. Cached: the mask depends only on the geometry.
+    """
+    assert all(d == 1 for d in dilation)
+    memo_key = (shape, kernel_size, stride, dilation, is_causal)
+    mask = _DENSE_MASK_CACHE.get(memo_key)
+    if mask is None:
+        effective = tuple(min(k, n) for k, n in zip(kernel_size, shape))
+        total = _prod(shape)
+        mask = torch.zeros(total, total, dtype=torch.bool)
+        for coord in itertools.product(*(range(n) for n in shape)):
+            axes = tuple(
+                _window_positions(i, n, k, min(s, k), d, c)
+                for i, n, k, s, d, c in zip(
+                    coord, shape, effective, stride, dilation, is_causal
+                )
+            )
+            row = _flatten_index(coord, shape)
+            for key_coord in itertools.product(*axes):
+                mask[row, _flatten_index(key_coord, shape)] = True
+        _DENSE_MASK_CACHE[memo_key] = mask
+    return mask.to(device)
+
+
+def _dense_reference(
+    query, key, value, shape, kernel_size, stride, dilation, is_causal, gradient
+):
+    """Dense float64 neighborhood attention over one document, plus its
+    gradients -- the answer both the packed and the isolated call approximate.
+    """
+    mask = _dense_mask(shape, kernel_size, stride, dilation, is_causal, query.device)
+    repeats = query.shape[-2] // key.shape[-2]
+    q = query.detach().double().requires_grad_(True)
+    k = key.detach().double().requires_grad_(True)
+    v = value.detach().double().requires_grad_(True)
+    k_g = k.repeat_interleave(repeats, dim=-2) if repeats > 1 else k
+    v_g = v.repeat_interleave(repeats, dim=-2) if repeats > 1 else v
+    scores = torch.einsum("qhd,khd->hqk", q, k_g) * query.shape[-1] ** -0.5
+    scores = scores.masked_fill(~mask, -torch.inf)
+    output = torch.einsum("hqk,khd->qhd", scores.softmax(-1), v_g)
+    lse = torch.logsumexp(scores, dim=-1).transpose(0, 1)
+    grads = torch.autograd.grad(output, (q, k, v), gradient.detach().double())
+    return (output.detach(), lse.detach(), *grads)
+
+
+def _assert_near_reference(test, packed, isolated, reference, dtype, message: str):
+    """The packed and the isolated call reach the same float64 answer down
+    different lowerings; neither is the other's oracle, so the packed one is
+    only required not to be more than twice as far off, plus one ulp.
+    """
+    ref = reference.detach().double()
+    allowed = 2 * float((isolated.detach().double() - ref).abs().max()) + _dtype_ulp(
+        float(ref.abs().max()), dtype
+    )
+    actual = float((packed.detach().double() - ref).abs().max())
+    test.assertLessEqual(actual, allowed, message)
 
 
 def _run_oracle_case(case: VarlenCase) -> None:
@@ -320,9 +537,13 @@ class VarlenDegenerateAxesOracleTests(unittest.TestCase):
                 _run_oracle_case(case)
 
     @skip_if_libnatten_is_not_supported()
-    def test_heterogeneous_pack_image_column_clamps_to_identity(self):
-        # Every image column has one token: output = V, dQ = dK = 0,
-        # and dV = grad_output, independently of the accompanying videos.
+    def test_heterogeneous_pack_image_column_is_a_single_key_row(self):
+        # (b)'s heterogeneous-pack sub-case: kernel (K, 1, 1) permutes H, W
+        # to the front, turning each document into H*W length-T 1-D
+        # documents. Every column of the image document (T = 1) then holds a
+        # single token, so the kernel computes it alongside the videos as a
+        # single-key row: output is V, dV is the upstream gradient, and dQ/dK
+        # are the rank-1 residual _assert_single_key_rows describes.
         torch.manual_seed(7200)
         dtype = torch.float32
         heads, head_dim, head_dim_v = 2, 16, 16
@@ -360,30 +581,32 @@ class VarlenDegenerateAxesOracleTests(unittest.TestCase):
         expected_lse = scale * (
             query[image_start:image_end] * key[image_start:image_end]
         ).sum(-1)
-        torch.testing.assert_close(
-            output[image_start:image_end],
-            value[image_start:image_end],
-            atol=0,
-            rtol=0,
+        rows = list(range(image_start, image_end))
+        _assert_product_close(
+            self, output[rows], value[rows], dtype, "image output is V"
         )
         gradient = torch.randn_like(output)
-        grads = torch.autograd.grad(output, (query, key, value), gradient)
-        for actual, expected in zip(
-            grads, (torch.zeros_like(query), torch.zeros_like(key), gradient)
-        ):
-            torch.testing.assert_close(
-                actual[image_start:image_end],
-                expected[image_start:image_end],
-                atol=0,
-                rtol=0,
-            )
+        dq, dk, dv = torch.autograd.grad(output, (query, key, value), gradient)
+        _assert_product_close(
+            self, dv[rows], gradient[rows], dtype, "image dV is the upstream gradient"
+        )
+        _assert_single_key_rows(
+            self, rows, query, key, value, gradient, dq, dk, dtype, scale
+        )
         torch.testing.assert_close(
             lse[image_start:image_end], expected_lse, atol=_FP32_FWD_ATOL, rtol=0
         )
 
 
+# Documents narrower than the kernel on some axis, packed next to documents
+# that are not. The pack is dispatched in ONE launch and each document's
+# window is clamped to its own extent inside the kernel; the same document
+# called on its own is a uniform layout, so it clamps in Python instead and
+# lands on a lower-rank kernel. The two agree on the mathematics, not bit for
+# bit -- documents that clamp are judged against a dense float64 reference,
+# documents that do not must still match their isolated call exactly.
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA is unavailable")
-class VarlenImplicitDegenerateAxesTests(unittest.TestCase):
+class VarlenMixedPackTests(unittest.TestCase):
     def setUp(self):
         self.previous_deterministic = _set_deterministic(True)
 
@@ -391,7 +614,7 @@ class VarlenImplicitDegenerateAxesTests(unittest.TestCase):
         torch.use_deterministic_algorithms(self.previous_deterministic)
 
     @skip_if_libnatten_is_not_supported()
-    def test_partition_inference_cache_and_pickle_support_backward(self):
+    def test_mixed_pack_inference_cache_and_pickle_support_backward(self):
         torch.manual_seed(1911)
         shapes = ((1, 5), (7, 5), (1, 5))
         layout = natten.VarlenLayout(shapes)
@@ -416,7 +639,7 @@ class VarlenImplicitDegenerateAxesTests(unittest.TestCase):
                 self.assertTrue(torch.equal(actual, expected))
 
     @skip_if_libnatten_is_not_supported()
-    def test_partition_preserves_dilated_axis_fit_check(self):
+    def test_mixed_pack_preserves_dilated_axis_fit_check(self):
         shapes = ((1, 1), (7, 5), (1, 5))
         layout = natten.VarlenLayout(shapes)
         inputs = tuple(torch.zeros(41, 1, 16, device="cuda") for _ in range(3))
@@ -424,11 +647,13 @@ class VarlenImplicitDegenerateAxesTests(unittest.TestCase):
             natten.na2d_varlen(*inputs, layout, kernel_size=(3, 3), dilation=(2, 1))
 
     @skip_if_libnatten_is_not_supported()
-    def test_mixed_single_token_exact_identity_and_gradients(self):
+    def test_mixed_single_token_documents_are_single_key_rows(self):
         for seed in (0, 1907):
             for dtype in (torch.float32, torch.float16, torch.bfloat16):
                 for heads, heads_kv in ((1, 1), (4, 2)):
                     with self.subTest(seed=seed, dtype=dtype, heads=heads):
+                        if not _dtype_is_supported(dtype):
+                            self.skipTest(f"{dtype} is unavailable on this device")
                         torch.manual_seed(seed)
                         # Interleaved singleton and empty documents exercise
                         # restoration of both document order and gradients.
@@ -458,50 +683,91 @@ class VarlenImplicitDegenerateAxesTests(unittest.TestCase):
                             dtype=dtype,
                             requires_grad=True,
                         )
-                        out = natten.na1d_varlen(
-                            q, k, v, layout, kernel_size=5, is_causal=True
+                        out, lse = natten.na1d_varlen(
+                            q,
+                            k,
+                            v,
+                            layout,
+                            kernel_size=5,
+                            is_causal=True,
+                            return_lse=True,
                         )
                         grad = torch.zeros_like(out)
                         grad[0] = torch.randn_like(grad[0])
                         grad[6] = torch.randn_like(grad[6])
-                        dq, dk, dv = torch.autograd.grad(out, (q, k, v), grad)
-                        expected_v = v.repeat_interleave(heads // heads_kv, dim=1)
-                        self.assertTrue(torch.equal(out[[0, 6]], expected_v[[0, 6]]))
-                        self.assertEqual(torch.count_nonzero(dq).item(), 0)
-                        self.assertEqual(torch.count_nonzero(dk).item(), 0)
-                        expected_dv = grad.reshape(
-                            14, heads_kv, heads // heads_kv, 24
-                        ).sum(2)
-                        self.assertTrue(torch.equal(dv, expected_dv))
+                        dq, dk, dv = torch.autograd.grad(
+                            out, (q, k, v), grad, retain_graph=True
+                        )
+                        rows = [0, 6]
+                        others = [i for i in range(14) if i not in rows]
+                        repeats = heads // heads_kv
+                        expected_v = v.repeat_interleave(repeats, dim=1)
+                        grouped = grad.reshape(14, heads_kv, repeats, 24)
+                        expected_dv = grouped.sum(2)
+                        _assert_product_close(
+                            self, out[rows], expected_v[rows], dtype, "output is V"
+                        )
+                        _assert_product_close(
+                            self,
+                            dv,
+                            expected_dv,
+                            dtype,
+                            "dV routes grad_output",
+                            magnitude=grouped.abs().sum(2),
+                        )
+                        # Every other query's upstream gradient is zero, so
+                        # its dQ/dK stay exactly zero whatever this row does.
+                        self.assertEqual(int(torch.count_nonzero(dq[others])), 0)
+                        self.assertEqual(int(torch.count_nonzero(dk[others])), 0)
+                        _assert_single_key_rows(
+                            self, rows, q, k, v, grad, dq, dk, dtype, 16**-0.5
+                        )
+                        # logsumexp is differentiable and its gradient is
+                        # ignored, the same contract as the rest of the family.
+                        for tensor in torch.autograd.grad(
+                            lse, (q, k, v), torch.randn_like(lse)
+                        ):
+                            self.assertTrue(
+                                torch.equal(tensor, torch.zeros_like(tensor))
+                            )
 
     @skip_if_libnatten_is_not_supported()
-    def test_mixed_degenerate_documents_match_isolated_calls(self):
+    def test_mixed_pack_documents_against_dense_reference(self):
         cases = (
-            (((1, 9, 11), (7, 9, 11)), (5, 4, 4), (True, False, False)),
+            (((1, 9, 11), (7, 9, 11)), (5, 4, 4), (True, False, False), 1, 1),
             (
                 ((7, 9, 11), (1, 9, 11), (7, 1, 11), (0, 9, 11), (1, 9, 11)),
                 (5, 4, 4),
                 (True, False, False),
+                1,
+                1,
             ),
-            (((9, 1), (9, 11), (1, 11)), (4, 4), (False, False)),
-            (((1, 9, 11), (1, 8, 10)), (5, 4, 4), (True, False, False)),
+            (((9, 1), (9, 11), (1, 11)), (4, 4), (False, False), 1, 1),
+            (((1, 9, 11), (1, 8, 10)), (5, 4, 4), (True, False, False), 1, 1),
+            (((1, 9, 11), (7, 9, 11)), (5, 4, 4), (True, False, False), 4, 2),
         )
+        names = ("out", "lse", "dQ", "dK", "dV")
         for seed in (0, 1907):
             for dtype in (torch.float32, torch.float16, torch.bfloat16):
-                for shapes, kernel, causal in cases:
-                    with self.subTest(seed=seed, dtype=dtype, shapes=shapes):
+                for shapes, kernel, causal, heads, heads_kv in cases:
+                    with self.subTest(
+                        seed=seed, dtype=dtype, shapes=shapes, heads=heads
+                    ):
+                        if not _dtype_is_supported(dtype):
+                            self.skipTest(f"{dtype} is unavailable on this device")
                         torch.manual_seed(seed)
                         layout = natten.VarlenLayout(shapes)
+                        total = layout.total_tokens
                         inputs = tuple(
                             torch.randn(
-                                layout.total_tokens,
-                                1,
+                                total,
+                                head_count,
                                 16,
                                 device="cuda",
                                 dtype=dtype,
                                 requires_grad=True,
                             )
-                            for _ in range(3)
+                            for head_count in (heads, heads_kv, heads_kv)
                         )
                         fn = _VARLEN_FN_BY_RANK[len(kernel)]
                         out, lse = fn(
@@ -512,43 +778,62 @@ class VarlenImplicitDegenerateAxesTests(unittest.TestCase):
                             return_lse=True,
                         )
                         grad = torch.randn_like(out)
-                        actual = (out, lse, *torch.autograd.grad(out, inputs, grad))
+                        packed = (out, lse, *torch.autograd.grad(out, inputs, grad))
+                        ones = (1,) * len(kernel)
                         start = 0
                         for shape in shapes:
                             length = _prod(shape)
-                            if length and 1 in shape:
-                                leaves = tuple(
-                                    x[start : start + length]
-                                    .detach()
-                                    .clone()
-                                    .requires_grad_(True)
-                                    for x in inputs
-                                )
-                                ref_out, ref_lse = fn(
-                                    *leaves,
-                                    natten.VarlenLayout((shape,)),
-                                    kernel_size=kernel,
-                                    is_causal=causal,
-                                    return_lse=True,
-                                )
-                                expected = (
-                                    ref_out,
-                                    ref_lse,
-                                    *torch.autograd.grad(
-                                        ref_out, leaves, grad[start : start + length]
-                                    ),
-                                )
-                                for label, a, b in zip(
-                                    ("out", "lse", "dQ", "dK", "dV"), actual, expected
-                                ):
-                                    torch.testing.assert_close(
-                                        a[start : start + length],
-                                        b,
-                                        atol=0,
-                                        rtol=0,
-                                        msg=label,
-                                    )
+                            if not length:
+                                continue
+                            window = slice(start, start + length)
                             start += length
+                            leaves = tuple(
+                                x[window].detach().clone().requires_grad_(True)
+                                for x in inputs
+                            )
+                            ref_out, ref_lse = fn(
+                                *leaves,
+                                natten.VarlenLayout((shape,)),
+                                kernel_size=kernel,
+                                is_causal=causal,
+                                return_lse=True,
+                            )
+                            isolated = (
+                                ref_out,
+                                ref_lse,
+                                *torch.autograd.grad(ref_out, leaves, grad[window]),
+                            )
+                            if 1 not in shape:
+                                # Same kernel family either way, so the pack
+                                # must not perturb this document at all.
+                                for name, actual, expected in zip(
+                                    names, packed, isolated
+                                ):
+                                    self.assertTrue(
+                                        torch.equal(actual[window], expected),
+                                        f"{name} of {shape}",
+                                    )
+                                continue
+                            reference = _dense_reference(
+                                *leaves,
+                                shape,
+                                kernel,
+                                ones,
+                                ones,
+                                causal,
+                                grad[window],
+                            )
+                            for name, actual, expected, exact in zip(
+                                names, packed, isolated, reference
+                            ):
+                                _assert_near_reference(
+                                    self,
+                                    actual[window],
+                                    expected,
+                                    exact,
+                                    torch.float32 if name == "lse" else dtype,
+                                    f"{name} of {shape}",
+                                )
 
 
 # (e) Uniform layouts with degenerate axes: the uniform-dispatch branch and
@@ -645,7 +930,9 @@ class VarlenDegenerateAxesIdentityTests(unittest.TestCase):
         layouts: Tuple[DimensionType, ...] = (
             ((3,), (5,))
             if rank == 1
-            else ((2, 3), (3, 2)) if rank == 2 else ((2, 2, 3), (1, 3, 2))
+            else ((2, 3), (3, 2))
+            if rank == 2
+            else ((2, 2, 3), (1, 3, 2))
         )
         kernel_size = (1,) * rank
         total = sum(_prod(s) for s in layouts)
@@ -906,7 +1193,7 @@ class VarlenDegenerateAxesCompileTests(unittest.TestCase):
             torch.use_deterministic_algorithms(False)
 
     @skip_if_libnatten_is_not_supported()
-    def test_compile_mixed_implicit_axes_cold_layout(self):
+    def test_compile_mixed_pack_cold_layout(self):
         self._run_compile_case(
             rank=3,
             layouts=((1, 5, 5), (3, 5, 5), (1, 5, 5)),
@@ -917,7 +1204,7 @@ class VarlenDegenerateAxesCompileTests(unittest.TestCase):
         )
 
     @skip_if_libnatten_is_not_supported()
-    def test_compile_mixed_identity_cold_layout(self):
+    def test_compile_mixed_permute_cold_layout(self):
         self._run_compile_case(
             rank=3,
             layouts=((1, 4, 4), (5, 4, 4), (1, 3, 4)),

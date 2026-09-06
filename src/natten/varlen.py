@@ -129,9 +129,8 @@ def _varlen_build_permutation_tensors(
     rank: int,
     group_axes: List[int],
     device: torch.device,
-    document_order: Optional[List[int]] = None,
 ) -> Tuple[Tensor, Tensor]:
-    """VarlenLayout._permuted/_partitioned's memo-miss device work, behind an opaque
+    """VarlenLayout._permuted's memo-miss device work, behind an opaque
     custom-op boundary for the same reason as varlen_fna.py's
     _varlen_build_schedule_tensors (see that docstring): a geometry miss
     taken at torch.compile trace time records one opaque op call instead of
@@ -145,8 +144,7 @@ def _varlen_build_permutation_tensors(
     + offset``, concatenated across documents into ``perm``, then inverted
     into ``inv`` by one scatter (``inv[perm] = arange(total)``) -- the
     inverse of a permutation is its own scatter-built lookup, not a second
-    sort or argsort. ``document_order`` groups whole documents before the
-    within-document axis permutation; its default preserves input order.
+    sort or argsort.
     """
     num_docs = len(shapes_flat) // rank
     shapes = [
@@ -159,8 +157,7 @@ def _varlen_build_permutation_tensors(
     offsets = _prefix_offsets(lengths)
     with torch.inference_mode(False):
         parts = []
-        for doc_index in range(num_docs) if document_order is None else document_order:
-            shape = shapes[doc_index]
+        for doc_index, shape in enumerate(shapes):
             length = lengths[doc_index]
             if length == 0:
                 # A zero-token document (some axis is 0, group or kept)
@@ -186,7 +183,6 @@ def _(
     rank: int,
     group_axes: List[int],
     device: torch.device,
-    document_order: Optional[List[int]] = None,
 ) -> Tuple[Tensor, Tensor]:
     num_docs = len(shapes_flat) // rank
     total = sum(
@@ -197,13 +193,6 @@ def _(
         torch.empty((total,), dtype=torch.int64, device=device),
         torch.empty((total,), dtype=torch.int64, device=device),
     )
-
-
-_DocumentPartition = Tuple[
-    Tuple[Tuple[Tuple[int, ...], "VarlenLayout"], ...],
-    Optional[Tensor],
-    Optional[Tensor],
-]
 
 
 class VarlenLayout:
@@ -321,20 +310,16 @@ class VarlenLayout:
         self._cu_seqlens: Optional[Tensor] = None
         self._token_layouts: Optional[Tensor] = None
         # Degenerate-axis lowering's derived state (see
-        # natten.backends.varlen_lowering): keyed and owned per-object,
+        # natten.backends.varlen_lowering): both keyed and owned per-object,
         # same identity-semantics rationale as _memo above. _fold_memo maps
         # a leading-fold length to the derived (lower-rank) VarlenLayout;
         # _permute_memo maps a tuple of degenerate axis indices (in this
         # layout's own rank) to the derived VarlenLayout plus the (perm,
-        # inv) index tensors gather/scatter the tokens with. _partition_memo
-        # groups documents by their effective degenerate axes. Derived
-        # state is discarded when pickling (see __getstate__/__setstate__).
+        # inv) index tensors gather/scatter the tokens with. Neither
+        # survives pickling (see __getstate__/__setstate__).
         self._fold_memo: Dict[int, "VarlenLayout"] = {}
         self._permute_memo: Dict[
             Tuple[int, ...], Tuple["VarlenLayout", Tensor, Tensor]
-        ] = {}
-        self._partition_memo: Dict[
-            Tuple[DimensionType, DimensionType], Optional[_DocumentPartition]
         ] = {}
         if device is not None:
             self._materialize(torch.device(device))
@@ -443,61 +428,6 @@ class VarlenLayout:
         return entry
 
     # -- degenerate-axis lowering (natten.backends.varlen_lowering) -------
-
-    def _partitioned(
-        self, kernel_size: DimensionType, dilation: DimensionType, device: torch.device
-    ) -> Optional[_DocumentPartition]:
-        """Group documents by the axes whose effective kernel is one.
-
-        There are at most 2**rank groups. Each retains document order and
-        its own cached lowering/schedule state. A token permutation is
-        needed only when groups are interleaved in the original pack.
-        Empty documents contribute no tokens to the partition.
-        """
-        self._check_device_pin(device)
-        key = (kernel_size, dilation)
-        if key in self._partition_memo:
-            return self._partition_memo[key]
-        explicit_axes = tuple([i for i, k in enumerate(kernel_size) if k == 1])
-        groups: Dict[Tuple[int, ...], List[int]] = {}
-        needs_partition = False
-        for doc_index, shape in enumerate(self._shapes):
-            if 0 in shape:
-                continue
-            axes = tuple(
-                [
-                    i
-                    for i, k in enumerate(kernel_size)
-                    if k == 1 or (shape[i] == 1 and dilation[i] == 1)
-                ]
-            )
-            needs_partition = needs_partition or axes != explicit_axes
-            if axes not in groups:
-                groups[axes] = []
-            groups[axes].append(doc_index)
-        if not needs_partition:
-            self._partition_memo[key] = None
-            return None
-        derived = tuple(
-            [
-                (axes, VarlenLayout([self._shapes[i] for i in indices]))
-                for axes, indices in groups.items()
-            ]
-        )
-        document_order = [i for indices in groups.values() for i in indices]
-        perm, inv = None, None
-        if document_order != sorted(document_order):
-            self._ensure_materialized(device)
-            perm, inv = _varlen_build_permutation_tensors(
-                [extent for shape in self._shapes for extent in shape],
-                self._rank,
-                [],
-                device,
-                document_order,
-            )
-        result = (derived, perm, inv)
-        self._partition_memo[key] = result
-        return result
 
     def _folded(self, f: int) -> "VarlenLayout":
         """Leading-fold derived layout: each document's shape ``s`` becomes
@@ -777,4 +707,3 @@ class VarlenLayout:
         self._token_layouts = None
         self._fold_memo = {}
         self._permute_memo = {}
-        self._partition_memo = {}
