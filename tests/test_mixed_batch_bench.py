@@ -5,6 +5,8 @@ from dataclasses import replace
 
 import torch
 
+from scripts.bench_mixed_batch import performance_adjudication
+
 from .mixed_batch_utils import (
     checks_pass,
     coordinate_mask,
@@ -321,6 +323,44 @@ def test_single_key_document_gate_bounds_the_rank_one_residual():
             planted["dk"][0, head] = (coefficient * data[0][0, head].double()).float()
         verdict = document_adjudication(planted, exact, ref, data, grad, case)
         assert verdict[0]["pass"] is expected
+
+
+def test_performance_adjudication_calibrates_only_the_bitwise_documents():
+    case = MixedCase(
+        "oracle",
+        "mixed",
+        ((1, 3, 4), (7, 3, 4)),
+        (5, 3, 3),
+        (False, False, False),
+        seed=17,
+    )
+    data, grad = make_inputs(case)
+    ref = reference(data, grad, case)
+    exact = {k: v.to(torch.float32) for k, v in ref.items()}
+    rows = performance_adjudication([exact], [exact], ref, data, grad, case)
+    assert [r["rule"] for r in rows] == ["reference-interval", "bitwise"]
+    assert all(r["pass"] for r in rows)
+
+    split_kv = replace(case, deterministic=False)
+    drifted = {k: v.clone() for k, v in exact.items()}
+    row = case.offsets[1]
+    for _ in range(8):
+        drifted["dq"][row, 0, 0] = torch.nextafter(
+            drifted["dq"][row, 0, 0], torch.tensor(torch.inf)
+        )
+    reproduced = performance_adjudication(
+        [exact, drifted], [exact, exact], ref, data, grad, split_kv
+    )
+    assert [r["rule"] for r in reproduced] == [
+        "reference-interval",
+        "repeat-calibrated",
+    ]
+    assert all(r["pass"] for r in reproduced)
+    assert reproduced[1]["repeats"]["dq_cross_max_ulp"] > 1
+    unreproduced = performance_adjudication(
+        [drifted, drifted], [exact, exact], ref, data, grad, split_kv
+    )
+    assert unreproduced[0]["pass"] and not unreproduced[1]["pass"]
 
 
 def test_3xtf32_emulation_splits_and_stays_exact_on_representable_products():

@@ -43,6 +43,7 @@ from tests.mixed_batch_utils import (  # noqa: E402
     checks_pass,
     coordinate_mask,
     document_adjudication,
+    document_comparison_rule,
     error_metrics,
     make_inputs,
     MixedCase,
@@ -187,6 +188,65 @@ def per_document(metrics_a, metrics_b, case):
         )
         for lo, hi in zip(case.offsets, case.offsets[1:])
     ]
+
+
+def document_references(data, grad, case):
+    """FP64 reference for the documents adjudicated against one, NaN on the rest.
+
+    Attention never crosses a document, so a document's reference is the one its own
+    shape produces alone; building them one at a time keeps the dense FP64 scores off
+    the whole pack, whose token count enters that matrix squared.
+    """
+    blocks = {}
+    for index, shape in enumerate(case.shapes):
+        if document_comparison_rule(case, shape) != "reference-interval":
+            continue
+        lo, hi = case.offsets[index], case.offsets[index + 1]
+        blocks[index] = reference(
+            [x[lo:hi] for x in data], grad[lo:hi], replace(case, shapes=(shape,))
+        )
+    if not blocks:
+        return {}
+    total = sum(case.lengths)
+    sample = next(iter(blocks.values()))
+    ref = {
+        name: torch.full((total,) + value.shape[1:], torch.nan, dtype=torch.float64)
+        for name, value in sample.items()
+    }
+    for index, block in blocks.items():
+        lo, hi = case.offsets[index], case.offsets[index + 1]
+        for name, value in block.items():
+            ref[name][lo:hi] = value
+    return ref
+
+
+def performance_adjudication(packed_runs, isolated_runs, ref, data, grad, case):
+    """Packed-vs-per-document verdict for a performance load, judged per document.
+
+    The load's documents are classified the way the capability cases classify them: a
+    document whose isolated call lowers to another kernel family is adjudicated
+    against the FP64 reference, every other document bitwise. A nondeterministic KV
+    split leaves no bitwise standard for the latter, so they are judged instead
+    against the noise their own same-mode repeats reproduce.
+    """
+    rows = document_adjudication(
+        packed_runs[0], isolated_runs[0], ref, data, grad, case
+    )
+    if case.deterministic:
+        return rows
+    for row in rows:
+        if row["rule"] != "bitwise":
+            continue
+        lo, hi = case.offsets[row["document"]], case.offsets[row["document"] + 1]
+        verdict = nondeterministic_parity(
+            [{k: v[lo:hi] for k, v in run.items()} for run in packed_runs],
+            [{k: v[lo:hi] for k, v in run.items()} for run in isolated_runs],
+        )
+        row["rule"] = "repeat-calibrated"
+        row["repeats"] = verdict
+        row["pass"] = verdict["correctness_status"] == "PASS"
+        del row["tensors"]
+    return rows
 
 
 def core_case(case):
@@ -777,14 +837,19 @@ def _performance_case(case, samples, smoke=False):
     a_result = packed_result()
     b_result = split_result()
     parity = compare(a_result, b_result)
-    if case.deterministic:
-        correctness = {
-            "correctness_status": "PASS" if exact_outputs(parity) else "FAIL"
-        }
-    else:
-        correctness = nondeterministic_parity(
-            (a_result, packed_result()), (b_result, split_result())
-        )
+    packed_runs, isolated_runs = [a_result], [b_result]
+    if not case.deterministic:
+        packed_runs.append(packed_result())
+        isolated_runs.append(split_result())
+    adjudication = performance_adjudication(
+        packed_runs,
+        isolated_runs,
+        document_references(data, grad, case),
+        data,
+        grad,
+        case,
+    )
+    accepted = all(row["pass"] for row in adjudication)
     measurements = {}
     phases = (
         ("warm_forward", {}),
@@ -825,9 +890,12 @@ def _performance_case(case, samples, smoke=False):
         "status": "MEASURED" if not (before or after or smoke) else "SMOKE_ONLY",
         "before_processes": before,
         "after_processes": after,
-        **correctness,
+        "correctness_status": (
+            "PASS" if accepted else ("FAIL" if case.deterministic else "REVIEW")
+        ),
+        "packed_vs_isolated_adjudication": adjudication,
         "bitwise_packed_vs_isolated": exact_outputs(parity),
-        "correctness_scope": "Packed/isolated compatibility only. Deterministic loads keep bitwise acceptance; nondeterministic loads calibrate the dQ split-KV noise with same-mode repeats. Neither is independent mathematical certification.",
+        "correctness_scope": "Packed/isolated compatibility only, adjudicated per document: documents whose isolated call lowers differently are held to the FP64 reference interval or the kernel single-key gate, the rest bitwise, and under a nondeterministic KV split to the dQ noise their same-mode repeats reproduce. Not independent mathematical certification.",
         "parity": parity,
         "tokens": sum(case.lengths),
         "a": "mixed",
