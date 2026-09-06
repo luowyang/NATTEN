@@ -1,6 +1,9 @@
 # Changelog
 
 ## [Main branch]
+* Test isolation: `torch._dynamo`'s recompile and cache-size limits are
+  restored after every test, so a module that tightens a compile budget for its
+  own cases no longer decides how the tests after it behave.
 
 ## [0.21.7] - 2026-07-26
 * Switched to int64 strides in cutlass-fna to avoid overflows in larger use cases.
