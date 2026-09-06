@@ -81,6 +81,43 @@ _VARLEN_FN_BY_RANK: Dict[int, Callable[..., Any]] = {
 _FP32_FWD_ATOL = 3e-4
 _FP32_GRAD_ATOL = 4e-4
 
+
+def _lower_with_mock_dispatch(layout, kernel_size: DimensionType, tensors):
+    """``maybe_lower_degenerate_axes`` on one pack, with the residual call it would
+    make replaced by a mock.
+
+    The mock is what makes the route observable from outside the layout: the
+    identity path and every pack the lowering declines leave it uncalled, and any
+    other route hands it the derived layout, geometry and tensors it built. Returns
+    the pair to assert on.
+    """
+    query, key, value = tensors
+    rank = layout.rank
+    dispatch = mock.Mock(return_value=torch.zeros_like(value))
+    result = maybe_lower_degenerate_axes(
+        na_dim=rank,
+        query=query,
+        key=key,
+        value=value,
+        layout=layout,
+        kernel_size=kernel_size,
+        stride=(1,) * rank,
+        dilation=(1,) * rank,
+        is_causal=(False,) * rank,
+        scale=None,
+        backend="cutlass-fna",
+        q_tile_shape=None,
+        kv_tile_shape=None,
+        backward_q_tile_shape=None,
+        backward_kv_tile_shape=None,
+        backward_kv_splits=None,
+        backward_use_pt_reduction=False,
+        return_lse=False,
+        dispatch=dispatch,
+    )
+    return result, dispatch
+
+
 # The FP32 kernels' GEMMs are OpMultiplyAddFastF32 (3xTF32), so a product
 # of one costs up to 2**-21 relative -- FP16/BF16 products of one are exact.
 _TF32_RELATIVE = 2.0**-21
@@ -1413,6 +1450,245 @@ class VarlenDegenerateAxesBookkeepingTests(unittest.TestCase):
                 dispatch=dispatch,
             )
         dispatch.assert_not_called()
+
+
+# (j) Empty documents are inert. A zero-token document has nothing to attend
+# over, so uniformity for lowering is judged over the documents that do carry
+# tokens (VarlenLayout.uniform_shape): identity, fold and permute lower a pack
+# padded with empty documents exactly as they lower the same pack without
+# them, and output, LSE and all three gradients come out bitwise identical.
+def _empty_document_shapes(rank: int) -> Tuple[DimensionType, ...]:
+    """Three zero-token document shapes: a zero on the leading axis, a zero
+    on the trailing axis, and every axis zero -- the three ways a derived
+    (folded/permuted) layout can meet an empty document, since an axis it
+    groups over and an axis it keeps repartition a zero extent differently.
+    """
+    if rank == 1:
+        return ((0,),) * 3
+    leading: Any = (0,) + (1,) * (rank - 1)
+    trailing: Any = (1,) * (rank - 1) + (0,)
+    everywhere: Any = (0,) * rank
+    return (leading, trailing, everywhere)
+
+
+def _empty_insertions(
+    shapes: Tuple[DimensionType, ...], rank: int
+) -> Tuple[Tuple[str, Tuple[DimensionType, ...]], ...]:
+    """``shapes`` with empty documents spliced in, one variant per position."""
+    leading, trailing, everywhere = _empty_document_shapes(rank)
+    return (
+        ("front", (leading,) + shapes),
+        ("back", shapes + (trailing,)),
+        ("middle", shapes[:1] + (everywhere,) + shapes[1:]),
+        (
+            "front-middle-back",
+            (leading,) + shapes[:1] + (everywhere,) + shapes[1:] + (trailing,),
+        ),
+    )
+
+
+# name, layouts, kernel_size, lowering route the clamp resolves to.
+_EMPTY_INSERTION_CASES = (
+    ("identity-r1", ((1,), (1,)), (3,), "identity"),
+    ("identity-r2", ((1, 1), (1, 1)), (3, 3), "identity"),
+    ("identity-r3", ((1, 1, 1), (1, 1, 1)), (3, 3, 3), "identity"),
+    ("fold-r2", ((1, 6), (1, 6)), (3, 3), "fold"),
+    ("fold-r3", ((1, 4, 4), (1, 4, 4)), (3, 3, 3), "fold"),
+    ("permute-r2", ((6, 1), (6, 1)), (3, 3), "permute"),
+    ("permute-r3", ((4, 1, 4), (4, 1, 4)), (3, 3, 3), "permute"),
+    ("fold-then-permute-r3", ((1, 4, 1), (1, 4, 1)), (3, 3, 3), "fold+permute"),
+)
+
+_EMPTY_INSERTION_RESULT_NAMES = ("output", "lse", "dq", "dk", "dv")
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "CUDA is unavailable")
+class VarlenEmptyDocumentInsertionTests(unittest.TestCase):
+    def _call(
+        self,
+        shapes: Tuple[DimensionType, ...],
+        kernel_size: DimensionType,
+        rank: int,
+        tensors: List[torch.Tensor],
+        grad_output: torch.Tensor,
+        grad_lse: torch.Tensor,
+    ) -> Tuple[Any, Tuple[torch.Tensor, ...]]:
+        leaves = [tensor.detach().clone().requires_grad_(True) for tensor in tensors]
+        layout = natten.VarlenLayout(shapes, device="cuda")
+        output, lse = _VARLEN_FN_BY_RANK[rank](
+            *leaves, layout, kernel_size=kernel_size, return_lse=True
+        )
+        # LSE is differentiable but its upstream gradient is ignored (the FNA
+        # contract); passing a non-zero one exercises that both packs ignore
+        # it the same way instead of only that neither crashes.
+        grads = torch.autograd.grad((output, lse), leaves, (grad_output, grad_lse))
+        results = (output.detach(), lse.detach()) + tuple(g.detach() for g in grads)
+        return layout, results
+
+    def _assert_route(
+        self,
+        layout,
+        kernel_size: DimensionType,
+        route: str,
+        tensors: List[torch.Tensor],
+    ) -> None:
+        """The padded pack must lower the same way the unpadded one does --
+        bitwise equality alone would also hold if BOTH packs had lost the
+        clamp and gone to the kernel.
+
+        The route is read off one mocked ``dispatch``: the identity path never
+        reaches it, a fold hands it the caller's own tokens (a metadata
+        repartition, no copy) and a permute hands it gathered ones, each with
+        the residual rank and derived shapes its consumed axes leave behind.
+        """
+        query, _, value = tensors
+        rank = layout.rank
+        result, dispatch = _lower_with_mock_dispatch(layout, kernel_size, tensors)
+        effective = tuple(
+            min(k, extent) for k, extent in zip(kernel_size, layout.uniform_shape)
+        )
+        keep = tuple(axis for axis, k in enumerate(effective) if k > 1)
+
+        if route == "identity":
+            dispatch.assert_not_called()
+            self.assertTrue(torch.equal(result, value))
+            return
+
+        dispatch.assert_called_once()
+        call = dispatch.call_args.kwargs
+        derived = call["layout"]
+        self.assertEqual(call["na_dim"], len(keep))
+        self.assertEqual(derived.rank, len(keep))
+        self.assertEqual(derived.total_tokens, layout.total_tokens)
+        self.assertEqual(call["kernel_size"], tuple(effective[a] for a in keep))
+        # Every derived document that carries tokens is a source document
+        # restricted to the axes the lowering kept -- for a fold that is a
+        # suffix of its shape, for a permute a reordered selection.
+        self.assertEqual(
+            {shape for shape in derived.shapes if _prod(shape)},
+            {tuple(shape[a] for a in keep) for shape in layout.shapes if _prod(shape)},
+        )
+        # A fold repartitions metadata only, so the kernel sees the caller's
+        # own tensor; a permute gathers the tokens into a new one first.
+        self.assertEqual(call["query"] is query, route == "fold")
+        # The leading run of degenerate axes is folded away first, and
+        # whatever is still degenerate after it is what the permute gathers,
+        # so the two steps are named separately in the case list.
+        folded = 0
+        while folded < rank and effective[folded] == 1:
+            folded += 1
+        self.assertEqual(folded > 0, route in ("fold", "fold+permute"))
+        self.assertEqual(
+            rank - folded - len(keep) > 0, route in ("permute", "fold+permute")
+        )
+
+    def _run_case(
+        self,
+        shapes: Tuple[DimensionType, ...],
+        kernel_size: DimensionType,
+        route: str,
+        dtype: torch.dtype,
+    ) -> None:
+        if not _dtype_is_supported(dtype):
+            self.skipTest(f"{dtype} is unavailable on this device")
+        rank = len(shapes[0])
+        previous = _set_deterministic(True)
+        try:
+            torch.manual_seed(7600 + rank)
+            heads, head_dim = 2, 32
+            total = sum(_prod(shape) for shape in shapes)
+            tensors = [
+                torch.randn(total, heads, head_dim, device="cuda", dtype=dtype)
+                for _ in range(3)
+            ]
+            grad_output = torch.randn(
+                total, heads, head_dim, device="cuda", dtype=dtype
+            )
+            grad_lse = torch.randn(total, heads, device="cuda", dtype=torch.float32)
+
+            layout, expected = self._call(
+                shapes, kernel_size, rank, tensors, grad_output, grad_lse
+            )
+            self.assertTrue(layout.is_uniform)
+            self.assertEqual(layout.uniform_shape, shapes[0])
+            self._assert_route(layout, kernel_size, route, tensors)
+
+            for placement, padded_shapes in _empty_insertions(shapes, rank):
+                with self.subTest(placement=placement):
+                    padded_layout, actual = self._call(
+                        padded_shapes, kernel_size, rank, tensors, grad_output, grad_lse
+                    )
+                    self.assertFalse(padded_layout.is_uniform)
+                    self.assertEqual(padded_layout.uniform_shape, shapes[0])
+                    self.assertEqual(padded_layout.total_tokens, total)
+                    self._assert_route(padded_layout, kernel_size, route, tensors)
+                    for name, want, got in zip(
+                        _EMPTY_INSERTION_RESULT_NAMES, expected, actual
+                    ):
+                        self.assertTrue(
+                            torch.equal(want, got),
+                            f"{name} changed when empty documents were inserted "
+                            f"({placement}): {padded_shapes} vs {shapes}",
+                        )
+        finally:
+            _set_deterministic(previous)
+
+    @skip_if_libnatten_is_not_supported()
+    def test_empty_documents_do_not_change_results_fp16(self):
+        for name, shapes, kernel_size, route in _EMPTY_INSERTION_CASES:
+            with self.subTest(case=name):
+                self._run_case(shapes, kernel_size, route, torch.float16)
+
+    @skip_if_libnatten_is_not_supported()
+    def test_empty_documents_do_not_change_results_fp32(self):
+        for name, shapes, kernel_size, route in _EMPTY_INSERTION_CASES:
+            with self.subTest(case=name):
+                self._run_case(shapes, kernel_size, route, torch.float32)
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "CUDA is unavailable")
+class VarlenAllEmptyPackLoweringTests(unittest.TestCase):
+    @skip_if_libnatten_is_not_supported()
+    def test_all_empty_pack_takes_the_fast_path(self):
+        # No document carries a token, so there is no shape to clamp against
+        # (uniform_shape is None) and the call belongs to the all-empty fast
+        # path -- no lowering, no schedule, no device pin.
+        for shapes in (((0,), (0,)), ((0, 4), (4, 0)), ((0, 0, 0),)):
+            with self.subTest(shapes=shapes):
+                rank = len(shapes[0])
+                layout = natten.VarlenLayout(shapes)
+                self.assertIsNone(layout.uniform_shape)
+                query = torch.zeros(
+                    0, 2, 32, device="cuda", dtype=torch.float16, requires_grad=True
+                )
+                key = query.detach().clone().requires_grad_(True)
+                value = query.detach().clone().requires_grad_(True)
+                output, lse = _VARLEN_FN_BY_RANK[rank](
+                    query,
+                    key,
+                    value,
+                    layout,
+                    kernel_size=(3,) * rank,
+                    return_lse=True,
+                )
+                self.assertEqual(output.shape, (0, 2, 32))
+                self.assertEqual(lse.shape, (0, 2))
+                output.sum().backward()
+                for tensor in (query, key, value):
+                    self.assertEqual(tensor.grad.shape, tensor.shape)
+                # Nothing was lowered and nothing was scheduled: the
+                # lowering declines the pack (returns None instead of an
+                # answer) whether or not the caller's kernel_size is
+                # degenerate, and its residual dispatch is never reached.
+                # The layout is left unpinned, which is the fast path's own
+                # contract -- an all-empty call never materializes it.
+                for probe in ((3,) * rank, (1,) * rank):
+                    result, dispatch = _lower_with_mock_dispatch(
+                        layout, probe, (query, key, value)
+                    )
+                    self.assertIsNone(result)
+                    dispatch.assert_not_called()
+                self.assertIsNone(layout.device)
 
 
 if __name__ == "__main__":

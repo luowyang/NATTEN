@@ -74,12 +74,14 @@ def effective_kernel_for_uniform_shape(
 ) -> DimensionType:
     """Host-side form of the per-document effective-kernel clamp
     (``min(kernel_size, extent)`` on every ``dilation == 1`` axis), valid
-    when every document shares ``shape`` -- the same rule
-    ``_neighborhood_attention_varlen_generic``'s uniform-dispatch branch
-    and the CUDA kernel's own per-document clamp both apply, so calling it
-    here first (to detect axes that clamp down to 1) is consistent with
-    dispatching the residual call to the fixed-shape kernels either
-    directly (already kernel_size >= 2 everywhere) or after lowering.
+    when every token-carrying document shares ``shape`` (a zero-token
+    document is never scheduled, so no clamp is defined for it) -- the same
+    rule ``_neighborhood_attention_varlen_generic``'s uniform-dispatch
+    branch and the CUDA kernel's own per-document clamp both apply, so
+    calling it here first (to detect axes that clamp down to 1) is
+    consistent with dispatching the residual call to the fixed-shape
+    kernels either directly (already kernel_size >= 2 everywhere) or after
+    lowering.
 
     An axis with ``dilation > 1`` is never clamped -- ``shape`` must still
     fit ``kernel_size * dilation`` there, exactly as the varlen fit check
@@ -251,14 +253,18 @@ def maybe_lower_degenerate_axes(
     (unmodified) kernel_size in that case.
 
     An axis is degenerate when its kernel_size is 1 -- either the caller's
-    own ``kernel_size`` entry, or (only for a uniform layout, where every
-    document's extent on an axis is a single known value) the per-axis
-    clamp ``effective_kernel_for_uniform_shape`` computes turning a >= 2
-    entry into 1. A non-uniform (heterogeneous) layout is never
-    axis-clamped here: an individual document narrower than kernel_size on
-    some axis remains a *device-side* concern (the CUDA kernel's own
-    per-document clamp, unrelated to this Python-level lowering), since a
-    single scalar clamp cannot represent per-document extents that differ.
+    own ``kernel_size`` entry, or the per-axis clamp
+    ``effective_kernel_for_uniform_shape`` computes turning a >= 2 entry
+    into 1. That clamp needs one known extent per axis, so it applies
+    exactly when every token-carrying document shares a shape
+    (``VarlenLayout.uniform_shape``); zero-token documents are excluded
+    from that judgement, so inserting empty documents into a pack lowers
+    it -- and so computes it -- identically. When token-carrying documents'
+    shapes differ, no axis is clamped here: an individual document narrower
+    than kernel_size on some axis remains a *device-side* concern (the CUDA
+    kernel's own per-document clamp, unrelated to this Python-level
+    lowering), since a single scalar clamp cannot represent per-document
+    extents that differ.
 
     Explicit tile shapes / backward_kv_splits raise immediately once any
     axis is found degenerate (checked before any lowering happens): folding
@@ -294,9 +300,10 @@ def maybe_lower_degenerate_axes(
     fixed-shape dispatch or (otherwise) varlen kernel path.
     """
     effective_kernel = kernel_size
-    if layout.is_uniform and layout.total_tokens > 0:
+    uniform_shape = layout.uniform_shape
+    if uniform_shape is not None:
         effective_kernel = effective_kernel_for_uniform_shape(
-            kernel_size, dilation, layout.shapes[0]
+            kernel_size, dilation, uniform_shape
         )
     degenerate = tuple(index for index, k in enumerate(effective_kernel) if k == 1)
     if not degenerate:

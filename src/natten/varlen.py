@@ -370,6 +370,15 @@ class VarlenLayout:
         # fixed-shape kernels on a batched view (see
         # _neighborhood_attention_varlen_generic's uniform-dispatch branch).
         self._is_uniform = all(shape == shapes[0] for shape in shapes)
+        # List comprehension, not a generator expression, for the same
+        # dynamo-tracing reason as the two above.
+        token_carrying = [shape for shape in shapes if math.prod(shape) > 0]
+        self._uniform_shape: Optional[DimensionType] = (
+            token_carrying[0]
+            if token_carrying
+            and all(shape == token_carrying[0] for shape in token_carrying)
+            else None
+        )
 
     # -- device materialization --------------------------------------------
 
@@ -554,6 +563,24 @@ class VarlenLayout:
         construction; a layout with a single document is trivially
         uniform."""
         return self._is_uniform
+
+    @property
+    def uniform_shape(self) -> Optional[DimensionType]:
+        """The spatial shape shared by every document that carries at least
+        one token, or ``None`` when there is no such document or their
+        shapes differ. Zero-token documents are excluded: they contribute
+        no tokens to attend over, so they cannot make the documents that do
+        carry tokens disagree on a shape. Cached at construction.
+
+        This is the uniformity that degenerate-axis lowering
+        (``natten.backends.varlen_lowering``) reads, so that inserting empty
+        documents into a pack leaves its lowering -- and therefore its
+        results -- unchanged.
+        [is_uniform][natten.VarlenLayout.is_uniform] is the stricter
+        property (every document, empty ones included) the fixed-shape
+        batched-view dispatch needs, since that view has a row per
+        document."""
+        return self._uniform_shape
 
     @property
     def shapes(self) -> Tuple[DimensionType, ...]:

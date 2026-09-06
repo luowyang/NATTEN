@@ -41,6 +41,12 @@
   to a different kernel family than the pack does (an image beside videos, say)
   therefore answers to within rounding of that isolated call rather than
   matching it bit for bit; every other document stays bitwise identical.
+* The extent clamp that turns a variable-length `kernel_size` into `1` is
+  applied whenever the documents carrying at least one token share a shape --
+  the new `VarlenLayout.uniform_shape` property, as opposed to `is_uniform`,
+  which the fixed-shape batched-view dispatch still needs over every document.
+  Inserting empty documents into a pack therefore leaves its output, logsumexp
+  and gradients bitwise unchanged.
 * Fixed three defects in that lowering: the all-degenerate identity path
   returned NaN once its inputs were large enough for a whole-tensor sum to
   overflow; that path backpropagated real query/key derivatives through

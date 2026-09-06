@@ -104,6 +104,29 @@ class VarlenLayoutConstructionTests(unittest.TestCase):
                 self.assertEqual(layout.total_tokens, total_tokens)
                 self.assertEqual(layout.max_seqlen, max_seqlen)
 
+    def test_uniform_shape_ignores_zero_token_documents(self):
+        # is_uniform compares every document; uniform_shape compares only the
+        # documents that carry tokens, so an empty document cannot change it.
+        cases = (
+            ([(4, 4), (4, 4)], True, (4, 4)),
+            ([(4, 4)], True, (4, 4)),
+            ([(0, 1), (4, 4), (4, 4), (1, 0)], False, (4, 4)),
+            ([(0, 0), (4, 4)], False, (4, 4)),
+            ([(4, 4), (4, 8)], False, None),
+            ([(0, 1), (4, 4), (4, 8)], False, None),
+            ([(0, 1), (0, 0)], False, None),
+            ([(0, 0)], True, None),
+        )
+        for shapes, is_uniform, uniform_shape in cases:
+            with self.subTest(shapes=shapes):
+                layout = VarlenLayout(shapes)
+                self.assertEqual(layout.is_uniform, is_uniform)
+                self.assertEqual(layout.uniform_shape, uniform_shape)
+
+    def test_uniform_shape_survives_pickling(self):
+        layout = VarlenLayout([(0, 1), (4, 4), (4, 4)])
+        self.assertEqual(pickle.loads(pickle.dumps(layout)).uniform_shape, (4, 4))
+
     def test_packed_token_count_int32_fence(self):
         with self.assertRaisesRegex(ValueError, "Packed token count"):
             VarlenLayout(((46_341, 46_341),))
