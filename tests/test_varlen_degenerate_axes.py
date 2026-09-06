@@ -321,13 +321,8 @@ class VarlenDegenerateAxesOracleTests(unittest.TestCase):
 
     @skip_if_libnatten_is_not_supported()
     def test_heterogeneous_pack_image_column_clamps_to_identity(self):
-        # (b)'s heterogeneous-pack sub-case: kernel (K, 1, 1) permutes H, W
-        # to the front, turning each document into H*W length-T 1-D
-        # documents. The image document (T=1) has columns of length 1 < K:
-        # the per-document device-side clamp (unrelated to the Python-level
-        # fold/permute lowering under test here) reduces ITS effective
-        # kernel to 1, giving an exact identity for those rows specifically
-        # -- checked directly here, not just within the oracle's tolerance.
+        # Every image column has one token: output = V, dQ = dK = 0,
+        # and dV = grad_output, independently of the accompanying videos.
         torch.manual_seed(7200)
         dtype = torch.float32
         heads, head_dim, head_dim_v = 2, 16, 16
@@ -341,9 +336,15 @@ class VarlenDegenerateAxesOracleTests(unittest.TestCase):
         image_end = image_start + _prod(image_shape)
 
         layout = natten.VarlenLayout(layouts, device="cuda")
-        query = torch.randn(total, heads, head_dim, device="cuda", dtype=dtype)
-        key = torch.randn(total, heads, head_dim, device="cuda", dtype=dtype)
-        value = torch.randn(total, heads, head_dim_v, device="cuda", dtype=dtype)
+        query = torch.randn(
+            total, heads, head_dim, device="cuda", dtype=dtype, requires_grad=True
+        )
+        key = torch.randn(
+            total, heads, head_dim, device="cuda", dtype=dtype, requires_grad=True
+        )
+        value = torch.randn(
+            total, heads, head_dim_v, device="cuda", dtype=dtype, requires_grad=True
+        )
 
         output, lse = natten.na3d_varlen(
             query,
@@ -362,12 +363,192 @@ class VarlenDegenerateAxesOracleTests(unittest.TestCase):
         torch.testing.assert_close(
             output[image_start:image_end],
             value[image_start:image_end],
-            atol=_FP32_FWD_ATOL,
+            atol=0,
             rtol=0,
         )
+        gradient = torch.randn_like(output)
+        grads = torch.autograd.grad(output, (query, key, value), gradient)
+        for actual, expected in zip(
+            grads, (torch.zeros_like(query), torch.zeros_like(key), gradient)
+        ):
+            torch.testing.assert_close(
+                actual[image_start:image_end],
+                expected[image_start:image_end],
+                atol=0,
+                rtol=0,
+            )
         torch.testing.assert_close(
             lse[image_start:image_end], expected_lse, atol=_FP32_FWD_ATOL, rtol=0
         )
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "CUDA is unavailable")
+class VarlenImplicitDegenerateAxesTests(unittest.TestCase):
+    def setUp(self):
+        self.previous_deterministic = _set_deterministic(True)
+
+    def tearDown(self):
+        torch.use_deterministic_algorithms(self.previous_deterministic)
+
+    @skip_if_libnatten_is_not_supported()
+    def test_partition_inference_cache_and_pickle_support_backward(self):
+        torch.manual_seed(1911)
+        shapes = ((1, 5), (7, 5), (1, 5))
+        layout = natten.VarlenLayout(shapes)
+        inputs = tuple(
+            torch.randn(45, 2, 32, device="cuda", dtype=torch.bfloat16)[:, :, ::2]
+            for _ in range(3)
+        )
+
+        def run(lay):
+            leaves = tuple(x.detach().requires_grad_(True) for x in inputs)
+            out = natten.na2d_varlen(*leaves, lay, kernel_size=(5, 3), stride=(3, 1))
+            return (out, *torch.autograd.grad(out, leaves, gradient))
+
+        with torch.inference_mode():
+            natten.na2d_varlen(*inputs, layout, kernel_size=(5, 3), stride=(3, 1))
+        restored = pickle.loads(pickle.dumps(layout))
+        self.assertIsNone(restored.device)
+        gradient = torch.randn_like(inputs[0])
+        reference = run(natten.VarlenLayout(shapes))
+        for lay in (layout, restored):
+            for actual, expected in zip(run(lay), reference):
+                self.assertTrue(torch.equal(actual, expected))
+
+    @skip_if_libnatten_is_not_supported()
+    def test_partition_preserves_dilated_axis_fit_check(self):
+        shapes = ((1, 1), (7, 5), (1, 5))
+        layout = natten.VarlenLayout(shapes)
+        inputs = tuple(torch.zeros(41, 1, 16, device="cuda") for _ in range(3))
+        with self.assertRaisesRegex(ValueError, "kernel_size \\* dilation must fit"):
+            natten.na2d_varlen(*inputs, layout, kernel_size=(3, 3), dilation=(2, 1))
+
+    @skip_if_libnatten_is_not_supported()
+    def test_mixed_single_token_exact_identity_and_gradients(self):
+        for seed in (0, 1907):
+            for dtype in (torch.float32, torch.float16, torch.bfloat16):
+                for heads, heads_kv in ((1, 1), (4, 2)):
+                    with self.subTest(seed=seed, dtype=dtype, heads=heads):
+                        torch.manual_seed(seed)
+                        # Interleaved singleton and empty documents exercise
+                        # restoration of both document order and gradients.
+                        shapes = ((1,), (5,), (0,), (1,), (7,))
+                        layout = natten.VarlenLayout(shapes)
+                        q = torch.randn(
+                            14,
+                            heads,
+                            16,
+                            device="cuda",
+                            dtype=dtype,
+                            requires_grad=True,
+                        )
+                        k = torch.randn(
+                            14,
+                            heads_kv,
+                            16,
+                            device="cuda",
+                            dtype=dtype,
+                            requires_grad=True,
+                        )
+                        v = torch.randn(
+                            14,
+                            heads_kv,
+                            24,
+                            device="cuda",
+                            dtype=dtype,
+                            requires_grad=True,
+                        )
+                        out = natten.na1d_varlen(
+                            q, k, v, layout, kernel_size=5, is_causal=True
+                        )
+                        grad = torch.zeros_like(out)
+                        grad[0] = torch.randn_like(grad[0])
+                        grad[6] = torch.randn_like(grad[6])
+                        dq, dk, dv = torch.autograd.grad(out, (q, k, v), grad)
+                        expected_v = v.repeat_interleave(heads // heads_kv, dim=1)
+                        self.assertTrue(torch.equal(out[[0, 6]], expected_v[[0, 6]]))
+                        self.assertEqual(torch.count_nonzero(dq).item(), 0)
+                        self.assertEqual(torch.count_nonzero(dk).item(), 0)
+                        expected_dv = grad.reshape(
+                            14, heads_kv, heads // heads_kv, 24
+                        ).sum(2)
+                        self.assertTrue(torch.equal(dv, expected_dv))
+
+    @skip_if_libnatten_is_not_supported()
+    def test_mixed_degenerate_documents_match_isolated_calls(self):
+        cases = (
+            (((1, 9, 11), (7, 9, 11)), (5, 4, 4), (True, False, False)),
+            (
+                ((7, 9, 11), (1, 9, 11), (7, 1, 11), (0, 9, 11), (1, 9, 11)),
+                (5, 4, 4),
+                (True, False, False),
+            ),
+            (((9, 1), (9, 11), (1, 11)), (4, 4), (False, False)),
+            (((1, 9, 11), (1, 8, 10)), (5, 4, 4), (True, False, False)),
+        )
+        for seed in (0, 1907):
+            for dtype in (torch.float32, torch.float16, torch.bfloat16):
+                for shapes, kernel, causal in cases:
+                    with self.subTest(seed=seed, dtype=dtype, shapes=shapes):
+                        torch.manual_seed(seed)
+                        layout = natten.VarlenLayout(shapes)
+                        inputs = tuple(
+                            torch.randn(
+                                layout.total_tokens,
+                                1,
+                                16,
+                                device="cuda",
+                                dtype=dtype,
+                                requires_grad=True,
+                            )
+                            for _ in range(3)
+                        )
+                        fn = _VARLEN_FN_BY_RANK[len(kernel)]
+                        out, lse = fn(
+                            *inputs,
+                            layout,
+                            kernel_size=kernel,
+                            is_causal=causal,
+                            return_lse=True,
+                        )
+                        grad = torch.randn_like(out)
+                        actual = (out, lse, *torch.autograd.grad(out, inputs, grad))
+                        start = 0
+                        for shape in shapes:
+                            length = _prod(shape)
+                            if length and 1 in shape:
+                                leaves = tuple(
+                                    x[start : start + length]
+                                    .detach()
+                                    .clone()
+                                    .requires_grad_(True)
+                                    for x in inputs
+                                )
+                                ref_out, ref_lse = fn(
+                                    *leaves,
+                                    natten.VarlenLayout((shape,)),
+                                    kernel_size=kernel,
+                                    is_causal=causal,
+                                    return_lse=True,
+                                )
+                                expected = (
+                                    ref_out,
+                                    ref_lse,
+                                    *torch.autograd.grad(
+                                        ref_out, leaves, grad[start : start + length]
+                                    ),
+                                )
+                                for label, a, b in zip(
+                                    ("out", "lse", "dQ", "dK", "dV"), actual, expected
+                                ):
+                                    torch.testing.assert_close(
+                                        a[start : start + length],
+                                        b,
+                                        atol=0,
+                                        rtol=0,
+                                        msg=label,
+                                    )
+                            start += length
 
 
 # (e) Uniform layouts with degenerate axes: the uniform-dispatch branch and
@@ -628,7 +809,13 @@ class VarlenDegenerateAxesProductionSmokeTests(unittest.TestCase):
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA is unavailable")
 class VarlenDegenerateAxesCompileTests(unittest.TestCase):
     def _run_compile_case(
-        self, rank, layouts, kernel_size, second_layouts, second_kernel_size
+        self,
+        rank,
+        layouts,
+        kernel_size,
+        second_layouts,
+        second_kernel_size,
+        cold_layout=False,
     ) -> None:
         # `call` takes layout/kernel_size as plain arguments (not closure-
         # captured): the SAME compiled wrapper is reused for both
@@ -670,19 +857,28 @@ class VarlenDegenerateAxesCompileTests(unittest.TestCase):
         torch.use_deterministic_algorithms(True)
         try:
             reference = run(call, layout, kernel_size)
+            if cold_layout:
+                layout = natten.VarlenLayout(layouts)
             torch.compiler.reset()
             try:
                 compiled = torch.compile(call, fullgraph=True)
+                # A cold layout may add one graph when its device/memo
+                # guards become warm, matching the existing cold-miss
+                # contract in test_fna_varlen.py.
+                graph_budget = 2 if cold_layout else 1
                 with torch._dynamo.config.patch(
-                    recompile_limit=1,
-                    accumulated_recompile_limit=1,
+                    recompile_limit=graph_budget,
+                    accumulated_recompile_limit=graph_budget,
                     fail_on_recompile_limit_hit=True,
                 ):
                     observed = run(compiled, layout, kernel_size)
                     observed_again = run(compiled, layout, kernel_size)
+                    observed_third = run(compiled, layout, kernel_size)
                 for expected, actual in zip(reference, observed):
                     self.assertTrue(torch.equal(expected, actual))
                 for expected, actual in zip(reference, observed_again):
+                    self.assertTrue(torch.equal(expected, actual))
+                for expected, actual in zip(reference, observed_third):
                     self.assertTrue(torch.equal(expected, actual))
             finally:
                 torch.compiler.reset()
@@ -708,6 +904,28 @@ class VarlenDegenerateAxesCompileTests(unittest.TestCase):
             torch.compiler.reset()
         finally:
             torch.use_deterministic_algorithms(False)
+
+    @skip_if_libnatten_is_not_supported()
+    def test_compile_mixed_implicit_axes_cold_layout(self):
+        self._run_compile_case(
+            rank=3,
+            layouts=((1, 5, 5), (3, 5, 5), (1, 5, 5)),
+            kernel_size=(3, 3, 3),
+            second_layouts=((3, 6, 6), (1, 6, 6), (1, 5, 5)),
+            second_kernel_size=(3, 3, 3),
+            cold_layout=True,
+        )
+
+    @skip_if_libnatten_is_not_supported()
+    def test_compile_mixed_identity_cold_layout(self):
+        self._run_compile_case(
+            rank=3,
+            layouts=((1, 4, 4), (5, 4, 4), (1, 3, 4)),
+            kernel_size=(3, 1, 1),
+            second_layouts=((5, 4, 4), (1, 4, 4), (1, 3, 4)),
+            second_kernel_size=(3, 1, 1),
+            cold_layout=True,
+        )
 
     @skip_if_libnatten_is_not_supported()
     def test_compile_fold_path(self):

@@ -218,17 +218,13 @@ def maybe_lower_degenerate_axes(
     (unmodified) kernel_size in that case.
 
     An axis is degenerate when its kernel_size is 1 -- either the caller's
-    own ``kernel_size`` entry, or (only for a uniform layout, where every
-    document's extent on an axis is a single known value) the per-axis
-    clamp ``effective_kernel_for_uniform_shape`` computes turning a >= 2
-    entry into 1. A non-uniform (heterogeneous) layout is never
-    axis-clamped here: an individual document narrower than kernel_size on
-    some axis remains a *device-side* concern (the CUDA kernel's own
-    per-document clamp, unrelated to this Python-level lowering), since a
-    single scalar clamp cannot represent per-document extents that differ.
+    own ``kernel_size`` entry, or the per-document extent clamp turning
+    an entry into 1. Heterogeneous packs are first partitioned by their
+    effective degenerate axes, so each group uses the same lowering as an
+    isolated document. Other per-document clamps remain in the kernels.
 
     Explicit tile shapes / backward_kv_splits raise immediately once any
-    axis is found degenerate (checked before any lowering happens): folding
+    axis is found degenerate (checked before dispatching a group): folding
     or permuting changes the call's rank, so a caller-supplied tile shape's
     rank would not match.
 
@@ -240,7 +236,7 @@ def maybe_lower_degenerate_axes(
     correctly with zero real tokens to view/permute) instead of being
     special-cased again here.
 
-    Lowering itself is at most a two-step pipeline, not a general loop:
+    Each group's lowering is at most a two-step pipeline:
     1. Leading fold (view-only, see ``VarlenLayout._folded``): consumes the
        *entire* leading run of degenerate axes in one step, since a
        document's own axes are already row-major (no partial-run
@@ -260,6 +256,69 @@ def maybe_lower_degenerate_axes(
     ``dispatch``'s own normal validation and (for a uniform derived layout)
     fixed-shape dispatch or (otherwise) varlen kernel path.
     """
+    tile_knobs = (
+        q_tile_shape,
+        kv_tile_shape,
+        backward_q_tile_shape,
+        backward_kv_tile_shape,
+        backward_kv_splits,
+    )
+    if not layout.is_uniform and layout.total_tokens > 0:
+        partition = layout._partitioned(kernel_size, dilation, query.device)
+        if partition is not None:
+            if any(knob is not None for knob in tile_knobs):
+                raise ValueError(_TILE_KNOB_MESSAGE)
+            groups, perm, inv = partition
+            if perm is not None:
+                query = _PermuteTokens.apply(query, perm, inv)
+                key = _PermuteTokens.apply(key, perm, inv)
+                value = _PermuteTokens.apply(value, perm, inv)
+            lengths = [group.total_tokens for _, group in groups]
+            queries = query.split(lengths, dim=0)
+            keys = key.split(lengths, dim=0)
+            values = value.split(lengths, dim=0)
+            outputs, lses = [], []
+            for (axes, group), group_q, group_k, group_v in zip(
+                groups, queries, keys, values
+            ):
+                result = dispatch(
+                    na_dim=na_dim,
+                    query=group_q,
+                    key=group_k,
+                    value=group_v,
+                    layout=group,
+                    kernel_size=tuple(
+                        1 if i in axes else k for i, k in enumerate(kernel_size)
+                    ),
+                    stride=tuple(1 if i in axes else s for i, s in enumerate(stride)),
+                    dilation=dilation,
+                    is_causal=is_causal,
+                    scale=scale,
+                    backend=backend,
+                    q_tile_shape=None,
+                    kv_tile_shape=None,
+                    backward_q_tile_shape=None,
+                    backward_kv_tile_shape=None,
+                    backward_kv_splits=None,
+                    backward_use_pt_reduction=backward_use_pt_reduction,
+                    return_lse=return_lse,
+                )
+                if return_lse:
+                    output, lse = result
+                    outputs.append(output)
+                    lses.append(lse)
+                else:
+                    outputs.append(result)
+            output = outputs[0] if len(outputs) == 1 else torch.cat(outputs, dim=0)
+            if inv is not None:
+                output = _PermuteTokens.apply(output, inv, perm)
+            if not return_lse:
+                return output
+            lse = lses[0] if len(lses) == 1 else torch.cat(lses, dim=0)
+            if inv is not None:
+                lse = _PermuteTokens.apply(lse, inv, perm)
+            return output, lse
+
     effective_kernel = kernel_size
     if layout.is_uniform and layout.total_tokens > 0:
         effective_kernel = effective_kernel_for_uniform_shape(
@@ -275,13 +334,7 @@ def maybe_lower_degenerate_axes(
     # is the only point common to every lowering path below.
     layout._check_device_pin(query.device)
 
-    if (
-        q_tile_shape is not None
-        or kv_tile_shape is not None
-        or backward_q_tile_shape is not None
-        or backward_kv_tile_shape is not None
-        or backward_kv_splits is not None
-    ):
+    if any(knob is not None for knob in tile_knobs):
         raise ValueError(_TILE_KNOB_MESSAGE)
 
     if layout.total_tokens == 0:
