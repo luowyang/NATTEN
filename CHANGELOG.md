@@ -33,6 +33,12 @@
   with no kernel launch. Explicit tile shapes and `backward_kv_splits` are
   not supported together with a `kernel_size = 1` axis. The fixed
   (non-varlen) family is unchanged and still rejects `kernel_size = 1`.
+* Fixed three defects in that lowering: the all-degenerate identity path
+  returned NaN once its inputs were large enough for a whole-tensor sum to
+  overflow; that path backpropagated real query/key derivatives through
+  logsumexp, where the rest of the FNA family ignores logsumexp's upstream
+  gradient; and clamping a window down to a short axis could leave `stride`
+  above the clamped `kernel_size`, which the residual call then rejected.
 
 ## [0.21.7] - 2026-07-26
 * Switched to int64 strides in cutlass-fna to avoid overflows in larger use cases.

@@ -51,6 +51,7 @@ from natten.backends.configs.cutlass.backward_knobs import (
 )
 from natten.backends.fna import cutlass_fna_generic
 from natten.backends.varlen_lowering import (
+    clamp_stride_to_kernel,
     effective_kernel_for_uniform_shape,
     maybe_lower_degenerate_axes,
 )
@@ -942,6 +943,7 @@ def _neighborhood_attention_varlen_generic(
         # result on this uniform layout regardless, just without the fixed
         # kernels' fast path.
         if all(k >= 2 for k in effective_kernel_size):
+            effective_stride = clamp_stride_to_kernel(stride, effective_kernel_size)
             head_dim = query.shape[-1]
             heads_kv = key.shape[-2]
             head_dim_v = value.shape[-1]
@@ -960,7 +962,7 @@ def _neighborhood_attention_varlen_generic(
                 k_b,
                 v_b,
                 kernel_size=effective_kernel_size,
-                stride=stride,
+                stride=effective_stride,
                 dilation=dilation,
                 is_causal=is_causal,
                 scale=scale,

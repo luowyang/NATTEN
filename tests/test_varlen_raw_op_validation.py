@@ -176,9 +176,16 @@ class VarlenRawOpForwardValidationTests(unittest.TestCase):
         # NOT part of the raw-op's own enforced contract (the wrapper's
         # job), unlike the metadata tensors below (passed through as-is).
         args = _valid_forward_metadata(1)
-        noncontig_query = args["query"].transpose(0, 1).transpose(0, 1)
-        output, _ = _call_forward(1, query=noncontig_query)
-        self.assertTrue(torch.isfinite(output).all())
+        expected, expected_lse = _call_forward(1, **args)
+        for name in ("query", "key", "value"):
+            with self.subTest(tensor=name):
+                noncontiguous = torch.stack((args[name], args[name]), dim=-1)[..., 0]
+                self.assertFalse(noncontiguous.is_contiguous())
+                self.assertTrue(torch.equal(noncontiguous, args[name]))
+                actual_args = dict(args, **{name: noncontiguous})
+                output, lse = _call_forward(1, **actual_args)
+                torch.testing.assert_close(output, expected, atol=0, rtol=0)
+                torch.testing.assert_close(lse, expected_lse, atol=0, rtol=0)
 
     @skip_if_libnatten_is_not_supported()
     def test_cumulative_seqlens_noncontiguous_raises(self):

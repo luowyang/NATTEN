@@ -102,6 +102,19 @@ def effective_kernel_for_uniform_shape(
     return cast(DimensionType, tuple(effective))
 
 
+def clamp_stride_to_kernel(
+    stride: DimensionType, kernel_size: DimensionType
+) -> DimensionType:
+    """``min(stride, kernel_size)`` per axis, for a ``kernel_size`` already
+    clamped down to a document's extent: an extent-sized window covers the
+    whole axis, so clamping its stride preserves the neighborhood and keeps
+    the call's ``stride <= kernel_size`` intact. Used by the lowering below
+    and by ``_neighborhood_attention_varlen_generic``'s uniform fast path,
+    the two places that clamp a kernel_size and must carry its stride along.
+    """
+    return cast(DimensionType, tuple(min(s, k) for s, k in zip(stride, kernel_size)))
+
+
 class _PermuteTokens(Function):
     """Permutes the token (row) dimension of a ``[tokens, heads, *]`` (or
     ``[tokens, heads]``, for logsumexp) tensor by a precomputed int64 index,
@@ -132,6 +145,26 @@ class _PermuteTokens(Function):
         return grad_output.index_select(0, inverse_index), None, None
 
 
+class _IdentityValue(Function):
+    """Copy V while keeping exact zero gradients connected to Q and K."""
+
+    @staticmethod
+    def forward(ctx, query: Tensor, key: Tensor, value: Tensor) -> Tensor:
+        ctx.query_shape = query.shape
+        ctx.key_shape = key.shape
+        return value.clone()
+
+    @staticmethod
+    def backward(  # type: ignore[override]
+        ctx, grad_output: Tensor
+    ) -> Tuple[Optional[Tensor], Optional[Tensor], Tensor]:
+        return (
+            grad_output.new_zeros(ctx.query_shape) if ctx.needs_input_grad[0] else None,
+            grad_output.new_zeros(ctx.key_shape) if ctx.needs_input_grad[1] else None,
+            grad_output,
+        )
+
+
 def _identity_output(
     query: Tensor,
     key: Tensor,
@@ -143,23 +176,20 @@ def _identity_output(
     degenerate axis, whatever remains clamps or starts at kernel_size == 1
     on every axis): each query's only valid window position is itself, so
     output is exactly ``value`` and logsumexp is exactly
-    ``scale * (query * key).sum(-1)`` -- no kernel launch, no memo entry.
+    ``scale * (query * key).sum(-1)`` -- no attention kernel, no memo entry.
 
     GQA (key/value with fewer heads than query) repeats key/value to
     query's head count first, exactly as the kernel's own GQA contract
     does (see ``varlen_cutlass_fna_generic``/``cutlass_fna_generic``).
-    query/key/value are tied into BOTH outputs with a zero-weighted
-    contribution (``* 0``, the same "differentiable but ignored" idiom
-    ``_neighborhood_attention_varlen_generic``'s all-empty fast path uses),
-    so requires_grad/.grad parity holds for every tensor regardless of
-    which output ``backward()`` is called through -- output alone still
-    gives exactly ``dv = grad_out``, ``dq = dk = 0`` (the zero-weighted
-    link's local gradient is exactly zero, not merely small).
+    The value copy has an explicit backward that routes ``grad_out`` to V
+    and creates zero Q/K gradients from their shapes. Connecting LSE
+    through an empty output view preserves the FNA contract: LSE remains
+    connected to autograd while its upstream gradient is ignored.
 
     Same CUDA/dtype/compute-capability contract as the rest of the varlen
     family, checked explicitly here for the same reason
     ``_neighborhood_attention_varlen_generic``'s all-empty fast path checks
-    it: this is a pure tensor-arithmetic terminal (no kernel launch), so
+    it: this is a pure tensor-arithmetic terminal, so
     nothing downstream would otherwise enforce it, and it must not silently
     succeed on an unsupported device/dtype just because kernel_size
     happened to be fully degenerate.
@@ -172,24 +202,27 @@ def _identity_output(
     heads_kv = key.shape[-2]
     if heads != heads_kv:
         repeats = heads // heads_kv
-        key_g = torch.repeat_interleave(key, repeats=repeats, dim=-2, output_size=heads)
         value_g = torch.repeat_interleave(
             value, repeats=repeats, dim=-2, output_size=heads
         )
     else:
-        key_g = key
         value_g = value
 
     resolved_scale = scale if scale is not None else query.shape[-1] ** -0.5
-    zero_link = (query.sum() + key.sum() + value.sum()) * 0
-
-    output = value_g.clone() + zero_link.to(value_g.dtype)
+    output = _IdentityValue.apply(query, key, value_g)
     if not return_lse:
         return output
-    lse = (query.float() * key_g.float()).sum(-1) * resolved_scale + zero_link.to(
-        torch.float32
-    )
-    return output, lse
+    zero_link = output[:0].sum(dtype=torch.float32)
+    with torch.no_grad():
+        key_g = (
+            torch.repeat_interleave(
+                key, repeats=heads // heads_kv, dim=-2, output_size=heads
+            )
+            if heads != heads_kv
+            else key
+        )
+        lse = (query.float() * key_g.float()).sum(-1) * resolved_scale
+    return output, lse + zero_link
 
 
 def maybe_lower_degenerate_axes(
@@ -341,6 +374,7 @@ def maybe_lower_degenerate_axes(
         return None
 
     kernel_size = effective_kernel
+    stride = clamp_stride_to_kernel(stride, kernel_size)
     if len(degenerate) == len(kernel_size):
         return _identity_output(query, key, value, scale, return_lse)
 

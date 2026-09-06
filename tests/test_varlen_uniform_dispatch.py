@@ -42,6 +42,7 @@ import unittest
 from typing import Any, Callable, Dict, Tuple
 
 import natten
+import pytest
 import torch
 from natten.backends import cutlass_fna_generic
 from natten.types import DimensionType
@@ -414,6 +415,47 @@ class VarlenUniformDispatchTests(unittest.TestCase):
                 torch.compiler.reset()
         finally:
             torch.use_deterministic_algorithms(False)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+@pytest.mark.parametrize(
+    "shapes",
+    [((0,), (2,), (4,)), ((0, 4), (1, 2), (3, 4)), ((0, 2, 4), (2, 1, 2), (3, 2, 4))],
+)
+@pytest.mark.parametrize("causal", [False, True])
+def test_extent_sized_windows_are_stride_invariant(shapes, causal):
+    rank = len(shapes[0])
+    kernel = tuple(max(s[axis] for s in shapes) + 2 for axis in range(rank))
+    fn = _VARLEN_FN_BY_RANK[rank]
+    previous = _set_deterministic(True)
+    try:
+        for pack in (shapes, *((shape,) for shape in shapes if _prod(shape))):
+            torch.manual_seed(716)
+            layout = natten.VarlenLayout(pack)
+            total = sum(_prod(shape) for shape in pack)
+            q = torch.randn(total, 4, 16, device="cuda")
+            k = torch.randn(total, 2, 16, device="cuda")
+            v = torch.randn(total, 2, 24, device="cuda")
+            grad = torch.randn(total, 4, 24, device="cuda")
+
+            def run(stride):
+                inputs = [x.detach().requires_grad_() for x in (q, k, v)]
+                out, lse = fn(
+                    *inputs,
+                    layout,
+                    kernel_size=kernel,
+                    stride=stride,
+                    is_causal=causal,
+                    return_lse=True,
+                )
+                gradients = torch.autograd.grad(out, inputs, grad)
+                return out, lse, *gradients
+
+            expected, actual = run(1), run(kernel)
+            for a, b in zip(expected, actual):
+                torch.testing.assert_close(a, b, atol=0, rtol=0)
+    finally:
+        _set_deterministic(previous)
 
 
 if __name__ == "__main__":

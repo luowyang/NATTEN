@@ -601,20 +601,13 @@ class VarlenLayoutGpuMechanismTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "compute capability 80 or higher"):
                 na1d_varlen(query, key, value, layout, kernel_size=3)
 
-    def _run_lse_autograd_parity_case(self, empty):
-        # logsumexp must be differentiable on BOTH paths (requires_grad
-        # follows the inputs), and its gradient must be ignored -- like the
-        # rest of the FNA family -- rather than raising or perturbing
-        # dq/dk/dv. Covers three shapes of backward: output-only, lse-only,
-        # and both summed together.
+    def _run_lse_autograd_parity_case(self, layouts, kernel_size=3):
+        # LSE stays connected to autograd and contributes zero to Q/K/V
+        # gradients, including when combined with the primary output.
         heads, head_dim = 2, 8
         dtype = torch.float16
-        if empty:
-            layout = VarlenLayout(((0,), (0,)))
-            total_tokens = 0
-        else:
-            layout = VarlenLayout(((8,),), device="cuda")
-            total_tokens = 8
+        layout = VarlenLayout(layouts)
+        total_tokens = sum(shape[0] for shape in layouts)
 
         def fresh_inputs():
             torch.manual_seed(7)
@@ -638,7 +631,7 @@ class VarlenLayoutGpuMechanismTests(unittest.TestCase):
         def run():
             query, key, value = fresh_inputs()
             output, logsumexp = na1d_varlen(
-                query, key, value, layout, kernel_size=3, return_lse=True
+                query, key, value, layout, kernel_size=kernel_size, return_lse=True
             )
             self.assertEqual(logsumexp.requires_grad, True)
             return query, key, value, output, logsumexp
@@ -652,27 +645,36 @@ class VarlenLayoutGpuMechanismTests(unittest.TestCase):
         query, key, value, output, logsumexp = run()
         output.sum().backward()
         assert_grads_ok(query, key, value)
+        output_grads = tuple(t.grad.detach().clone() for t in (query, key, value))
 
         # (b) lse-only backward.
         query, key, value, output, logsumexp = run()
         logsumexp.sum().backward()
         assert_grads_ok(query, key, value)
-        if not empty:
-            # Pins the family "differentiable but ignored" semantics: lse
-            # is connected to autograd, but its gradient carries no signal.
-            for tensor in (query, key, value):
-                self.assertTrue(torch.all(tensor.grad == 0))
+        for tensor in (query, key, value):
+            self.assertTrue(torch.all(tensor.grad == 0))
 
         # (c) combined backward.
         query, key, value, output, logsumexp = run()
         (output.sum() + logsumexp.sum()).backward()
         assert_grads_ok(query, key, value)
+        for tensor, expected in zip((query, key, value), output_grads):
+            self.assertTrue(torch.equal(tensor.grad, expected))
 
     def test_lse_autograd_parity_all_empty(self):
-        self._run_lse_autograd_parity_case(empty=True)
+        self._run_lse_autograd_parity_case(((0,), (0,)))
 
     def test_lse_autograd_parity_non_empty(self):
-        self._run_lse_autograd_parity_case(empty=False)
+        self._run_lse_autograd_parity_case(((8,),))
+
+    def test_lse_autograd_parity_identity(self):
+        self._run_lse_autograd_parity_case(((8,),), kernel_size=1)
+
+    def test_lse_autograd_parity_clamped_identity(self):
+        self._run_lse_autograd_parity_case(((1,),))
+
+    def test_lse_autograd_parity_mixed_identity(self):
+        self._run_lse_autograd_parity_case(((1,), (8,)))
 
     @skip_if_libnatten_is_not_supported()
     def test_memo_key_ignores_stride_and_is_causal(self):
@@ -681,30 +683,39 @@ class VarlenLayoutGpuMechanismTests(unittest.TestCase):
         query = torch.randn(80, 2, 64, device="cuda", dtype=torch.float16)
         key = torch.randn(80, 2, 64, device="cuda", dtype=torch.float16)
         value = torch.randn(80, 2, 64, device="cuda", dtype=torch.float16)
+        grad = torch.randn_like(value)
 
-        out_a = na1d_varlen(
-            query, key, value, layout, kernel_size=5, stride=1, is_causal=False
-        )
-        self.assertEqual(len(layout._memo), 1)
-        entry_a = next(iter(layout._memo.values()))
+        def run(chosen_layout, stride, causal):
+            inputs = [x.detach().requires_grad_() for x in (query, key, value)]
+            out, lse = na1d_varlen(
+                *inputs,
+                chosen_layout,
+                kernel_size=5,
+                stride=stride,
+                is_causal=causal,
+                return_lse=True,
+            )
+            return out, lse, *torch.autograd.grad(out, inputs, grad)
 
-        # Different stride AND different is_causal: neither is part of the
-        # geometry key -- this must hit the SAME entry, not build a second
-        # one.
-        out_b = na1d_varlen(
-            query, key, value, layout, kernel_size=5, stride=3, is_causal=True
-        )
-        self.assertEqual(len(layout._memo), 1)
-        entry_b = next(iter(layout._memo.values()))
-
-        self.assertIs(entry_a, entry_b)
-        # Stride/is_causal still act per-call inside the kernel (from the
-        # call's own arguments, not from the shared memo entry) -- outputs
-        # correctly differ. Correctness of that masking itself is the main
-        # suite's job (DEFAULT_CASES/PAIRWISE_CASES in test_fna_varlen.py);
-        # this assertion only guards against the memo sharing silently
-        # making the kernel ignore stride/causal too.
-        self.assertFalse(torch.equal(out_a, out_b))
+        deterministic = torch.are_deterministic_algorithms_enabled()
+        torch.use_deterministic_algorithms(True)
+        try:
+            initial = run(layout, 1, False)
+            self.assertEqual(len(layout._memo), 1)
+            entry = next(iter(layout._memo.values()))
+            # Per-call masking must be independent of cache history.
+            for stride, causal in ((3, False), (1, True), (3, True), (1, False)):
+                with self.subTest(stride=stride, causal=causal):
+                    cached = run(layout, stride, causal)
+                    fresh = run(VarlenLayout(layout.shapes), stride, causal)
+                    for actual, expected in zip(cached, fresh):
+                        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+                    self.assertEqual(len(layout._memo), 1)
+                    self.assertIs(next(iter(layout._memo.values())), entry)
+                    if (stride, causal) != (1, False):
+                        self.assertFalse(torch.equal(cached[0], initial[0]))
+        finally:
+            torch.use_deterministic_algorithms(deterministic)
 
 
 if __name__ == "__main__":
