@@ -12,6 +12,64 @@
 * Test isolation: the process-global default device is restored after every
   test, so a module that switches it to cuda for its own tensors no longer
   decides where the tests after it allocate.
+* Fixed int32 address-offset overflow in the CUTLASS `dO * O` reduction
+  kernel for large sequence lengths.
+* Added variable-length 1-D, 2-D, and 3-D CUTLASS FNA for sequence-packed QKV,
+  including training, deterministic backward, GQA/MQA, MLA, and `torch.compile`.
+  Public entry points are `natten.VarlenLayout` (a caller-held, reusable
+  packed-document layout with a per-geometry memo scoped to the layout's
+  lifetime) and
+  `natten.na1d_varlen`/`na2d_varlen`/`na3d_varlen` (parameter-for-parameter
+  aligned with `na1d`/`na2d`/`na3d`, plus `layout`); QKV are flat
+  `[total_tokens, heads, head_dim]`, with `total_tokens` equal to the layout's
+  total exactly (no batch dimension, no capacity padding).
+* Variable-length CUTLASS FNA does not fence total active QKV element count
+  to int32. Its limits are: total packed tokens and `heads * head_dim` (and
+  `heads * head_dim_v`) must each fit in int32; the practical ceiling for
+  element count is device memory.
+* A variable-length document narrower than `kernel_size` on some axis now
+  attends over its whole extent on that axis (`effective_kernel_size =
+  min(kernel_size, extent)`), as long as `dilation == 1` on that axis; axes
+  with `kernel_size > 1` and `dilation > 1` still require the document to fit
+  `kernel_size * dilation`.
+* A `VarlenLayout` whose documents all share the same shape dispatches to
+  the fixed-shape CUTLASS FNA kernels on a batched view instead of
+  building a varlen schedule, returning results bit-for-bit identical to
+  `na{1,2,3}d(..., backend="cutlass-fna")` on that view.
+* `na{1,2,3}d_varlen`'s `kernel_size` may contain `1`: that axis mixes
+  nothing (each query attends only to tokens sharing its coordinate on that
+  axis), with no effect from `is_causal`/`dilation` there. Such an axis is
+  lowered away in Python (folded or permuted, depending on position) before
+  reaching a CUDA kernel; an all-degenerate call short-circuits to an
+  identity (`output = value`, `logsumexp = scale * (query * key).sum(-1)`)
+  with no kernel launch. Explicit tile shapes and `backward_kv_splits` are
+  not supported together with a `kernel_size = 1` axis.
+* A variable-length pack whose documents do not all share a shape reaches the
+  CUDA kernel in a single launch: only the caller's own `kernel_size = 1` axes
+  are lowered away in Python -- the same fold or permute for every document --
+  and each document's own narrower-than-`kernel_size` window is clamped by the
+  kernel, where that clamp already lived. A document whose isolated call lowers
+  to a different kernel family than the pack does (an image beside videos, say)
+  therefore answers to within rounding of that isolated call rather than
+  matching it bit for bit; every other document stays bitwise identical.
+* The extent clamp that turns a variable-length `kernel_size` into `1` is
+  applied whenever the documents carrying at least one token share a shape --
+  the new `VarlenLayout.uniform_shape` property, as opposed to `is_uniform`,
+  which the fixed-shape batched-view dispatch still needs over every document.
+  Inserting empty documents into a pack therefore leaves its output, logsumexp
+  and gradients bitwise unchanged.
+* Fixed three defects in that lowering: the all-degenerate identity path
+  returned NaN once its inputs were large enough for a whole-tensor sum to
+  overflow; that path backpropagated real query/key derivatives through
+  logsumexp, where the rest of the FNA family ignores logsumexp's upstream
+  gradient; and clamping a window down to a short axis could leave `stride`
+  above the clamped `kernel_size`, which the residual call then rejected.
+* A variable-length `kernel_size = 1` axis no longer imposes a `kernel_size *
+  dilation` fit requirement on the extent it spans. Such an axis mixes nothing
+  and is lowered away, so its `dilation` is inert, as the entry points already
+  documented; a uniform pack of 1-token-deep documents under `kernel_size =
+  (1, 3)` and `dilation = (2, 1)` had been rejected while the same call on a
+  pack of differing shapes computed.
 
 ## [0.21.7] - 2026-07-26
 * Switched to int64 strides in cutlass-fna to avoid overflows in larger use cases.

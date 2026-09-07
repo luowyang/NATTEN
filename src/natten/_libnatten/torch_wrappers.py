@@ -65,6 +65,12 @@ from natten.libnatten import (  # type: ignore[import-untyped]
     token_unpermute_1d as token_unpermute_1d_cxx,
     token_unpermute_2d as token_unpermute_2d_cxx,
     token_unpermute_3d as token_unpermute_3d_cxx,
+    varlen_na1d_backward as varlen_na1d_backward_cxx,
+    varlen_na1d_forward as varlen_na1d_forward_cxx,
+    varlen_na2d_backward as varlen_na2d_backward_cxx,
+    varlen_na2d_forward as varlen_na2d_forward_cxx,
+    varlen_na3d_backward as varlen_na3d_backward_cxx,
+    varlen_na3d_forward as varlen_na3d_forward_cxx,
 )
 from natten.utils.environment import DISABLE_TORCH_OPS
 from natten.utils.tuples import ceil_div_tuple, mul_tuple
@@ -1204,6 +1210,211 @@ def make_fna_ops(na_dim):
     )
 
 
+def make_varlen_fna_ops(na_dim):
+    """Registers the raw varlen FNA ops.
+
+    These ops trust the schedule metadata they are handed (cumulative
+    seqlens, token layouts, worklists, offset arrays). Public callers go
+    through ``natten.na{1,2,3}d_varlen``, which resolve that metadata from a
+    caller-held ``natten.VarlenLayout``.
+    """
+    fwd_handle, bwd_handle = {
+        1: (varlen_na1d_forward_cxx, varlen_na1d_backward_cxx),
+        2: (varlen_na2d_forward_cxx, varlen_na2d_backward_cxx),
+        3: (varlen_na3d_forward_cxx, varlen_na3d_backward_cxx),
+    }[na_dim]
+
+    @register_op(
+        f"natten::varlen_na{na_dim}d_forward",
+        mutates_args=(),
+        device_types="cuda",
+    )
+    def varlen_fna_forward_torch_op(
+        query: Tensor,
+        key: Tensor,
+        value: Tensor,
+        cumulative_seqlens: Tensor,
+        token_layouts: Tensor,
+        forward_worklist: Tensor,
+        kernel_size: list[int],
+        stride: list[int],
+        dilation: list[int],
+        is_causal: list[bool],
+        scale: float,
+        q_tile_shape: list[int],
+        kv_tile_shape: list[int],
+        forward_work_count: int,
+    ) -> Tuple[Tensor, Tensor]:
+        query, key, value = [maybe_contiguous(x) for x in (query, key, value)]
+
+        output_shape = [s for s in query.shape[:-1]] + [value.shape[-1]]
+        output = torch.empty(output_shape, device=query.device, dtype=query.dtype)
+        logsumexp = torch.empty(
+            query.shape[:-1], dtype=torch.float32, device=query.device
+        )
+
+        fwd_handle(
+            output,
+            query,
+            key,
+            value,
+            logsumexp,
+            cumulative_seqlens,
+            token_layouts,
+            forward_worklist,
+            kernel_size,
+            stride,
+            dilation,
+            is_causal,
+            scale,
+            q_tile_shape,
+            kv_tile_shape,
+            forward_work_count,
+        )
+
+        return output, logsumexp
+
+    @register_fake(f"natten::varlen_na{na_dim}d_forward")
+    def varlen_fna_forward_torch_fake_op(
+        query: Tensor,
+        key: Tensor,
+        value: Tensor,
+        cumulative_seqlens: Tensor,
+        token_layouts: Tensor,
+        forward_worklist: Tensor,
+        kernel_size: list[int],
+        stride: list[int],
+        dilation: list[int],
+        is_causal: list[bool],
+        scale: float,
+        q_tile_shape: list[int],
+        kv_tile_shape: list[int],
+        forward_work_count: int,
+    ) -> Tuple[Tensor, Tensor]:
+        query, key, value = [maybe_contiguous(x) for x in (query, key, value)]
+
+        output_shape = [s for s in query.shape[:-1]] + [value.shape[-1]]
+        output = torch.empty(output_shape, device=query.device, dtype=query.dtype)
+        logsumexp = torch.empty(
+            query.shape[:-1], dtype=torch.float32, device=query.device
+        )
+        return output, logsumexp
+
+    @register_op(
+        f"natten::varlen_na{na_dim}d_backward",
+        mutates_args=(),
+        device_types="cuda",
+    )
+    def varlen_fna_backward_torch_op(
+        query: Tensor,
+        key: Tensor,
+        value: Tensor,
+        output: Tensor,
+        d_output: Tensor,
+        logsumexp: Tensor,
+        cumulative_seqlens: Tensor,
+        token_layouts: Tensor,
+        backward_kv_splits: Tensor,
+        backward_worklist: Tensor,
+        backward_q_tile_offsets: Tensor,
+        backward_kv_split_offsets: Tensor,
+        kernel_size: list[int],
+        stride: list[int],
+        dilation: list[int],
+        is_causal: list[bool],
+        scale: float,
+        q_tile_shape: list[int],
+        kv_tile_shape: list[int],
+        backward_work_count: int,
+        total_backward_q_tiles: int,
+        compute_delta_with_torch: bool,
+        deterministic: bool,
+    ) -> Tuple[Tensor, Tensor, Tensor]:
+        query, key, value = [maybe_contiguous(x) for x in (query, key, value)]
+        output, d_output, logsumexp = [
+            maybe_contiguous(x) for x in (output, d_output, logsumexp)
+        ]
+
+        d_query = torch.empty_like(query)
+        d_key = torch.empty_like(key)
+        d_value = torch.empty_like(value)
+
+        bwd_handle(
+            d_query,
+            d_key,
+            d_value,
+            query,
+            key,
+            value,
+            output,
+            d_output,
+            logsumexp,
+            cumulative_seqlens,
+            token_layouts,
+            backward_kv_splits,
+            backward_worklist,
+            backward_q_tile_offsets,
+            backward_kv_split_offsets,
+            kernel_size,
+            stride,
+            dilation,
+            is_causal,
+            scale,
+            q_tile_shape,
+            kv_tile_shape,
+            backward_work_count,
+            total_backward_q_tiles,
+            compute_delta_with_torch,
+            deterministic,
+        )
+
+        return d_query, d_key, d_value
+
+    @register_fake(f"natten::varlen_na{na_dim}d_backward")
+    def varlen_fna_backward_torch_fake_op(
+        query: Tensor,
+        key: Tensor,
+        value: Tensor,
+        output: Tensor,
+        d_output: Tensor,
+        logsumexp: Tensor,
+        cumulative_seqlens: Tensor,
+        token_layouts: Tensor,
+        backward_kv_splits: Tensor,
+        backward_worklist: Tensor,
+        backward_q_tile_offsets: Tensor,
+        backward_kv_split_offsets: Tensor,
+        kernel_size: list[int],
+        stride: list[int],
+        dilation: list[int],
+        is_causal: list[bool],
+        scale: float,
+        q_tile_shape: list[int],
+        kv_tile_shape: list[int],
+        backward_work_count: int,
+        total_backward_q_tiles: int,
+        compute_delta_with_torch: bool,
+        deterministic: bool,
+    ) -> Tuple[Tensor, Tensor, Tensor]:
+        query, key, value = [maybe_contiguous(x) for x in (query, key, value)]
+        output, d_output, logsumexp = [
+            maybe_contiguous(x) for x in (output, d_output, logsumexp)
+        ]
+
+        return (
+            torch.empty_like(query),
+            torch.empty_like(key),
+            torch.empty_like(value),
+        )
+
+    return (
+        varlen_fna_forward_torch_op,
+        varlen_fna_forward_torch_fake_op,
+        varlen_fna_backward_torch_op,
+        varlen_fna_backward_torch_fake_op,
+    )
+
+
 def make_reference_fna_ops(na_dim):
     fwd_handle, bwd_handle = {
         1: (reference_na1d_forward_cxx, reference_na1d_backward_cxx),
@@ -1600,6 +1811,25 @@ def make_token_permute_ops(na_dim):
 ) = make_fna_ops(3)
 
 (
+    varlen_na1d_forward_torch_op,
+    varlen_na1d_forward_torch_fake_op,
+    varlen_na1d_backward_torch_op,
+    varlen_na1d_backward_torch_fake_op,
+) = make_varlen_fna_ops(1)
+(
+    varlen_na2d_forward_torch_op,
+    varlen_na2d_forward_torch_fake_op,
+    varlen_na2d_backward_torch_op,
+    varlen_na2d_backward_torch_fake_op,
+) = make_varlen_fna_ops(2)
+(
+    varlen_na3d_forward_torch_op,
+    varlen_na3d_forward_torch_fake_op,
+    varlen_na3d_backward_torch_op,
+    varlen_na3d_backward_torch_fake_op,
+) = make_varlen_fna_ops(3)
+
+(
     reference_na1d_forward_torch_op,
     reference_na1d_forward_torch_fake_op,
     reference_na1d_backward_torch_op,
@@ -1676,6 +1906,15 @@ if DISABLE_TORCH_OPS:
     na3d_forward = na3d_forward_torch_op
     na3d_backward = na3d_backward_torch_op
 
+    varlen_na1d_forward = varlen_na1d_forward_torch_op
+    varlen_na1d_backward = varlen_na1d_backward_torch_op
+
+    varlen_na2d_forward = varlen_na2d_forward_torch_op
+    varlen_na2d_backward = varlen_na2d_backward_torch_op
+
+    varlen_na3d_forward = varlen_na3d_forward_torch_op
+    varlen_na3d_backward = varlen_na3d_backward_torch_op
+
     reference_na1d_forward = reference_na1d_forward_torch_op
     reference_na1d_backward = reference_na1d_backward_torch_op
 
@@ -1730,6 +1969,15 @@ else:
 
     na3d_forward = torch.ops.natten.na3d_forward
     na3d_backward = torch.ops.natten.na3d_backward
+
+    varlen_na1d_forward = torch.ops.natten.varlen_na1d_forward
+    varlen_na1d_backward = torch.ops.natten.varlen_na1d_backward
+
+    varlen_na2d_forward = torch.ops.natten.varlen_na2d_forward
+    varlen_na2d_backward = torch.ops.natten.varlen_na2d_backward
+
+    varlen_na3d_forward = torch.ops.natten.varlen_na3d_forward
+    varlen_na3d_backward = torch.ops.natten.varlen_na3d_backward
 
     reference_na1d_forward = torch.ops.natten.reference_na1d_forward
     reference_na1d_backward = torch.ops.natten.reference_na1d_backward
@@ -1790,4 +2038,10 @@ __all__ = [
     "token_unpermute_1d",
     "token_unpermute_2d",
     "token_unpermute_3d",
+    "varlen_na1d_backward",
+    "varlen_na1d_forward",
+    "varlen_na2d_backward",
+    "varlen_na2d_forward",
+    "varlen_na3d_backward",
+    "varlen_na3d_forward",
 ]
