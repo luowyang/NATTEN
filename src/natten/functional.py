@@ -1190,8 +1190,8 @@ def na1d_varlen(
     A document narrower than `kernel_size` on some axis attends over its
     whole extent on that axis instead (`effective_kernel_size =
     min(kernel_size, extent)`), as long as `dilation == 1` on that axis;
-    axes with `dilation > 1` still require the document to fit
-    `kernel_size * dilation`.
+    axes with `kernel_size > 1` and `dilation > 1` still require the
+    document to fit `kernel_size * dilation`.
 
     A layout whose documents all share the same shape (uniform) runs on the
     fixed-shape CUTLASS FNA kernels instead of the varlen schedule, and

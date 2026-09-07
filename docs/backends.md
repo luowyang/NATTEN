@@ -84,10 +84,10 @@ exact no-op, and a layout whose documents are all empty returns correctly-shaped
 empty outputs without a kernel launch. A document narrower than `kernel_size`
 on some axis attends over its whole extent on that axis instead
 (`effective_kernel_size = min(kernel_size, extent)`), as long as `dilation == 1`
-on that axis; axes with `dilation > 1` still require the document to fit
-`kernel_size * dilation`. A layout whose documents all share the same shape
-(uniform) dispatches to the fixed-shape CUTLASS FNA kernels on a batched
-view instead of building a varlen schedule, matching `na{1,2,3}d(...,
+on that axis; axes with `kernel_size > 1` and `dilation > 1` still require the
+document to fit `kernel_size * dilation`. A layout whose documents all share
+the same shape (uniform) dispatches to the fixed-shape CUTLASS FNA kernels on a
+batched view instead of building a varlen schedule, matching `na{1,2,3}d(...,
 backend="cutlass-fna")` bit-for-bit.
 
 A `kernel_size` entry may be `1`: that axis mixes nothing (each query

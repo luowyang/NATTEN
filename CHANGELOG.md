@@ -19,7 +19,8 @@
 * A variable-length document narrower than `kernel_size` on some axis now
   attends over its whole extent on that axis (`effective_kernel_size =
   min(kernel_size, extent)`), as long as `dilation == 1` on that axis; axes
-  with `dilation > 1` still require the document to fit `kernel_size * dilation`.
+  with `kernel_size > 1` and `dilation > 1` still require the document to fit
+  `kernel_size * dilation`.
 * A `VarlenLayout` whose documents all share the same shape dispatches to
   the fixed-shape CUTLASS FNA kernels on a batched view instead of
   building a varlen schedule, returning results bit-for-bit identical to
@@ -52,6 +53,12 @@
   logsumexp, where the rest of the FNA family ignores logsumexp's upstream
   gradient; and clamping a window down to a short axis could leave `stride`
   above the clamped `kernel_size`, which the residual call then rejected.
+* A variable-length `kernel_size = 1` axis no longer imposes a `kernel_size *
+  dilation` fit requirement on the extent it spans. Such an axis mixes nothing
+  and is lowered away, so its `dilation` is inert, as the entry points already
+  documented; a uniform pack of 1-token-deep documents under `kernel_size =
+  (1, 3)` and `dilation = (2, 1)` had been rejected while the same call on a
+  pack of differing shapes computed.
 
 ## [0.21.7] - 2026-07-26
 * Switched to int64 strides in cutlass-fna to avoid overflows in larger use cases.

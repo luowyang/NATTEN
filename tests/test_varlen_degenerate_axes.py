@@ -51,7 +51,10 @@ import natten
 import torch
 from natten._libnatten import na1d_forward, varlen_na1d_forward
 from natten.backends import cutlass_fna_generic
-from natten.backends.varlen_lowering import maybe_lower_degenerate_axes
+from natten.backends.varlen_lowering import (
+    effective_kernel_for_uniform_shape,
+    maybe_lower_degenerate_axes,
+)
 from natten.types import DimensionType
 from natten.utils.testing import (
     skip_if_fewer_than_n_gpus,
@@ -1544,6 +1547,93 @@ class VarlenAllEmptyPackLoweringTests(unittest.TestCase):
                     self.assertIsNone(result)
                     dispatch.assert_not_called()
                 self.assertIsNone(layout.device)
+
+
+# (k) dilation on a degenerate axis. A kernel_size = 1 axis mixes nothing and
+# is lowered away, so its dilation has no effect there -- and, in particular,
+# imposes no kernel_size * dilation fit requirement on the extent, which is
+# the only thing dilation could otherwise do to such an axis. Every axis that
+# is a real window keeps that requirement.
+# name, shapes, kernel_size, dilation.
+_DEGENERATE_DILATION_CASES = (
+    ("identity-r1", ((1,), (1,)), (1,), (2,)),
+    ("fold-r2", ((1, 8), (1, 8)), (1, 3), (2, 1)),
+    ("fold-r2-dilated-window", ((1, 8), (1, 8)), (1, 3), (2, 2)),
+    ("permute-r2", ((8, 1), (8, 1)), (3, 1), (1, 2)),
+    ("fold-r3", ((1, 1, 8), (1, 1, 8)), (1, 1, 3), (2, 3, 1)),
+    ("permute-r3", ((4, 1, 4), (4, 1, 4)), (3, 1, 3), (1, 2, 1)),
+    ("fold-then-permute-r3", ((1, 4, 1), (1, 4, 1)), (1, 3, 1), (2, 1, 3)),
+)
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "CUDA is unavailable")
+class VarlenDegenerateAxisDilationTests(unittest.TestCase):
+    def _run(self, rank, shapes, kernel_size, dilation, tensors, gradient):
+        layout = natten.VarlenLayout(shapes, device="cuda")
+        leaves = tuple(x.detach().clone().requires_grad_(True) for x in tensors)
+        output, lse = _VARLEN_FN_BY_RANK[rank](
+            *leaves,
+            layout,
+            kernel_size=kernel_size,
+            dilation=dilation,
+            return_lse=True,
+        )
+        return (output, lse, *torch.autograd.grad(output, leaves, gradient))
+
+    @skip_if_libnatten_is_not_supported()
+    def test_dilation_on_a_degenerate_axis_is_inert(self):
+        for name, shapes, kernel_size, dilation in _DEGENERATE_DILATION_CASES:
+            with self.subTest(case=name):
+                rank = len(shapes[0])
+                # Same call with every degenerate axis's dilation set to 1 and
+                # every kept axis's left alone: the two differ only where
+                # dilation is supposed to be inert.
+                baseline = tuple(
+                    1 if k == 1 else d for k, d in zip(kernel_size, dilation)
+                )
+                torch.manual_seed(7500 + rank)
+                heads, head_dim = 2, 32
+                total = sum(_prod(shape) for shape in shapes)
+                tensors = tuple(
+                    torch.randn(
+                        total, heads, head_dim, device="cuda", dtype=torch.float16
+                    )
+                    for _ in range(3)
+                )
+                gradient = torch.randn_like(tensors[0])
+
+                self.assertEqual(
+                    effective_kernel_for_uniform_shape(
+                        kernel_size, dilation, shapes[0]
+                    ),
+                    effective_kernel_for_uniform_shape(
+                        kernel_size, baseline, shapes[0]
+                    ),
+                )
+                dilated = self._run(
+                    rank, shapes, kernel_size, dilation, tensors, gradient
+                )
+                undilated = self._run(
+                    rank, shapes, kernel_size, baseline, tensors, gradient
+                )
+                for tensor_name, actual, expected in zip(
+                    _EMPTY_INSERTION_RESULT_NAMES, dilated, undilated
+                ):
+                    self.assertTrue(
+                        torch.equal(actual, expected),
+                        f"{name}: {tensor_name} differs under dilation={dilation}",
+                    )
+
+    @skip_if_libnatten_is_not_supported()
+    def test_uniform_pack_keeps_the_fit_check_on_a_real_window(self):
+        # The same pack under kernel_size > 1 on the extent-1 axis: that axis
+        # is a window the document has to fit, and does not.
+        layout = natten.VarlenLayout(((1, 8), (1, 8)), device="cuda")
+        inputs = tuple(
+            torch.zeros(16, 2, 32, device="cuda", dtype=torch.float16) for _ in range(3)
+        )
+        with self.assertRaisesRegex(ValueError, "kernel_size \\* dilation must fit"):
+            natten.na2d_varlen(*inputs, layout, kernel_size=(3, 3), dilation=(2, 1))
 
 
 if __name__ == "__main__":

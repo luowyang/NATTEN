@@ -74,7 +74,8 @@ def effective_kernel_for_uniform_shape(
     kernel_size: DimensionType, dilation: DimensionType, shape: DimensionType
 ) -> DimensionType:
     """Host-side form of the per-document effective-kernel clamp
-    (``min(kernel_size, extent)`` on every ``dilation == 1`` axis), valid
+    (``min(kernel_size, extent)`` on every axis that is not a dilated
+    window of more than one element), valid
     when every token-carrying document shares ``shape`` (a zero-token
     document is never scheduled, so no clamp is defined for it) -- the same
     rule ``_neighborhood_attention_varlen_generic``'s uniform-dispatch
@@ -84,15 +85,21 @@ def effective_kernel_for_uniform_shape(
     kernels either directly (already kernel_size >= 2 everywhere) or after
     lowering.
 
-    An axis with ``dilation > 1`` is never clamped -- ``shape`` must still
-    fit ``kernel_size * dilation`` there, exactly as the varlen fit check
-    (``_build_varlen_fna_state``) and the fixed-shape uniform-dispatch
-    branch (``_neighborhood_attention_varlen_generic``) require; this
-    raises the same ``ValueError`` otherwise.
+    An axis with ``kernel_size > 1`` and ``dilation > 1`` is never clamped
+    -- ``shape`` must still fit ``kernel_size * dilation`` there, exactly as
+    the varlen fit check (``_build_varlen_fna_state``) and the fixed-shape
+    uniform-dispatch branch (``_neighborhood_attention_varlen_generic``)
+    require; this raises the same ``ValueError`` otherwise. A
+    ``kernel_size = 1`` axis has no window to fit: it mixes nothing and is
+    lowered away below, so its dilation has no effect and imposes no fit
+    requirement, which is the contract docs/backends.md and
+    ``na{1,2,3}d_varlen``'s docstrings state. Every document ``shape``
+    comes from carries at least one token on every axis, so such an axis
+    takes the clamp branch and stays 1.
     """
     effective = []
     for kernel_axis, extent, dilation_axis in zip(kernel_size, shape, dilation):
-        if dilation_axis > 1:
+        if kernel_axis > 1 and dilation_axis > 1:
             if extent < kernel_axis * dilation_axis:
                 raise ValueError(
                     "kernel_size * dilation must fit every token layout on any "
