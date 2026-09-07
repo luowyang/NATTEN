@@ -6,6 +6,12 @@
   on FP16/BF16 it could round early, underflow to zero, or overflow to `Inf`
   and turn a whole row into `NaN` once a masked position contributed `0 * Inf`.
   Both operands are converted to FP32 first.
+* Test isolation: `torch._dynamo`'s recompile and cache-size limits are
+  restored after every test, so a module that tightens a compile budget for its
+  own cases no longer decides how the tests after it behave.
+* Test isolation: the process-global default device is restored after every
+  test, so a module that switches it to cuda for its own tensors no longer
+  decides where the tests after it allocate.
 
 ## [0.21.7] - 2026-07-26
 * Switched to int64 strides in cutlass-fna to avoid overflows in larger use cases.
