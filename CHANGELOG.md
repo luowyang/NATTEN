@@ -70,6 +70,12 @@
   documented; a uniform pack of 1-token-deep documents under `kernel_size =
   (1, 3)` and `dilation = (2, 1)` had been rejected while the same call on a
   pack of differing shapes computed.
+* Added `scripts/bench_mixed_batch.py`, a capability and performance bench for
+  mixed variable-length batches: generated attention graphs judged by
+  implementation-independent properties, a fixed regression set, execution and
+  API contracts, and paired packed-versus-per-document timings, each with its
+  own verdict rather than one composite score. `docs/mixed-batch-bench.md`
+  describes what every mode judges and what its verdicts do not cover.
 
 ## [0.21.7] - 2026-07-26
 * Switched to int64 strides in cutlass-fna to avoid overflows in larger use cases.
