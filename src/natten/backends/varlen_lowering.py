@@ -29,10 +29,11 @@ from ``natten.backends.varlen_fna._neighborhood_attention_varlen_generic``
 right after that function's own argument normalization; see
 ``maybe_lower_degenerate_axes``'s docstring for the exact contract.
 
-Only this module and ``natten.backends.varlen_fna`` know kernel_size = 1 is
-possible for varlen calls -- the CUDA kernels and the fixed (non-varlen)
-family are unchanged and still reject it (``check_kernel_size_arg``'s
-``allow_ones`` stays ``False`` for every other caller).
+A varlen ``kernel_size`` may contain 1 only as far as this module and
+``natten.backends.varlen_fna``, which is where it is accepted
+(``check_all_args(..., allow_ones=True)``) and here where it is lowered away.
+Everything downstream -- the residual dispatch, the schedules it builds, the
+CUDA kernels themselves -- only ever sees ``kernel_size >= 2``.
 """
 
 from typing import Callable, cast, Optional, Tuple, Union

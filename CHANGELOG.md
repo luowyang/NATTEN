@@ -31,8 +31,7 @@
   reaching a CUDA kernel; an all-degenerate call short-circuits to an
   identity (`output = value`, `logsumexp = scale * (query * key).sum(-1)`)
   with no kernel launch. Explicit tile shapes and `backward_kv_splits` are
-  not supported together with a `kernel_size = 1` axis. The fixed
-  (non-varlen) family is unchanged and still rejects `kernel_size = 1`.
+  not supported together with a `kernel_size = 1` axis.
 * A variable-length pack whose documents do not all share a shape reaches the
   CUDA kernel in a single launch: only the caller's own `kernel_size = 1` axes
   are lowered away in Python -- the same fold or permute for every document --

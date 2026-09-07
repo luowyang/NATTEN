@@ -99,8 +99,7 @@ ever sees `kernel_size >= 2`; if every axis ends up `1` the call
 short-circuits to `output = value`, `logsumexp = scale * (query *
 key).sum(-1)`, with no kernel launch. Explicit tile shapes and
 `backward_kv_splits` are not supported together with a `kernel_size = 1`
-axis (lowering changes the call's rank). The fixed (non-varlen) family is
-unaffected -- `na{1,2,3}d` still rejects `kernel_size = 1`.
+axis (lowering changes the call's rank).
 
 All documents in one layout share the
 same spatial rank; `kernel_size`, `stride`, `dilation`, and the causal mask are

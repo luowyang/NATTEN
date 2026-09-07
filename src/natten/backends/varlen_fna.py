@@ -821,9 +821,9 @@ def _neighborhood_attention_varlen_generic(
             and any(isinstance(item, bool) for item in arg_value)
         ):
             raise TypeError(f"{arg_name} must contain integers, not booleans.")
-    # allow_ones=True: unlike the fixed (non-varlen) family, this entry
-    # point accepts kernel_size = 1 -- a degenerate axis, lowered away in
-    # Python below rather than rejected here.
+    # allow_ones=True: this entry point accepts kernel_size = 1 -- a
+    # degenerate axis, lowered away in Python below rather than rejected
+    # here.
     kernel_size, stride, dilation, is_causal = check_all_args(
         na_dim, kernel_size, stride, dilation, is_causal, allow_ones=True
     )
@@ -936,9 +936,9 @@ def _neighborhood_attention_varlen_generic(
             kernel_size, dilation, shape
         )
 
-        # A clamped axis of 1 is a kernel_size the fixed family still
-        # rejects (kernel_size = 1 lowering is a different feature); decline
-        # and fall through to the varlen kernel path below, unchanged --
+        # cutlass_fna_generic is a kernel dispatch, and takes kernel_size
+        # >= 2 only; a clamped axis of 1 therefore declines this fast path
+        # and falls through to the varlen kernel path below, unchanged --
         # its own per-document device-side clamp produces the identical
         # result on this uniform layout regardless, just without the fixed
         # kernels' fast path.

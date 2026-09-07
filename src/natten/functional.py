@@ -1213,8 +1213,7 @@ def na1d_varlen(
     `backward_kv_tile_shape`) and `backward_kv_splits` are not supported
     together with a `kernel_size = 1` axis, since folding/permuting changes
     the call's rank; omit them (the resolved rank picks its own defaults)
-    or drop the degenerate axes. The fixed (non-varlen) family is
-    unaffected -- `na{1,2,3}d` still rejects `kernel_size = 1`.
+    or drop the degenerate axes.
 
     `layout` defines the document order for `query`/`key`/`value`; every
     tensor passed with it must be packed in that same order.

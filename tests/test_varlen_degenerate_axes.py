@@ -1171,12 +1171,6 @@ class VarlenDegenerateAxesErrorTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     natten.na1d_varlen(query, query, query, layout, kernel_size=bad)
 
-    @skip_if_libnatten_is_not_supported()
-    def test_fixed_family_still_rejects_kernel_size_one(self):
-        query = torch.zeros(1, 4, 4, 1, 16, device="cuda", dtype=torch.float16)
-        with self.assertRaises(ValueError):
-            natten.na3d(query, query, query, kernel_size=(1, 3, 3))
-
     def test_pickle_after_lowering_drops_derived_state(self):
         layout = natten.VarlenLayout(((1, 5, 5), (3, 5, 5)))
         folded = layout._folded(1)
