@@ -2543,9 +2543,9 @@ class VarlenFnaGpuTests(unittest.TestCase):
         # spot-check covers the packed sequence's last 3 positions -- the
         # LAST document's tail -- so with len(layouts) > 1 it exercises a
         # nonzero token_start: the context slice's right edge is the true
-        # right edge, so the boundary window-clamping in _window_positions
-        # produces identical windows for these positions whether or not
-        # other documents precede it.
+        # right edge, so the oracle's boundary window-clamping produces
+        # identical windows for these positions whether or not other
+        # documents precede it.
         torch.use_deterministic_algorithms(True)
         active_tokens = sum(doc_layout[0] for doc_layout in layouts)
         torch.manual_seed(seed)

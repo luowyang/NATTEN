@@ -31,7 +31,7 @@ and CHANGELOG.md for the public description.
 Primary oracle: tests/utils.py's `_explicit_oracle`, a from-scratch
 per-token coordinate/softmax computation, called once per document. It
 already treats kernel_size = 1 correctly with NO special-casing on this
-file's part: for any axis, `_window_positions` degenerates to exactly the
+file's part: for any axis, `axis_neighbors` degenerates to exactly the
 query's own single position when kernel_size == 1 (verified by hand for
 both causal and non-causal, independent of stride/dilation, since a
 window of width 1 has only one possible position). This makes it a fully
@@ -42,7 +42,6 @@ of degenerate axes, so (a)/(b)/(c)'s different degenerate-axis positions
 through one shared runner rather than three separately hand-built oracles.
 """
 
-import itertools
 import pickle
 import unittest
 from typing import Any, Callable, Dict, List, Tuple
@@ -63,13 +62,23 @@ from torch._dynamo.testing import CompileCounter
 from .utils import (
     _dtype_is_supported,
     _explicit_oracle,
-    _flatten_index,
     _make_layout,
     _prod,
     _set_deterministic,
     _tolerances,
-    _window_positions,
     VarlenCase,
+)
+from .varlen_numerics import (
+    dense_reference,
+    document_comparison_rule,
+    document_mask,
+    dtype_interval,
+    effective_kernel,
+    grouped_head_prediction,
+    rank_one_match,
+    rank_one_scalar,
+    reference_interval,
+    single_key_scalar_bound,
 )
 
 _VARLEN_FN_BY_RANK: Dict[int, Callable[..., Any]] = {
@@ -118,91 +127,9 @@ def _lower_with_mock_dispatch(layout, kernel_size: DimensionType, tensors):
     return result, dispatch
 
 
-# The FP32 kernels' GEMMs are OpMultiplyAddFastF32 (3xTF32), so a product
-# of one costs up to 2**-21 relative -- FP16/BF16 products of one are exact.
-_TF32_RELATIVE = 2.0**-21
-_TF32_ABSOLUTE = 2.0**-30
-
-_DENSE_MASK_CACHE: Dict[Any, torch.Tensor] = {}
-
-
-def _ulp32(value: float) -> float:
-    """Spacing of float32 above ``abs(value)``."""
-    magnitude = torch.tensor(abs(value), dtype=torch.float32)
-    above = torch.nextafter(magnitude, torch.tensor(torch.inf, dtype=torch.float32))
-    return float(above.double() - magnitude.double())
-
-
-def _dtype_ulp(magnitude: float, dtype: torch.dtype) -> float:
-    """Spacing of ``dtype`` above ``magnitude``."""
-    value = torch.tensor(abs(magnitude), dtype=dtype)
-    above = torch.nextafter(value, torch.tensor(torch.inf, dtype=dtype))
-    return float(above.double() - value.double())
-
-
-def _rounding_radius(values: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
-    """Half an ulp of ``dtype`` at each element's own magnitude."""
-    magnitude = values.detach().cpu().abs().to(dtype)
-    above = torch.nextafter(magnitude, torch.full_like(magnitude, torch.inf))
-    return (above.double() - magnitude.double()) * 0.5
-
-
-def _product_radius(values: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
-    """How far one kernel-computed product of this magnitude may land from the
-    exact answer: the 3xTF32 interval on FP32, half a storage ulp otherwise."""
-    if dtype == torch.float32:
-        return values.detach().cpu().double().abs() * _TF32_RELATIVE + _TF32_ABSOLUTE
-    return _rounding_radius(values, dtype)
-
-
-def _prefix_sum_bound(left: torch.Tensor, right: torch.Tensor) -> float:
-    """Largest sequential prefix sum of ``left * right``, the full dot
-    product included."""
-    products = left.detach().cpu().double() * right.detach().cpu().double()
-    return float(products.cumsum(0).abs().max()) if products.numel() else 0.0
-
-
-def _fit_rank_one(
-    values: torch.Tensor, basis: torch.Tensor, dtype: torch.dtype
-) -> float:
-    """Least-squares scalar in float64, stored back in the kernel's dtype."""
-    y = values.detach().cpu().double().flatten()
-    x = basis.detach().cpu().double().flatten()
-    denominator = float(x @ x)
-    fitted = float(x @ y) / denominator if denominator else 0.0
-    return float(torch.tensor([fitted], dtype=torch.float64).to(dtype).double()[0])
-
-
-def _assert_product_close(
-    test, actual, expected, dtype, message: str, magnitude=None
-) -> None:
-    """Equality for a quantity the kernel obtains by multiplying by one:
-    bitwise on FP16/BF16, within the 3xTF32 interval on FP32. ``magnitude``
-    carries the relative term when ``expected`` is a sum of such products
-    (GQA folds one per query head into each key/value head), since the
-    interval belongs to each product, not to what they add up to.
-    """
-    a = actual.detach().cpu().double()
-    b = expected.detach().cpu().double()
-    if dtype != torch.float32:
-        test.assertTrue(torch.equal(a, b), message)
-        return
-    scale = b.abs() if magnitude is None else magnitude.detach().cpu().double()
-    allowed = scale * _TF32_RELATIVE + _TF32_ABSOLUTE
-    outside = int(((a - b).abs() > allowed).sum())
-    test.assertEqual(outside, 0, f"{message}: {outside} outside the 3xTF32 interval")
-
-
-def _assert_rank_one(test, values, basis, coefficient, dtype, message: str) -> None:
-    expected = (
-        torch.tensor([coefficient], dtype=torch.float64)
-        * basis.detach().cpu().double().flatten()
-    )
-    if dtype != torch.float32:
-        expected = expected.float().to(dtype).double()
-    _assert_product_close(
-        test, values.detach().cpu().flatten(), expected, dtype, message
-    )
+def _assert_check(test, check: Dict[str, Any], message: str) -> None:
+    """Assert one tests/varlen_numerics.py comparison record."""
+    test.assertTrue(check["pass"], f"{message}: {check}")
 
 
 def _assert_single_key_rows(
@@ -214,8 +141,7 @@ def _assert_single_key_rows(
     Its exact gradients are zero, and what the kernel returns instead is the
     rank-1 image of one scalar per head: the residual of the same head_dim-term
     dot product taken over the backward GEMM's and the delta reduction's
-    different summation orders. The scalar is bounded by 8 float32 ulps of that
-    dot product's largest sequential partial sum.
+    different summation orders, bounded by ``single_key_scalar_bound``.
     """
     heads = query.shape[-2]
     heads_kv = key.shape[-2]
@@ -224,113 +150,37 @@ def _assert_single_key_rows(
         coefficients, bounds = [], []
         for head in range(heads):
             kv_head = head // repeats
-            bound = 8 * _ulp32(
-                _prefix_sum_bound(upstream[row, head], value[row, kv_head])
+            bound = single_key_scalar_bound(
+                upstream[row, head], value[row, kv_head], dtype
             )
-            coefficient = _fit_rank_one(dq[row, head], key[row, kv_head], dtype)
+            _, coefficient = rank_one_scalar(dq[row, head], key[row, kv_head], dtype)
             label = f"row {row} head {head}"
             test.assertLessEqual(abs(coefficient / scale), bound, f"dQ {label} scalar")
-            _assert_rank_one(
+            _assert_check(
                 test,
-                dq[row, head],
-                key[row, kv_head],
-                coefficient,
-                dtype,
+                rank_one_match(dq[row, head], key[row, kv_head], coefficient, dtype),
                 f"dQ {label}",
             )
             coefficients.append(coefficient)
             bounds.append(bound)
         if heads == heads_kv:
             for head in range(heads):
-                coefficient = _fit_rank_one(dk[row, head], query[row, head], dtype)
+                _, coefficient = rank_one_scalar(dk[row, head], query[row, head], dtype)
                 label = f"row {row} head {head}"
                 test.assertLessEqual(
                     abs(coefficient / scale), bounds[head], f"dK {label} scalar"
                 )
-                _assert_rank_one(
+                _assert_check(
                     test,
-                    dk[row, head],
-                    query[row, head],
-                    coefficient,
-                    dtype,
+                    rank_one_match(dk[row, head], query[row, head], coefficient, dtype),
                     f"dK {label}",
                 )
             continue
-        # GQA repeats key/value in Python, so dK comes back as a sum of
-        # per-Q-head rounded products; only that sum is observable here.
-        predicted = torch.zeros(heads_kv, query.shape[-1], dtype=torch.float64)
-        radius = torch.zeros_like(predicted)
-        for head in range(heads):
-            term = (
-                torch.tensor([coefficients[head]], dtype=torch.float64)
-                * query[row, head].detach().cpu().double()
-            )
-            predicted[head // repeats] += term
-            radius[head // repeats] += _product_radius(term, dtype)
-        radius += _rounding_radius(predicted, dtype) * repeats
+        predicted, radius = grouped_head_prediction(
+            coefficients, query[row], repeats, dtype
+        )
         difference = (dk[row].detach().cpu().double() - predicted).abs()
         test.assertTrue(bool((difference <= radius).all()), f"dK row {row}")
-
-
-def _dense_mask(shape, kernel_size, stride, dilation, is_causal, device):
-    """``[tokens, tokens]`` bool: is key n in query m's neighborhood, from
-    tests/utils.py's per-axis window rule with each axis's kernel clamped to
-    this document's own extent -- the clamp the CUDA kernel applies per
-    document. Cached: the mask depends only on the geometry.
-    """
-    assert all(d == 1 for d in dilation)
-    memo_key = (shape, kernel_size, stride, dilation, is_causal)
-    mask = _DENSE_MASK_CACHE.get(memo_key)
-    if mask is None:
-        effective = tuple(min(k, n) for k, n in zip(kernel_size, shape))
-        total = _prod(shape)
-        mask = torch.zeros(total, total, dtype=torch.bool)
-        for coord in itertools.product(*(range(n) for n in shape)):
-            axes = tuple(
-                _window_positions(i, n, k, min(s, k), d, c)
-                for i, n, k, s, d, c in zip(
-                    coord, shape, effective, stride, dilation, is_causal
-                )
-            )
-            row = _flatten_index(coord, shape)
-            for key_coord in itertools.product(*axes):
-                mask[row, _flatten_index(key_coord, shape)] = True
-        _DENSE_MASK_CACHE[memo_key] = mask
-    return mask.to(device)
-
-
-def _dense_reference(
-    query, key, value, shape, kernel_size, stride, dilation, is_causal, gradient
-):
-    """Dense float64 neighborhood attention over one document, plus its
-    gradients -- the answer both the packed and the isolated call approximate.
-    """
-    mask = _dense_mask(shape, kernel_size, stride, dilation, is_causal, query.device)
-    repeats = query.shape[-2] // key.shape[-2]
-    q = query.detach().double().requires_grad_(True)
-    k = key.detach().double().requires_grad_(True)
-    v = value.detach().double().requires_grad_(True)
-    k_g = k.repeat_interleave(repeats, dim=-2) if repeats > 1 else k
-    v_g = v.repeat_interleave(repeats, dim=-2) if repeats > 1 else v
-    scores = torch.einsum("qhd,khd->hqk", q, k_g) * query.shape[-1] ** -0.5
-    scores = scores.masked_fill(~mask, -torch.inf)
-    output = torch.einsum("hqk,khd->qhd", scores.softmax(-1), v_g)
-    lse = torch.logsumexp(scores, dim=-1).transpose(0, 1)
-    grads = torch.autograd.grad(output, (q, k, v), gradient.detach().double())
-    return (output.detach(), lse.detach(), *grads)
-
-
-def _assert_near_reference(test, packed, isolated, reference, dtype, message: str):
-    """The packed and the isolated call reach the same float64 answer down
-    different lowerings; neither is the other's oracle, so the packed one is
-    only required not to be more than twice as far off, plus one ulp.
-    """
-    ref = reference.detach().double()
-    allowed = 2 * float((isolated.detach().double() - ref).abs().max()) + _dtype_ulp(
-        float(ref.abs().max()), dtype
-    )
-    actual = float((packed.detach().double() - ref).abs().max())
-    test.assertLessEqual(actual, allowed, message)
 
 
 def _run_oracle_case(case: VarlenCase) -> None:
@@ -619,13 +469,17 @@ class VarlenDegenerateAxesOracleTests(unittest.TestCase):
             query[image_start:image_end] * key[image_start:image_end]
         ).sum(-1)
         rows = list(range(image_start, image_end))
-        _assert_product_close(
-            self, output[rows], value[rows], dtype, "image output is V"
+        _assert_check(
+            self,
+            dtype_interval(output[rows], value[rows], dtype),
+            "image output is V",
         )
         gradient = torch.randn_like(output)
         dq, dk, dv = torch.autograd.grad(output, (query, key, value), gradient)
-        _assert_product_close(
-            self, dv[rows], gradient[rows], dtype, "image dV is the upstream gradient"
+        _assert_check(
+            self,
+            dtype_interval(dv[rows], gradient[rows], dtype),
+            "image dV is the upstream gradient",
         )
         _assert_single_key_rows(
             self, rows, query, key, value, gradient, dq, dk, dtype, scale
@@ -741,16 +595,20 @@ class VarlenMixedPackTests(unittest.TestCase):
                         expected_v = v.repeat_interleave(repeats, dim=1)
                         grouped = grad.reshape(14, heads_kv, repeats, 24)
                         expected_dv = grouped.sum(2)
-                        _assert_product_close(
-                            self, out[rows], expected_v[rows], dtype, "output is V"
-                        )
-                        _assert_product_close(
+                        _assert_check(
                             self,
-                            dv,
-                            expected_dv,
-                            dtype,
+                            dtype_interval(out[rows], expected_v[rows], dtype),
+                            "output is V",
+                        )
+                        _assert_check(
+                            self,
+                            dtype_interval(
+                                dv,
+                                expected_dv,
+                                dtype,
+                                magnitude=grouped.abs().sum(2),
+                            ),
                             "dV routes grad_output",
-                            magnitude=grouped.abs().sum(2),
                         )
                         # Every other query's upstream gradient is zero, so
                         # its dQ/dK stay exactly zero whatever this row does.
@@ -783,7 +641,7 @@ class VarlenMixedPackTests(unittest.TestCase):
             (((1, 9, 11), (1, 8, 10)), (5, 4, 4), (True, False, False), 1, 1),
             (((1, 9, 11), (7, 9, 11)), (5, 4, 4), (True, False, False), 4, 2),
         )
-        names = ("out", "lse", "dQ", "dK", "dV")
+        names = ("out", "lse", "dq", "dk", "dv")
         for seed in (0, 1907):
             for dtype in (torch.float32, torch.float16, torch.bfloat16):
                 for shapes, kernel, causal, heads, heads_kv in cases:
@@ -840,7 +698,8 @@ class VarlenMixedPackTests(unittest.TestCase):
                                 ref_lse,
                                 *torch.autograd.grad(ref_out, leaves, grad[window]),
                             )
-                            if 1 not in shape:
+                            rule = document_comparison_rule(kernel, ones, shapes, shape)
+                            if rule == "bitwise":
                                 # Same kernel family either way, so the pack
                                 # must not perturb this document at all.
                                 for name, actual, expected in zip(
@@ -851,24 +710,20 @@ class VarlenMixedPackTests(unittest.TestCase):
                                         f"{name} of {shape}",
                                     )
                                 continue
-                            reference = _dense_reference(
-                                *leaves,
-                                shape,
-                                kernel,
-                                ones,
-                                ones,
-                                causal,
-                                grad[window],
-                            )
-                            for name, actual, expected, exact in zip(
-                                names, packed, isolated, reference
-                            ):
-                                _assert_near_reference(
+                            # The third rule (a document the pack computes as
+                            # single-key rows while its isolated call answers
+                            # exactly) needs the rank-1 residual gate instead
+                            # of a reference interval, and no case here asks
+                            # for it -- one that does must bring that gate.
+                            self.assertEqual(rule, "reference-interval", str(shape))
+                            mask = document_mask(shape, kernel, ones, ones, causal)
+                            reference = dense_reference(*leaves, grad[window], mask)
+                            for name, actual, expected in zip(names, packed, isolated):
+                                _assert_check(
                                     self,
-                                    actual[window],
-                                    expected,
-                                    exact,
-                                    torch.float32 if name == "lse" else dtype,
+                                    reference_interval(
+                                        actual[window], expected, reference[name]
+                                    ),
                                     f"{name} of {shape}",
                                 )
 
@@ -1544,9 +1399,9 @@ class VarlenEmptyDocumentInsertionTests(unittest.TestCase):
         query, _, value = tensors
         rank = layout.rank
         result, dispatch = _lower_with_mock_dispatch(layout, kernel_size, tensors)
-        effective = tuple(
-            min(k, extent) for k, extent in zip(kernel_size, layout.uniform_shape)
-        )
+        # This class's cases never pass dilation to _call, so it is (1,) *
+        # rank throughout -- effective_kernel's dilation branch is inert here.
+        effective = effective_kernel(kernel_size, (1,) * rank, layout.uniform_shape)
         keep = tuple(axis for axis, k in enumerate(effective) if k > 1)
 
         if route == "identity":

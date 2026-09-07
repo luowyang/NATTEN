@@ -45,7 +45,6 @@ import natten
 import pytest
 import torch
 from natten.backends import cutlass_fna_generic
-from natten.types import DimensionType
 from natten.utils.testing import skip_if_libnatten_is_not_supported
 from torch import Tensor
 
@@ -56,20 +55,13 @@ from .utils import (
     _set_deterministic,
     VarlenCase,
 )
+from .varlen_numerics import effective_kernel
 
 _VARLEN_FN_BY_RANK: Dict[int, Callable[..., Any]] = {
     1: natten.na1d_varlen,
     2: natten.na2d_varlen,
     3: natten.na3d_varlen,
 }
-
-
-def _effective_kernel(
-    shape: DimensionType, kernel_size: DimensionType, dilation: DimensionType
-) -> Tuple[int, ...]:
-    return tuple(
-        k if d > 1 else min(k, e) for k, e, d in zip(kernel_size, shape, dilation)
-    )
 
 
 # Each case is a uniform layout (every document sharing `case.layouts[0]`);
@@ -214,7 +206,7 @@ class VarlenUniformDispatchTests(unittest.TestCase):
             # Uniform layouts build no varlen schedule: the memo stays empty.
             self.assertEqual(len(layout._memo), 0)
 
-            k_eff = _effective_kernel(shape, case.kernel_size, case.dilation)
+            k_eff = effective_kernel(case.kernel_size, case.dilation, shape)
             q_view = query_ref.view(num_docs, *shape, case.heads, case.head_dim)
             k_view = key_ref.view(num_docs, *shape, case.heads_kv, case.head_dim)
             v_view = value_ref.view(num_docs, *shape, case.heads_kv, case.head_dim_v)

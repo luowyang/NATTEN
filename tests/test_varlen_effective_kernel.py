@@ -58,6 +58,7 @@ from .utils import (
     _tolerances,
     VarlenCase,
 )
+from .varlen_numerics import effective_kernel
 
 _VARLEN_FN_BY_RANK: Dict[int, Callable[..., Any]] = {
     1: natten.na1d_varlen,
@@ -76,16 +77,6 @@ _FP32_FWD_ATOL = 3e-4
 _FP32_GRAD_ATOL = 4e-4
 
 
-def _effective_kernel(
-    doc_layout: DimensionType,
-    kernel_size: DimensionType,
-    dilation: DimensionType,
-) -> Tuple[int, ...]:
-    return tuple(
-        k if d > 1 else min(k, e) for k, e, d in zip(kernel_size, doc_layout, dilation)
-    )
-
-
 def _clamped_document_reference(
     doc_layout: DimensionType,
     kernel_size: DimensionType,
@@ -102,7 +93,7 @@ def _clamped_document_reference(
 ) -> Tuple[Tensor, Tensor]:
     """fp32 forward+backward reference for one document under the
     effective-kernel clamp; see the module docstring for the method."""
-    effective_kernel = _effective_kernel(doc_layout, kernel_size, dilation)
+    clamped_kernel = effective_kernel(kernel_size, dilation, doc_layout)
     keep_axes = tuple(i for i, e in enumerate(doc_layout) if e > 1)
     head_dim = q_doc.shape[-1]
     scale_value = scale if scale is not None else head_dim**-0.5
@@ -118,7 +109,7 @@ def _clamped_document_reference(
         lse = scale_value * (q_doc.float() * k_expanded).sum(-1)
         return v_expanded, lse
 
-    reduced_kernel = tuple(effective_kernel[i] for i in keep_axes)
+    reduced_kernel = tuple(clamped_kernel[i] for i in keep_axes)
     reduced_stride = tuple(stride[i] for i in keep_axes)
     reduced_dilation = tuple(dilation[i] for i in keep_axes)
     reduced_causal = tuple(is_causal[i] for i in keep_axes)

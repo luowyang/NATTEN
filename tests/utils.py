@@ -36,6 +36,8 @@ from natten.utils import log
 from natten.utils.checks import check_all_args
 from torch import Tensor
 
+from .varlen_numerics import axis_neighbors
+
 logger = log.get_logger("natten_tests")
 
 
@@ -1033,32 +1035,6 @@ def _independent_reference(
     return output, logsumexp, covered
 
 
-def _window_positions(
-    index: int,
-    extent: int,
-    kernel_size: int,
-    stride: int,
-    dilation: int,
-    causal: bool,
-) -> Tuple[int, ...]:
-    residue = index % dilation
-    local_index = index // dilation
-    local_extent = (extent - residue + dilation - 1) // dilation
-    if causal:
-        leader = min((local_index // stride) * stride + stride - 1, local_extent - 1)
-        start = max(leader - kernel_size + 1, 0)
-        end = min(local_index + 1, local_extent)
-    else:
-        leader = min((local_index // stride) * stride + stride // 2, local_extent - 1)
-        radius_left = kernel_size // 2
-        radius_right = kernel_size // 2 + (kernel_size % 2 - 1)
-        start = max(leader - radius_left, 0)
-        if leader + radius_right >= local_extent:
-            start += local_extent - radius_right - leader - 1
-        end = start + kernel_size
-    return tuple(residue + local * dilation for local in range(start, end))
-
-
 def _flatten_index(coord: Dimension, layout: Dimension) -> int:
     index = 0
     for axis, extent in zip(coord, layout):
@@ -1085,7 +1061,7 @@ def _explicit_oracle(
     scale = query.shape[-1] ** -0.5 if scale is None else scale
     for coord in itertools.product(*(range(extent) for extent in layout)):
         key_axes = tuple(
-            _window_positions(i, n, k, s, d, c)
+            axis_neighbors(i, n, k, s, d, c)
             for i, n, k, s, d, c in zip(
                 coord, layout, kernel_size, stride, dilation, is_causal
             )
