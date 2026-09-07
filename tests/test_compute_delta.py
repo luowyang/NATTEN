@@ -105,6 +105,24 @@ class ComputeDeltaTests(unittest.TestCase):
             )
 
     @skip_if_libnatten_is_not_supported()
+    def test_exactly_representable_dot_products(self):
+        for dtype in (torch.float32, torch.float16, torch.bfloat16):
+            if dtype == torch.float16 and not supports_float16(torch.device("cuda")):
+                continue
+            if dtype == torch.bfloat16 and not supports_bfloat16(torch.device("cuda")):
+                continue
+            for value in (0, 1, 1 + 2**-7, 256, 2**-14):
+                with self.subTest(dtype=dtype, value=value):
+                    out = torch.full((2, 19, 3, 60), value, device="cuda", dtype=dtype)
+                    expected = out.double().square().sum(-1)
+                    self.assertTrue(torch.equal(expected, expected.float().double()))
+                    delta = torch.empty(
+                        out.shape[:-1], device="cuda", dtype=torch.float32
+                    )
+                    compute_delta(out, out, delta)
+                    torch.testing.assert_close(delta.double(), expected, atol=0, rtol=0)
+
+    @skip_if_libnatten_is_not_supported()
     def test_against_pt_reference(self):
         # (batch, seqlen, heads, head_dim)
         input_sizes = [

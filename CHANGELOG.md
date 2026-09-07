@@ -1,6 +1,11 @@
 # Changelog
 
 ## [Main branch]
+* Fixed precision loss in the CUTLASS `dO * O` reduction kernel: each product
+  was formed in the input element type before reaching the FP32 accumulator, so
+  on FP16/BF16 it could round early, underflow to zero, or overflow to `Inf`
+  and turn a whole row into `NaN` once a masked position contributed `0 * Inf`.
+  Both operands are converted to FP32 first.
 
 ## [0.21.7] - 2026-07-26
 * Switched to int64 strides in cutlass-fna to avoid overflows in larger use cases.
