@@ -502,7 +502,14 @@ def check_args_against_input(
     na_dim = input_tensor.dim() - 3
     input_size = input_tensor.shape[1 : 1 + na_dim]
 
-    if any(k * d > x for x, k, d in zip(input_size, kernel_size, dilation)):
+    # A kernel_size = 1 axis is not a window: it mixes nothing, dilation has no
+    # effect on it, and neighborhood_attention_generic lowers it away before any
+    # backend sees it, so the only thing the input has to supply there is a
+    # token. Every other axis has to fit kernel_size * dilation.
+    if any(
+        (k * d if k > 1 else 1) > x
+        for x, k, d in zip(input_size, kernel_size, dilation)
+    ):
         raise ValueError(
             "The product of kernel size and dilation cannot be larger than input size "
             f"along any dimension, got {input_size=} ({input_tensor.shape=}), "

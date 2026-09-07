@@ -76,6 +76,11 @@
   API contracts, and paired packed-versus-per-document timings, each with its
   own verdict rather than one composite score. `docs/mixed-batch-bench.md`
   describes what every mode judges and what its verdicts do not cover.
+* `na1d`/`na2d`/`na3d` now accept a `kernel_size` of `1` along any axis: that axis mixes nothing,
+  and is lowered away in Python (folded or permuted into the batch dimension, or short-circuited
+  to an identity if every axis is `1`) before reaching a backend kernel. `is_causal` and
+  `dilation` have no effect on such an axis, and it imposes no `kernel_size * dilation` fit
+  requirement on the input's extent there.
 
 ## [0.21.7] - 2026-07-26
 * Switched to int64 strides in cutlass-fna to avoid overflows in larger use cases.

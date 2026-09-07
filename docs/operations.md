@@ -15,6 +15,17 @@ best configuration.
 
 ## Neighborhood Attention
 
+A `kernel_size` entry may be `1`: that axis mixes nothing (each query attends only to the token
+sharing its coordinate on that axis), and `is_causal`/`dilation` have no effect there (`stride`
+is then forced to `1`, since it can never exceed `kernel_size`). Such an axis is lowered away in
+Python -- folded (zero-copy, for a leading run) or permuted (gather in, scatter back, for the
+rest) -- before reaching a backend kernel, which only ever sees `kernel_size >= 2`; if every axis
+is `1`, the call short-circuits to `output = value`, `logsumexp = scale * (query *
+key).sum(-1)`, with no kernel launch. Explicit tile shapes, `backward_kv_splits`,
+`additional_keys`/`additional_values`, and `attention_kwargs` are not supported together with a
+`kernel_size = 1` axis, since lowering changes the call's rank (or bypasses the kernel
+altogether).
+
 ::: natten
     options:
           heading_level: 3
