@@ -566,7 +566,7 @@ class VarlenLayoutGpuMechanismTests(unittest.TestCase):
         # Deliberately unmaterialized (no device= at construction): the
         # fast-return path must not force materialization.
         layout = VarlenLayout(layouts)
-        self.assertIsNone(layout._device)
+        self.assertIsNone(layout.device)
 
         query = torch.zeros(
             0, heads, head_dim, device="cuda", dtype=dtype, requires_grad=True
@@ -591,9 +591,9 @@ class VarlenLayoutGpuMechanismTests(unittest.TestCase):
             self.assertEqual(tensor.grad.shape, tensor.shape)
 
         # The fast-return path runs entirely before _resolve/materialize:
-        # no memo entry, and the layout is still unmaterialized.
-        self.assertEqual(len(layout._memo), 0)
-        self.assertIsNone(layout._device)
+        # the layout is still unmaterialized, and a resolved schedule would
+        # have pinned it.
+        self.assertIsNone(layout.device)
 
     def test_all_empty_layout_returns_zero_token_outputs_1d(self):
         self._run_all_empty_case(1, ((0,), (0,)))

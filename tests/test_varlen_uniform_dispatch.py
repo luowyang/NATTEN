@@ -40,6 +40,7 @@ fixed-shape CUTLASS FNA kernel" means here.
 
 import unittest
 from typing import Any, Callable, Dict, Tuple
+from unittest import mock
 
 import natten
 import pytest
@@ -191,20 +192,26 @@ class VarlenUniformDispatchTests(unittest.TestCase):
             layout = _make_layout(case)
             varlen_fn = _VARLEN_FN_BY_RANK[case.rank]
 
-            output, logsumexp = varlen_fn(
-                query,
-                key,
-                value,
-                layout,
-                kernel_size=case.kernel_size,
-                stride=case.stride,
-                dilation=case.dilation,
-                is_causal=case.is_causal,
-                return_lse=True,
-            )
+            with mock.patch(
+                "natten.backends.varlen_fna.cutlass_fna_generic",
+                wraps=cutlass_fna_generic,
+            ) as fixed_dispatch:
+                output, logsumexp = varlen_fn(
+                    query,
+                    key,
+                    value,
+                    layout,
+                    kernel_size=case.kernel_size,
+                    stride=case.stride,
+                    dilation=case.dilation,
+                    is_causal=case.is_causal,
+                    return_lse=True,
+                )
 
-            # Uniform layouts build no varlen schedule: the memo stays empty.
-            self.assertEqual(len(layout._memo), 0)
+            # A uniform layout is answered by the fixed-shape kernels, which
+            # the varlen entry point reaches through this one dispatch; no
+            # varlen schedule is built for it.
+            fixed_dispatch.assert_called_once()
 
             k_eff = effective_kernel(case.kernel_size, case.dilation, shape)
             q_view = query_ref.view(num_docs, *shape, case.heads, case.head_dim)
@@ -286,22 +293,28 @@ class VarlenUniformDispatchTests(unittest.TestCase):
         value_ref = value.detach().clone().requires_grad_(True)
 
         layout = natten.VarlenLayout((shape,) * num_docs, device="cuda")
-        output, lse = natten.na1d_varlen(
-            query,
-            key,
-            value,
-            layout,
-            kernel_size=kernel_size,
-            stride=stride,
-            dilation=dilation,
-            is_causal=is_causal,
-            q_tile_shape=q_tile_shape,
-            kv_tile_shape=kv_tile_shape,
-            backward_q_tile_shape=backward_q_tile_shape,
-            backward_kv_tile_shape=backward_kv_tile_shape,
-            return_lse=True,
-        )
-        self.assertEqual(len(layout._memo), 0)
+        with mock.patch(
+            "natten.backends.varlen_fna.cutlass_fna_generic",
+            wraps=cutlass_fna_generic,
+        ) as fixed_dispatch:
+            output, lse = natten.na1d_varlen(
+                query,
+                key,
+                value,
+                layout,
+                kernel_size=kernel_size,
+                stride=stride,
+                dilation=dilation,
+                is_causal=is_causal,
+                q_tile_shape=q_tile_shape,
+                kv_tile_shape=kv_tile_shape,
+                backward_q_tile_shape=backward_q_tile_shape,
+                backward_kv_tile_shape=backward_kv_tile_shape,
+                return_lse=True,
+            )
+        # Explicit tile shapes do not take this layout off the fixed-shape
+        # dispatch: they are forwarded to it.
+        fixed_dispatch.assert_called_once()
 
         q_view = query_ref.view(num_docs, *shape, heads, head_dim)
         k_view = key_ref.view(num_docs, *shape, heads, head_dim)
@@ -341,8 +354,14 @@ class VarlenUniformDispatchTests(unittest.TestCase):
         query = torch.randn(14, 2, 16, device="cuda", dtype=torch.float16)
         key = torch.randn(14, 2, 16, device="cuda", dtype=torch.float16)
         value = torch.randn(14, 2, 16, device="cuda", dtype=torch.float16)
-        natten.na1d_varlen(query, key, value, layout, kernel_size=3)
-        self.assertEqual(len(layout._memo), 1)
+        with mock.patch(
+            "natten.backends.varlen_fna.cutlass_fna_generic",
+            wraps=cutlass_fna_generic,
+        ) as fixed_dispatch:
+            natten.na1d_varlen(query, key, value, layout, kernel_size=3)
+        # The fixed-shape dispatch is the uniform layouts' path only: a pack
+        # whose documents differ answers on the varlen kernel instead.
+        fixed_dispatch.assert_not_called()
 
     @skip_if_libnatten_is_not_supported()
     def test_torch_compile_fullgraph_matches_eager(self):

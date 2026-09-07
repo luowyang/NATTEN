@@ -840,7 +840,12 @@ class VarlenDegenerateAxesIdentityTests(unittest.TestCase):
         output, lse = varlen_fn(
             query, key, value, layout, kernel_size=kernel_size, return_lse=True
         )
-        self.assertEqual(len(layout._memo), 0)
+        # The identity path answers the whole call itself: the residual
+        # dispatch the lowering would otherwise make is never reached.
+        _, dispatch = _lower_with_mock_dispatch(
+            layout, kernel_size, (query, key, value)
+        )
+        dispatch.assert_not_called()
 
         repeats = heads // heads_kv
         if heads != heads_kv:
@@ -912,7 +917,8 @@ class VarlenDegenerateAxesIdentityTests(unittest.TestCase):
         ):
             output = natten.na1d_varlen(query, key, value, layout, kernel_size=1)
             output.sum().backward()
-        self.assertEqual(len(layout._memo), 0)
+        _, dispatch = _lower_with_mock_dispatch(layout, (1,), (query, key, value))
+        dispatch.assert_not_called()
         # Sanity: the mocks above are wired to the same symbols the
         # production code imports (not a stale/unused patch target).
         self.assertIs(varlen_na1d_forward, natten._libnatten.varlen_na1d_forward)
