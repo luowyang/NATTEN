@@ -706,6 +706,76 @@ class DegenerateAxisErrorTest(unittest.TestCase):
 
 
 # -----------------------------------------------------------------------------------------------
+# dilation on a degenerate axis: inert, and imposing no fit requirement on the extent.
+# -----------------------------------------------------------------------------------------------
+
+# na_fn, input shape, kernel_size, dilation. Every case carries a dilation > 1 on at least one
+# kernel_size = 1 axis, over a leading, a trailing and a both-ends position, and one case puts a
+# dilated real window beside a degenerate one.
+_DEGENERATE_DILATION_CASES = (
+    ("identity-r1", na1d, (1, 1, 2, 32), (1,), (2,)),
+    ("fold-r2", na2d, (1, 1, 8, 2, 32), (1, 3), (2, 1)),
+    ("fold-r2-dilated-window", na2d, (1, 1, 8, 2, 32), (1, 3), (2, 2)),
+    ("permute-r2", na2d, (1, 8, 1, 2, 32), (3, 1), (1, 2)),
+    ("fold-r3", na3d, (1, 1, 1, 8, 2, 32), (1, 1, 3), (2, 3, 1)),
+    ("permute-r3", na3d, (1, 4, 1, 4, 2, 32), (3, 1, 3), (1, 2, 1)),
+    ("fold-then-permute-r3", na3d, (1, 1, 4, 1, 2, 32), (1, 3, 1), (2, 1, 3)),
+)
+
+
+class DegenerateAxisDilationTest(_DegenerateAxesTestBase):
+    """A kernel_size = 1 axis mixes nothing and is lowered away, so its dilation has no effect
+    and the extent it spans has no kernel_size * dilation to fit -- docs/operations.md's contract.
+    Each case is run twice, once with the dilation and once with every degenerate axis's dilation
+    set to 1, and compared bitwise on the output and all three gradients.
+    """
+
+    @skip_if_libnatten_is_not_supported()
+    def test_dilation_on_a_degenerate_axis_is_inert(self):
+        for name, na_fn, shape, kernel_size, dilation in _DEGENERATE_DILATION_CASES:
+            baseline = tuple(1 if k == 1 else d for k, d in zip(kernel_size, dilation))
+            for backend in ["cutlass-fna", None]:
+                with self.subTest(case=name, backend=backend):
+                    _reset_everything()
+                    inputs = tuple(
+                        torch.randn(*shape, device="cuda", dtype=torch.float32)
+                        for _ in range(3)
+                    )
+                    gradient = torch.randn_like(inputs[0])
+
+                    def run(dilation_arg):
+                        leaves = tuple(
+                            x.detach().clone().requires_grad_(True) for x in inputs
+                        )
+                        out = na_fn(
+                            *leaves,
+                            kernel_size=kernel_size,
+                            dilation=dilation_arg,
+                            backend=backend,
+                        )
+                        return (out, *torch.autograd.grad(out, leaves, gradient))
+
+                    for tensor_name, actual, expected in zip(
+                        ("out", "dq", "dk", "dv"), run(dilation), run(baseline)
+                    ):
+                        self.assertTrue(
+                            torch.equal(actual, expected),
+                            f"{name}: {tensor_name} differs under {dilation=}",
+                        )
+
+    def test_fit_check_kept_on_a_real_window(self):
+        # The same extent-1 axis under kernel_size > 1 is a window the input has to fit, and does
+        # not. Raises before any backend or device is touched.
+        q = torch.randn(1, 1, 8, 2, 8)
+        with self.assertRaises(ValueError):
+            na2d(q, q, q, kernel_size=(3, 3), dilation=(2, 1))
+        # And a degenerate axis still needs one token to attend to.
+        empty = torch.randn(1, 0, 8, 2, 8)
+        with self.assertRaises(ValueError):
+            na2d(empty, empty, empty, kernel_size=(1, 3), dilation=(2, 1))
+
+
+# -----------------------------------------------------------------------------------------------
 # torch.compile(fullgraph=True) smoke tests
 # -----------------------------------------------------------------------------------------------
 
