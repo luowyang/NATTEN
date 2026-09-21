@@ -91,6 +91,10 @@
 * A CUTLASS kernel the Hopper and Blackwell FNA/FMHA backends fail to launch
   now raises instead of printing one line to `stderr` and returning, which left
   the caller holding an uninitialized output tensor.
+* Fixed a 32-bit overflow in the CUTLASS FMHA forward's batch offsets for
+  output, the output accumulator and logsumexp: `batch_id * num_queries` was
+  formed in 32 bits before being widened, so it wrapped once batch times
+  sequence length passed `2^32`.
 
 ## [0.21.7] - 2026-07-26
 * Switched to int64 strides in cutlass-fna to avoid overflows in larger use cases.
