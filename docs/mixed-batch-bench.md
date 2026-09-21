@@ -104,7 +104,7 @@ python scripts/bench_mixed_batch.py --mode properties --graph-seed 41011 \
 | --- | --- | --- |
 | Generic properties | `--mode properties --graph-seed 41011` | The real-dtype gradient comparison, plus the default 24 graphs and six property classes; a different seed generates another batch of graphs, and the original geometries are written to `plan.json` |
 | Reproducing one item | `--mode properties --graph-seed 41011 --case graph-1088301 --property connectivity` | `--case` and `--property` may be repeated; a case name must belong to the given seed's graph set |
-| Fixed regressions | `--mode regressions` | 44 fixed entries: 41 regression cases, plus the compute-delta known answer, cross-layer layout reuse and the bench's own oracle self-check |
+| Fixed regressions | `--mode regressions` | 47 fixed entries: 44 regression cases, plus the compute-delta known answer, cross-layer layout reuse and the bench's own oracle self-check |
 | Execution and API | `--mode contracts` | Includes a multi-GPU test and needs two visible devices; a single group can be selected with `--case execution` and the like |
 | Efficiency | `--mode performance --samples 30` | 12 load types, keeping the A/B and A/A samples per stage; select a load with `--case` |
 | Timing self-check | `--mode performance --case perf-downstream-throughput --samples 4 --performance-smoke` | Marked `SMOKE_ONLY`; not a performance result |

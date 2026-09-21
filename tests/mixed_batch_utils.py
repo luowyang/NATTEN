@@ -416,6 +416,22 @@ def capability_cases():
                 focus=(0, 0),
             )
         )
+        cases.append(
+            C(
+                "single-key-image-column-" + dtype,
+                "singleton document, every row driven",
+                ((1, 4, 4), (7, 4, 4)),
+                (5, 1, 1),
+                (True, False, False),
+                dtype=dtype,
+                heads=8,
+                kv_heads=8,
+                dim=64,
+                vdim=64,
+                scale=0.5,
+                seed=271828,
+            )
+        )
     return tuple(cases)
 
 

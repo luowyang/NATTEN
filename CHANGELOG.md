@@ -70,7 +70,9 @@
   quantizes it to a float32 next to 1.0: the flash-style backward recomputes
   the softmax weight from a transposed GEMM rather than reusing the forward's
   exact `exp(0) = 1`, so `dV = P * dO` misses the `1 * dO` product the gate had
-  been holding it to.
+  been holding it to. The regression set gains a fully degenerate document
+  whose every row carries an upstream gradient, since the previous single-key
+  fixtures drove one row each and could not show the deviation.
 
 ## [0.21.7] - 2026-07-26
 * Switched to int64 strides in cutlass-fna to avoid overflows in larger use cases.
