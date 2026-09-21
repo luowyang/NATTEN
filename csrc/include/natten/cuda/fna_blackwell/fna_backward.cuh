@@ -23,6 +23,9 @@
 
 #pragma once
 
+#include <stdexcept>
+#include <string>
+
 #include "cute/tensor.hpp"
 
 #include "cutlass/cutlass.h"
@@ -235,9 +238,10 @@ struct KernelBackward {
     // Run
     status = op.run(stream);
     if (status != cutlass::Status::kSuccess) {
-      std::cerr << "Failed to launch the CUTLASS kernel. Last CUDA error is: "
-                << cudaGetErrorString(cudaGetLastError()) << std::endl;
-      return;
+      throw std::runtime_error(
+          std::string(
+              "Failed to launch the CUTLASS kernel. Last CUDA error is: ") +
+          cudaGetErrorString(cudaGetLastError()));
     }
   }
 };

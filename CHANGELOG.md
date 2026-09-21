@@ -88,6 +88,9 @@
   batches. Output, logsumexp and gradients are bit-for-bit what a caller
   chunking the batch by hand gets, and what a batch of 65535 or less got
   before.
+* A CUTLASS kernel the Hopper and Blackwell FNA/FMHA backends fail to launch
+  now raises instead of printing one line to `stderr` and returning, which left
+  the caller holding an uninitialized output tensor.
 
 ## [0.21.7] - 2026-07-26
 * Switched to int64 strides in cutlass-fna to avoid overflows in larger use cases.
