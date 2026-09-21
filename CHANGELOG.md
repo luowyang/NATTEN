@@ -81,6 +81,13 @@
   to an identity if every axis is `1`) before reaching a backend kernel. `is_causal` and
   `dilation` have no effect on such an axis, and it imposes no `kernel_size * dilation` fit
   requirement on the input's extent there.
+* Fixed-shape CUTLASS FNA accepts any batch size. It maps batch onto
+  `gridDim.z`, which CUDA caps at 65535, so a larger batch used to fail the
+  launch -- in the forward, and in both the `dO * O` reduction and the backward
+  kernel itself. All three now launch one grid per chunk of at most 65535
+  batches. Output, logsumexp and gradients are bit-for-bit what a caller
+  chunking the batch by hand gets, and what a batch of 65535 or less got
+  before.
 
 ## [0.21.7] - 2026-07-26
 * Switched to int64 strides in cutlass-fna to avoid overflows in larger use cases.

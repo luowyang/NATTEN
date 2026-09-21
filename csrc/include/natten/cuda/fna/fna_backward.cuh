@@ -39,6 +39,8 @@
 
 #pragma once
 
+#include <algorithm>
+
 #include <natten/cuda/utils/cuda.h>
 #include <natten/natten.h>
 #include <natten/cuda/utils/cutlass.cuh>
@@ -165,14 +167,6 @@ void fna_backward_generic(
 
     p.num_splits_key = tuple_to_na_dim<Dim>(num_splits_key);
 
-    int64_t size_bytes = p.workspace_size();
-    if (size_bytes) {
-      void* workspace_ptr = nullptr;
-      alloc_bytes(
-          &workspace_ptr, size_bytes, true /*p.should_zero_workspace()*/);
-      p.workspace = (float*)workspace_ptr;
-    }
-
     Kernel::check_supported(p);
 
     if (smem_bytes > 0xc000) {
@@ -205,7 +199,72 @@ void fna_backward_generic(
         checkBinaryArchMatches(), "Something went wrong in the build process");
 #endif
 
-    kernel_fn<<<p.getBlocksGrid(), p.getThreadsGrid(), smem_bytes, stream>>>(p);
+    if constexpr (Kernel::kIsVarlen) {
+      // Varlen indexes work items along grid.x and holds grid.z at 1
+      // (Params::getBlocksGrid in kernel_backward.h), so one launch covers any
+      // number of documents.
+      int64_t size_bytes = p.workspace_size();
+      if (size_bytes) {
+        void* workspace_ptr = nullptr;
+        alloc_bytes(
+            &workspace_ptr, size_bytes, true /*p.should_zero_workspace()*/);
+        p.workspace = (float*)workspace_ptr;
+      }
+      kernel_fn<<<p.getBlocksGrid(), p.getThreadsGrid(), smem_bytes, stream>>>(
+          p);
+    } else {
+      // Fixed shape maps batch onto grid.z (`batch_id = blockIdx.z` in
+      // Params::advance_to_block, kernel_backward.h), and CUDA caps gridDim.z
+      // at 65535. Launch one grid per chunk of at most that many batches, and
+      // add on the host the batch offset the kernel adds on the device for the
+      // batches a chunk starts past.
+      constexpr int32_t kMaxBatchPerLaunch = 65535;
+      const int64_t spatial =
+          static_cast<int64_t>(natten::flatten(spatial_extent));
+      // q/k_strideB = num_queries.prod() * num_heads * head_dim, and
+      // v/o_strideB = num_queries.prod() * num_heads * head_dim_value
+      // (kernel_backward.h, the `q_strideB` block in advance_to_block); the
+      // gradient tensors share the layout of the tensors they belong to.
+      const int64_t qk_strideB = spatial * heads * dim;
+      const int64_t vo_strideB = spatial * heads * dim_value;
+      // logsumexp_ptr and delta_ptr both advance by
+      // batch_id * num_queries.prod32() * num_heads (kernel_backward.h, the
+      // logsumexp_ptr and delta_ptr lines in advance_to_block).
+      const int64_t lse_strideB = spatial * heads;
+      for (int32_t batch_start = 0; batch_start < batch_size;
+           batch_start += kMaxBatchPerLaunch) {
+        auto pc = p;
+        pc.num_batches = std::min(kMaxBatchPerLaunch, batch_size - batch_start);
+        pc.query_ptr += batch_start * qk_strideB;
+        pc.grad_query_ptr += batch_start * qk_strideB;
+        pc.key_ptr += batch_start * qk_strideB;
+        pc.grad_key_ptr += batch_start * qk_strideB;
+        pc.value_ptr += batch_start * vo_strideB;
+        pc.grad_value_ptr += batch_start * vo_strideB;
+        pc.output_ptr += batch_start * vo_strideB;
+        pc.grad_output_ptr += batch_start * vo_strideB;
+        pc.logsumexp_ptr += batch_start * lse_strideB;
+        pc.delta_ptr += batch_start * lse_strideB;
+        // The workspace is a flat array of (batch, head, dilation) slots whose
+        // size, workspace_strideBH(), does not depend on num_batches
+        // (kernel_backward.h, the workspace line in advance_to_block), so a
+        // zero-filled buffer sized for one chunk is addressed exactly the way
+        // that chunk's slice of a whole-batch buffer would be. It also holds
+        // the peak workspace footprint at one chunk instead of the whole batch.
+        int64_t size_bytes = pc.workspace_size();
+        if (size_bytes) {
+          void* workspace_ptr = nullptr;
+          alloc_bytes(
+              &workspace_ptr, size_bytes, true /*pc.should_zero_workspace()*/);
+          pc.workspace = (float*)workspace_ptr;
+        }
+        kernel_fn<<<
+            pc.getBlocksGrid(),
+            pc.getThreadsGrid(),
+            smem_bytes,
+            stream>>>(pc);
+      }
+    }
 
     // if (size_bytes) {
     //   // NATTEN_CHECK(

@@ -23,6 +23,8 @@
 
 #pragma once
 
+#include <algorithm>
+
 #include <natten/natten.h>
 #ifdef NATTEN_WITH_CUTLASS
 #include <natten/cuda/reduction/fmha_kernel_bwd_sum_OdO.hpp>
@@ -53,43 +55,59 @@ void compute_delta(
 
   OperationSumOdO op_sum_OdO;
 
-  ProblemShape problem_shape = cute::make_tuple(batch, heads, seqlen_Q, dim);
   // Keep dynamic strides int64-typed so device-side coordinate * stride
   // address arithmetic is evaluated in 64 bits.
   const int64_t q_stride =
       static_cast<int64_t>(dim) * static_cast<int64_t>(heads);
   const int64_t batch_stride = q_stride * static_cast<int64_t>(seqlen_Q);
+  const int64_t sum_OdO_batch_stride =
+      static_cast<int64_t>(heads) * static_cast<int64_t>(seqlen_Q);
   auto stride_O =
       make_stride(batch_stride, static_cast<int64_t>(dim), q_stride, _1{});
   auto stride_dO = stride_O;
-  auto stride_sum_OdO = make_stride(
-      static_cast<int64_t>(heads) * static_cast<int64_t>(seqlen_Q),
-      _1{},
-      static_cast<int64_t>(heads));
+  auto stride_sum_OdO =
+      make_stride(sum_OdO_batch_stride, _1{}, static_cast<int64_t>(heads));
 
-  auto args = typename OperationSumOdO::Arguments{
-      problem_shape,
-      ptr_O,
-      stride_O,
-      ptr_dO,
-      stride_dO,
-      ptr_sum_OdO,
-      stride_sum_OdO};
+  // The kernel maps batch onto grid.z (`blockIdx.z * get<0>(stride)` in
+  // FmhaKernelBwdSumOdO::operator(), fmha_kernel_bwd_sum_OdO.hpp), and CUDA
+  // caps gridDim.z at 65535. Launch one grid per chunk of at most that many
+  // batches, and add on the host the batch offset the kernel adds on the
+  // device for the batches a chunk starts past. Every (batch, head, query)
+  // block computes an independent dot product, so chunking changes nothing
+  // about what any block does.
+  constexpr int kMaxBatchPerLaunch = 65535;
+  for (int batch_start = 0; batch_start < batch;
+       batch_start += kMaxBatchPerLaunch) {
+    ProblemShape problem_shape = cute::make_tuple(
+        std::min(kMaxBatchPerLaunch, batch - batch_start),
+        heads,
+        seqlen_Q,
+        dim);
 
-  auto status = OperationSumOdO::can_implement(args);
-  if (status != cutlass::Status::kSuccess) {
-    NATTEN_FAILURE(
-        "`compute_delta` kernel is not supported for this use case.");
-  }
+    auto args = typename OperationSumOdO::Arguments{
+        problem_shape,
+        ptr_O + batch_start * batch_stride,
+        stride_O,
+        ptr_dO + batch_start * batch_stride,
+        stride_dO,
+        ptr_sum_OdO + batch_start * sum_OdO_batch_stride,
+        stride_sum_OdO};
 
-  status = op_sum_OdO.initialize(args, nullptr, stream);
-  if (status != cutlass::Status::kSuccess) {
-    NATTEN_FAILURE("`compute_delta` kernel failed to initialize.");
-  }
+    auto status = OperationSumOdO::can_implement(args);
+    if (status != cutlass::Status::kSuccess) {
+      NATTEN_FAILURE(
+          "`compute_delta` kernel is not supported for this use case.");
+    }
 
-  auto result = op_sum_OdO.run(stream);
-  if (result != cutlass::Status::kSuccess) {
-    NATTEN_FAILURE("`compute_delta` kernel launch failed.");
+    status = op_sum_OdO.initialize(args, nullptr, stream);
+    if (status != cutlass::Status::kSuccess) {
+      NATTEN_FAILURE("`compute_delta` kernel failed to initialize.");
+    }
+
+    auto result = op_sum_OdO.run(stream);
+    if (result != cutlass::Status::kSuccess) {
+      NATTEN_FAILURE("`compute_delta` kernel launch failed.");
+    }
   }
 #else
   NATTEN_FAILURE(
