@@ -1,0 +1,65 @@
+name: nightly
+
+# The nightly trigger for this fork's wheel build. This file is the only
+# thing this fork adds to `main`, which is otherwise an untouched mirror
+# of upstream SHI-Labs/NATTEN; everything else fork-specific lives on the
+# `fork-ci` branch (see .github/README-fork-ci.md there).
+#
+# WHY IT HAS TO BE HERE. GitHub only fires `schedule` from a repository's
+# DEFAULT branch, and this fork's default branch is `main`. A copy of this
+# workflow on `fork-ci` would never be scheduled, no matter what its cron
+# said. So the schedule lives on `main` and does nothing but dispatch the
+# real build, which stays on `fork-ci` with the rest of the CI.
+#
+# WHY A DISPATCH WORKS AT ALL. Events created with the automatic
+# GITHUB_TOKEN deliberately do not start new workflow runs, to keep
+# workflows from triggering each other in a loop -- `workflow_dispatch`
+# and `repository_dispatch` are the two documented exceptions, which is
+# exactly what this job uses.
+#
+# THE TWO REFS ARE DIFFERENT THINGS, and both matter:
+#   --ref fork-ci   picks which copy of the wheel.yml FILE runs, so a
+#                   nightly always uses the current fork-ci workflow even
+#                   when `dev` was last assembled from an older one.
+#   -f ref=dev      picks what actually gets checked out and built.
+#
+# 19:00 UTC is 03:00 the next day in Beijing, so a nightly is finished
+# and downloadable by the start of the working day. GitHub runs scheduled
+# workflows on a best-effort basis and can delay them under load; a
+# missed night costs nothing, since the next dispatch rebuilds the same
+# `dev` and the wheel is reproducible from the tag either way.
+
+on:
+  schedule:
+    - cron: '0 19 * * *'
+  workflow_dispatch: {}
+
+jobs:
+  dispatch-nightly-wheel:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: write   # the only permission this job needs: dispatching a
+                        # workflow run is actions-scoped. It creates no
+                        # tag, release or commit of its own -- wheel.yml
+                        # does all of that, under its own `contents:
+                        # write`. The repo default is read-only (checked
+                        # via `gh api repos/luowyang/NATTEN/actions/
+                        # permissions/workflow`), so this must be declared
+                        # to elevate it.
+    steps:
+      - name: Dispatch wheel.yml on the nightly channel
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # No checkout: `gh` is preinstalled on hosted runners and
+          # --repo names the target explicitly, so this job needs nothing
+          # from the working directory.
+          gh workflow run wheel.yml \
+            --repo luowyang/NATTEN \
+            --ref fork-ci \
+            -f ref=dev \
+            -f channel=nightly
+          echo "Dispatched wheel.yml (--ref fork-ci, ref=dev, channel=nightly)."
+          echo "The run appears under the wheel workflow, not this one: ${{ github.server_url }}/${{ github.repository }}/actions/workflows/wheel.yml"
