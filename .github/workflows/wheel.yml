@@ -1,8 +1,25 @@
 name: wheel
 
-# Builds the NATTEN fork wheel on GitHub-hosted runners, then (tag
-# builds only) publishes a GitHub Release with the wheel attached. See
-# .github/README-fork-ci.md for the full tag -> release flow.
+# Builds the NATTEN fork wheel on GitHub-hosted runners, then publishes
+# it according to the run's CHANNEL. See .github/README-fork-ci.md for
+# the full channel -> release flow.
+#
+# THREE CHANNELS, ONE PIPELINE (gate -> warm -> build). Everything up to
+# and including the wheel is identical in all three; the channel only
+# decides what version the wheel carries and where it goes afterwards:
+#   - release  a fork/* tag. Version comes from src/natten/version.py as
+#              assemble.sh stamped it. Publishes a normal (not pre-)
+#              GitHub Release on that tag, kept forever.
+#   - nightly  a dispatch with channel=nightly (normally from nightly.yml
+#              on the default branch, which is the only place GitHub
+#              fires `schedule` from). CI stamps
+#              <newest fork/* tag's version>.dev<UTC date>, which PEP 440
+#              orders after the last release and before the next one, and
+#              publishes a pre-release tagged nightly/<UTC date>, pruned
+#              after 14 days.
+#   - warm     a dev push, or any dispatch that names no tag. Publishes
+#              nothing; the point is the 30-day workflow artifact and a
+#              warm sccache for whatever release or nightly comes next.
 #
 # The build runs on GitHub-hosted runners because the organization's
 # network does not allow self-hosted runners to reach GitHub Actions;
@@ -15,10 +32,13 @@ name: wheel
 # build/test tooling (integration/build_wheel.sh and friends) -- unrelated
 # to and unaffected by this workflow.
 #
-# THREE JOBS, `gate` then (conditionally) `warm` then `build`. `warm`
-# fans a cold compile across SHARD_COUNT runners to prime sccache;
-# `build` produces the real wheel. `gate` skips `warm` when an earlier
-# successful build recorded the same compilation fingerprint. A stale
+# THREE JOBS, `gate` then (conditionally) `warm` then `build`. `gate`
+# resolves the channel (above) and decides whether `warm` is needed;
+# `warm` fans a cold compile across SHARD_COUNT runners to prime sccache;
+# `build` produces the real wheel and publishes it per the channel. `gate`
+# skips `warm` when an earlier successful build recorded the same
+# compilation fingerprint -- the channel is deliberately not part of that
+# fingerprint, since all three compile the identical tree. A stale
 # marker can only cost time: sccache independently keys every object
 # from its real compiler inputs, and `build` compiles any miss from
 # source. Shared setup for `warm` and `build` lives in
@@ -44,24 +64,41 @@ name: wheel
 # Triggers:
 #   - push of a tag matching fork/* (the normal release path: assemble.sh
 #     ... --tag, then `git push origin refs/tags/fork/<version>`)
+#   - push to dev (the warm channel: keeps sccache current with the
+#     integration branch, so the next release or nightly is cheap)
 #   - workflow_dispatch, with a `ref` input (tag, branch, or commit) to
-#     build, and a `cache_namespace` input (see below). The workflow
-#     *definition* always comes from whatever ref the dispatch itself
-#     targets (`gh workflow run wheel.yml --ref ...`); `inputs.ref`
-#     decouples that from what actually gets checked out and built, so
-#     e.g. dispatching from fork-ci can still build and publish a release
-#     for an already-existing tag like fork/0.21.7+fork.2.
+#     build, a `channel` input (see above), and a `cache_namespace` input
+#     (see below). The workflow *definition* always comes from whatever
+#     ref the dispatch itself targets (`gh workflow run wheel.yml --ref
+#     ...`); `inputs.ref` decouples that from what actually gets checked
+#     out and built, so e.g. dispatching from fork-ci can still build and
+#     publish a release for an already-existing tag like
+#     fork/0.21.7+fork.2, and nightly.yml on the default branch can
+#     dispatch --ref fork-ci -f ref=dev to build today's dev with
+#     today's workflow file.
 
 on:
   push:
     tags:
       - 'fork/*'
+    branches:
+      - dev
   workflow_dispatch:
     inputs:
       ref:
         description: 'Ref (tag/branch/sha) to check out and build. Blank on a manual dispatch = the ref this workflow run itself was dispatched against.'
         required: false
         default: ''
+      channel:
+        description: 'Build channel. auto = fork/* tag -> release, anything else -> warm.'
+        required: false
+        default: auto
+        type: choice
+        options:
+          - auto
+          - release
+          - nightly
+          - warm
       cache_namespace:
         description: 'Optional sccache cache namespace (SCCACHE_GHA_VERSION). Set to a value nothing has used before to force a cold build (e.g. for testing); leave blank for normal use, including tag-triggered releases.'
         required: false
@@ -72,11 +109,17 @@ concurrency:
   cancel-in-progress: false
 
 permissions:
-  contents: write   # needed for the tag-build release step AND the
-                     # ci-logs branch pushes (both jobs); repo default is
-                     # read-only (checked via `gh api repos/luowyang/
-                     # NATTEN/actions/permissions/workflow`), so this
-                     # must be declared here to elevate it.
+  contents: write   # needed for the publish steps AND the ci-logs branch
+                     # pushes (both jobs); repo default is read-only
+                     # (checked via `gh api repos/luowyang/NATTEN/
+                     # actions/permissions/workflow`), so this must be
+                     # declared here to elevate it. `contents: write` is
+                     # also the whole of what the nightly channel needs:
+                     # creating the nightly/<date> tag and release, and
+                     # deleting an expired one with --cleanup-tag, are
+                     # all contents-scoped. Nothing here dispatches a
+                     # workflow, so no `actions: write` -- that lives in
+                     # nightly.yml on the default branch, which does.
 
 env:
   SHARD_COUNT: "8"   # Number of jobs.warm.strategy.matrix.shard entries.
@@ -141,12 +184,107 @@ jobs:
       warm_needed: ${{ steps.decide.outputs.warm_needed }}
       cache_key: ${{ steps.fingerprint.outputs.cache_key }}
       fingerprint: ${{ steps.fingerprint.outputs.fingerprint }}
+      channel: ${{ steps.channel.outputs.channel }}
+      build_ref: ${{ steps.channel.outputs.build_ref }}
+      base_tag: ${{ steps.channel.outputs.base_tag }}
+      publish: ${{ steps.channel.outputs.publish }}
+      nightly_tag: ${{ steps.channel.outputs.nightly_tag }}
+      nightly_version: ${{ steps.channel.outputs.nightly_version }}
     steps:
       - name: Checkout
         uses: actions/checkout@v7
         with:
           ref: ${{ inputs.ref }}
           submodules: false
+
+      - name: Resolve channel
+        id: channel
+        env:
+          INPUT_REF: ${{ inputs.ref }}
+          INPUT_CHANNEL: ${{ inputs.channel }}
+        run: |
+          set -euo pipefail
+          # Nothing resolved here feeds the fingerprint below, deliberately:
+          # all three channels compile the identical tree with the identical
+          # flags, so they must share one marker and one set of sccache
+          # entries. A nightly of an unchanged dev is meant to hit the
+          # marker that yesterday's build saved and skip the warm shards.
+
+          # What gets built: `inputs.ref` when a dispatch names one,
+          # otherwise the ref this run was triggered on (a fork/* tag push,
+          # a dev push, or a dispatch that left `ref` blank). Checked by
+          # name, not by github.ref_type, because github.ref_type describes
+          # the ref the *run* was dispatched against (e.g. the fork-ci
+          # branch), not the ref actually built.
+          BUILD_REF="$INPUT_REF"
+          if [[ -z "$BUILD_REF" ]]; then
+            BUILD_REF="${{ github.ref_name }}"
+          fi
+
+          # The `inputs` context is empty on a push event, so a blank
+          # channel means "auto" there just as it does for a dispatch left
+          # at the input's default.
+          CHANNEL="${INPUT_CHANNEL:-auto}"
+          if [[ "$CHANNEL" == "auto" ]]; then
+            if [[ "$BUILD_REF" == fork/* ]]; then
+              CHANNEL=release
+            else
+              CHANNEL=warm
+            fi
+          fi
+
+          BASE_TAG=""
+          NIGHTLY_TAG=""
+          NIGHTLY_VERSION=""
+          case "$CHANNEL" in
+            release)
+              # A release is named after the tag it builds, so the built
+              # ref has to actually be one -- refuse rather than invent a
+              # release name for a branch.
+              if [[ "$BUILD_REF" != fork/* ]]; then
+                echo "::error::gate: channel=release needs a fork/* tag as the built ref, got '$BUILD_REF'. Dispatch with -f ref=fork/<version>, or use channel=warm."
+                exit 1
+              fi
+              PUBLISH=true
+              ;;
+            nightly)
+              # A nightly is versioned relative to the last release:
+              # "<newest fork/* tag's version>.dev<UTC date>". `sort -V`
+              # compares digit runs numerically, so fork.10 beats fork.9
+              # and a base-version bump beats both; `--refs` drops the
+              # ^{} peel lines annotated tags add (fork/0.21.7+fork.2 is
+              # annotated, fork/0.21.7+fork.3 is not).
+              BASE_TAG="$(git ls-remote --tags --refs origin 'refs/tags/fork/*' \
+                          | sed 's#.*refs/tags/##' | sort -V | tail -n 1)"
+              if [[ -z "$BASE_TAG" ]]; then
+                echo "::error::gate: channel=nightly found no fork/* tag to express a version against."
+                exit 1
+              fi
+              # Resolved once, here, so the version, the release tag and
+              # the manifest cannot disagree if the build itself straddles
+              # midnight UTC.
+              NIGHTLY_DATE="$(date -u +%Y%m%d)"
+              NIGHTLY_TAG="nightly/${NIGHTLY_DATE}"
+              NIGHTLY_VERSION="${BASE_TAG#fork/}.dev${NIGHTLY_DATE}"
+              PUBLISH=true
+              ;;
+            warm)
+              PUBLISH=false
+              ;;
+            *)
+              echo "::error::gate: unknown channel '$CHANNEL' (expected auto, release, nightly or warm)."
+              exit 1
+              ;;
+          esac
+
+          {
+            echo "channel=$CHANNEL"
+            echo "build_ref=$BUILD_REF"
+            echo "base_tag=$BASE_TAG"
+            echo "publish=$PUBLISH"
+            echo "nightly_tag=$NIGHTLY_TAG"
+            echo "nightly_version=$NIGHTLY_VERSION"
+          } | tee -a "$GITHUB_OUTPUT"
 
       - name: Compute fingerprint
         id: fingerprint
@@ -390,12 +528,16 @@ jobs:
   build:
     needs: [gate, warm]   # gate: this job reads its marker outputs below.
                             # warm: the cache it was meant to prime, if it ran.
-    if: ${{ !cancelled() }}   # Run even if warm was skipped (gate decided
-                               # it wasn't needed) or a shard failed --
-                               # `build` then simply compiles whatever
-                               # that shard would have primed the cache
-                               # for, itself, cold. Only skip on
-                               # cancellation.
+    if: ${{ !cancelled() && needs.gate.outputs.channel != '' }}
+      # Run even if warm was skipped (gate decided it wasn't needed) or a
+      # shard failed -- `build` then simply compiles whatever that shard
+      # would have primed the cache for, itself, cold. A failed `gate`
+      # must not block the build either: its fingerprint work is a
+      # scheduling hint, and a failed job still publishes the outputs its
+      # steps did set. The one exception is a gate that could not resolve
+      # a channel at all (e.g. channel=release against a branch): there is
+      # then no version to stamp and nowhere to publish, so spending up to
+      # six hours of runner time on the wheel would buy nothing.
     runs-on: ubuntu-latest
     timeout-minutes: 360   # a cold, uncached CUDA compile on a 4-vCPU hosted
                             # runner is far slower than the 39-worker dev-
@@ -407,29 +549,6 @@ jobs:
                             # at the full cold-build budget as a backstop in
                             # case a shard failed or the cache didn't take.
     steps:
-      - name: Resolve build ref
-        id: resolve_ref
-        run: |
-          set -euo pipefail
-          BUILD_REF="${{ inputs.ref }}"
-          if [[ -z "$BUILD_REF" ]]; then
-            BUILD_REF="${{ github.ref_name }}"
-          fi
-          echo "build_ref=$BUILD_REF" >> "$GITHUB_OUTPUT"
-          # A release only makes sense, and only gets attempted, for a ref
-          # that IS one of this fork's fork/<version> tags -- checked by
-          # name, not by github.ref_type, because github.ref_type reflects
-          # the ref the *workflow run* was dispatched against (e.g. the
-          # fork-ci branch), not `inputs.ref` (the ref actually built). A
-          # branch push or a dispatch naming a plain branch both correctly
-          # fall through to "artifact only".
-          if [[ "$BUILD_REF" == fork/* ]]; then
-            echo "is_tag_build=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "is_tag_build=false" >> "$GITHUB_OUTPUT"
-          fi
-          echo "Building ref: $BUILD_REF (tag build: $([[ "$BUILD_REF" == fork/* ]] && echo true || echo false))"
-
       - name: Checkout
         uses: actions/checkout@v7
         with:
@@ -471,7 +590,8 @@ jobs:
           # incidental nonzero from something like an empty `git diff`.
           {
             echo "wheel.yml run ${{ github.run_id }} attempt ${{ github.run_attempt }}: build starting"
-            echo "Ref built: ${{ steps.resolve_ref.outputs.build_ref }}"
+            echo "Ref built: ${{ needs.gate.outputs.build_ref }}"
+            echo "Channel: ${{ needs.gate.outputs.channel }}"
             echo "warm job result: ${{ needs.warm.result }}"
             date -u
             echo
@@ -507,6 +627,39 @@ jobs:
             echo "Pushed: runs/${{ github.run_id }}-${{ github.run_attempt }}/started.txt on ci-logs"
           fi
           exit 0
+
+      - name: Stamp nightly version
+        id: stamp
+        if: needs.gate.outputs.channel == 'nightly'
+        env:
+          NIGHTLY_VERSION: ${{ needs.gate.outputs.nightly_version }}
+        run: |
+          set -euo pipefail
+          # A nightly builds a branch, not a tag, so nothing has stamped a
+          # version for it. setup.py's get_version() reads
+          # src/natten/version.py and nothing else -- there is no
+          # environment override -- so rewriting that one line is the only
+          # hook, and it is the same one integration/assemble.sh uses for a
+          # fork/* tag. Left uncommitted on purpose: `git rev-parse HEAD`
+          # below must keep naming the commit that was actually built.
+          #
+          # CACHE-SAFE, which is why a daily stamp does not make every
+          # nightly cold: the version string never reaches a compiler.
+          # setup.py builds its cmake invocation as a fixed list with no
+          # version define, and csrc/CMakeLists.txt has no configure_file
+          # and no PROJECT_VERSION, so every nvcc command line -- and
+          # therefore every sccache key, and therefore everything the warm
+          # shards primed without stamping -- is byte-identical to an
+          # unstamped build of the same tree. Verified against a full
+          # NATTEN_VERBOSE=1 build log of 0.21.7+fork.3: the version string
+          # appears only in egg-info/dist-info/wheel-filename lines, in
+          # none of that build's 176 nvcc invocations.
+          sed -i -E "s/^__version__[[:space:]]*=.*/__version__ = \"${NIGHTLY_VERSION}\"/" src/natten/version.py
+          if ! grep -qxF "__version__ = \"${NIGHTLY_VERSION}\"" src/natten/version.py; then
+            echo "::error::stamp: src/natten/version.py did not take the nightly version ${NIGHTLY_VERSION} -- its format may have changed since this sed was written."
+            exit 1
+          fi
+          grep -m1 '^__version__' src/natten/version.py
 
       - name: Build wheel
         id: build
@@ -644,13 +797,70 @@ jobs:
           path: gate-marker.txt
           key: ${{ needs.gate.outputs.cache_key }}
 
+      - name: Decide publication
+        id: publication
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CHANNEL: ${{ needs.gate.outputs.channel }}
+          PUBLISH: ${{ needs.gate.outputs.publish }}
+        run: |
+          set -euo pipefail
+          # Decided here, before the manifest, so the manifest can state
+          # the outcome; the publish steps below just act on it.
+          BUILT_SHA="$(git rev-parse HEAD)"
+          PUBLISHED=not-a-publishing-channel
+          if [[ "$PUBLISH" == "true" ]]; then
+            PUBLISHED=yes
+          fi
+
+          PREV_TAG=""
+          PREV_SHA=""
+          if [[ "$CHANNEL" == "nightly" ]]; then
+            # Rebuilding an unchanged dev is still worth doing (it keeps
+            # sccache current), but there is nothing new to hand a
+            # consumer, so it does not get its own pre-release. Tag names
+            # are nightly/<YYYYMMDD>, fixed width, so a plain string sort
+            # is chronological.
+            PREV_TAG="$(gh release list --repo luowyang/NATTEN --limit 200 --json tagName \
+                        --jq '[.[].tagName | select(startswith("nightly/"))] | sort | last // empty')"
+            if [[ -n "$PREV_TAG" ]]; then
+              # Every lookup here degrades to "publish": an unreadable
+              # previous nightly must not turn a transient API blip into a
+              # silently skipped release. Publishing one nightly too many
+              # costs a tag; skipping one silently costs a day.
+              PREV_SHA="$(gh release view "$PREV_TAG" --repo luowyang/NATTEN --json targetCommitish --jq .targetCommitish || echo "")"
+              # A nightly this workflow published carries the built sha,
+              # because `gh release create --target <sha>` on a tag that
+              # does not exist yet stores exactly that. One created any
+              # other way carries a branch name instead -- the existing
+              # fork/0.21.7+fork.2 release reads "main" today -- so fall
+              # back to what the tag itself points at.
+              if [[ ! "$PREV_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+                PREV_SHA="$(gh api "repos/luowyang/NATTEN/git/ref/tags/$PREV_TAG" --jq '.object.sha' || echo "")"
+              fi
+              if [[ "$PREV_SHA" == "$BUILT_SHA" ]]; then
+                PUBLISHED=skipped-unchanged
+              fi
+            fi
+          fi
+
+          {
+            echo "built_sha=$BUILT_SHA"
+            echo "published=$PUBLISHED"
+          } >> "$GITHUB_OUTPUT"
+          echo "channel=$CHANNEL built_sha=$BUILT_SHA newest_nightly=${PREV_TAG:-(none)} newest_nightly_sha=${PREV_SHA:-(n/a)} published=$PUBLISHED"
+
       - name: Build manifest
         id: manifest
+        env:
+          CHANNEL: ${{ needs.gate.outputs.channel }}
+          BASE_TAG: ${{ needs.gate.outputs.base_tag }}
+          PUBLISHED: ${{ steps.publication.outputs.published }}
         run: |
           set -euo pipefail
           SHA256="$(sha256sum "$WHEEL" | awk '{print $1}')"
           VERSION="$(python -c 'import natten; print(natten.__version__)')"
-          BUILT_COMMIT="$(git rev-parse HEAD)"
+          BUILT_COMMIT="${{ steps.publication.outputs.built_sha }}"
           MANIFEST="dist/MANIFEST-${VERSION}.txt"
           {
             echo "NATTEN fork CI build manifest"
@@ -660,9 +870,12 @@ jobs:
             echo "Built (UTC)        : $(date -u +%Y-%m-%dT%H:%M:%SZ)"
             echo "natten.__version__ : $VERSION"
             echo
+            echo "Channel            : $CHANNEL"
+            echo "Published          : $PUBLISHED"
+            echo "Base tag           : ${BASE_TAG:-(n/a -- only a nightly is versioned against a tag)}"
             echo "Built from commit  : $BUILT_COMMIT"
             echo "Workflow commit    : ${{ github.sha }}"
-            echo "Ref built          : ${{ steps.resolve_ref.outputs.build_ref }}"
+            echo "Ref built          : ${{ needs.gate.outputs.build_ref }}"
             echo "Workflow run       : ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
             echo
             echo "Toolchain:"
@@ -695,14 +908,14 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
-      - name: Create or update GitHub Release (fork/* tag builds only)
+      - name: Create or update GitHub Release (release channel)
         id: release
-        if: steps.resolve_ref.outputs.is_tag_build == 'true'
+        if: needs.gate.outputs.channel == 'release'
         env:
           GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.gate.outputs.build_ref }}
         run: |
           set -euo pipefail
-          TAG="${{ steps.resolve_ref.outputs.build_ref }}"
           echo "Publishing release for tag $TAG: $WHEEL + $MANIFEST"
           if gh release view "$TAG" --repo luowyang/NATTEN >/dev/null 2>&1; then
             # The tag's release may already exist (e.g. created by hand,
@@ -710,12 +923,71 @@ jobs:
             # delete/recreate it, just attach/replace these two assets.
             gh release upload "$TAG" "$WHEEL" "$MANIFEST" --repo luowyang/NATTEN --clobber
           else
+            # No --prerelease: fork/* IS this fork's release channel, and
+            # marking it pre-release hides it from "latest" and from any
+            # consumer tooling that only looks at full releases. Nightlies
+            # are the pre-releases here.
             gh release create "$TAG" "$WHEEL" "$MANIFEST" \
               --repo luowyang/NATTEN \
+              --title "$TAG" \
+              --notes-file "$MANIFEST"
+          fi
+
+      - name: Publish nightly pre-release
+        id: nightly_release
+        if: needs.gate.outputs.channel == 'nightly' && steps.publication.outputs.published == 'yes'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.gate.outputs.nightly_tag }}
+          BUILT_SHA: ${{ steps.publication.outputs.built_sha }}
+        run: |
+          set -euo pipefail
+          echo "Publishing nightly $TAG at $BUILT_SHA: $WHEEL + $MANIFEST"
+          if gh release view "$TAG" --repo luowyang/NATTEN >/dev/null 2>&1; then
+            # Same UTC day, changed dev. Git tags are not moved here, so
+            # replace the assets and say so plainly: the tag keeps pointing
+            # at the commit the day's first build used, while the manifest
+            # inside these assets records the commit actually built.
+            echo "$TAG already exists; replacing its assets. Its tag still points at the commit this UTC day's first nightly built."
+            gh release upload "$TAG" "$WHEEL" "$MANIFEST" --repo luowyang/NATTEN --clobber
+          else
+            # --target pins the new tag to the commit actually built, which
+            # is what the next nightly's unchanged-check reads back.
+            gh release create "$TAG" "$WHEEL" "$MANIFEST" \
+              --repo luowyang/NATTEN \
+              --target "$BUILT_SHA" \
               --title "$TAG" \
               --notes-file "$MANIFEST" \
               --prerelease
           fi
+
+      - name: Prune nightly pre-releases older than 14 days
+        id: prune_nightlies
+        if: needs.gate.outputs.channel == 'nightly'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # Runs on every nightly, including one that skipped publishing:
+          # retention describes what is on the releases page, not whether
+          # today's build had anything new to say. Only nightly/<YYYYMMDD>
+          # tags are ever considered here -- fork/* releases are permanent
+          # and this step must never look at one.
+          CUTOFF="$(date -u -d '14 days ago' +%Y%m%d)"
+          mapfile -t TAGS < <(gh release list --repo luowyang/NATTEN --limit 200 --json tagName \
+                              --jq '.[].tagName | select(startswith("nightly/"))')
+          for TAG in "${TAGS[@]}"; do
+            DATE="${TAG#nightly/}"
+            if [[ ! "$DATE" =~ ^[0-9]{8}$ ]]; then
+              echo "Leaving $TAG alone: not a nightly/<YYYYMMDD> tag."
+              continue
+            fi
+            if (( 10#$DATE < 10#$CUTOFF )); then
+              echo "Deleting $TAG (dated before $CUTOFF)."
+              gh release delete "$TAG" --repo luowyang/NATTEN --cleanup-tag --yes
+            fi
+          done
+          echo "Kept every nightly dated $CUTOFF or later."
 
       - name: Relay build log and diagnostics (ci-logs branch)
         id: relay_logs
@@ -766,22 +1038,27 @@ jobs:
 
           {
             echo "wheel.yml run ${{ github.run_id }} attempt ${{ github.run_attempt }}"
-            echo "Ref built    : ${{ steps.resolve_ref.outputs.build_ref }}"
-            echo "Commit       : ${{ github.sha }}"
+            echo "Ref built    : ${{ needs.gate.outputs.build_ref }}"
+            echo "Built commit : ${{ steps.publication.outputs.built_sha }}"
+            echo "Workflow sha : ${{ github.sha }}"
+            echo "Channel      : ${{ needs.gate.outputs.channel }} (publish=${{ needs.gate.outputs.publish }}, published=${{ steps.publication.outputs.published }})"
             echo "Workflow run : ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
             echo "warm job result : ${{ needs.warm.result }}"
             echo "gate decision   : warm_needed=$GATE_WARM_NEEDED fingerprint=$GATE_FINGERPRINT marker_key=$GATE_CACHE_KEY"
             echo
             echo "Step outcomes:"
-            echo "  Resolve build ref                 : ${{ steps.resolve_ref.outcome }}"
             echo "  Prepare build environment          : ${{ steps.prepare.outcome }}"
             echo "  Push started.txt                   : ${{ steps.started_checkpoint.outcome }}"
+            echo "  Stamp nightly version              : ${{ steps.stamp.outcome }}"
             echo "  Build wheel                        : ${{ steps.build.outcome }}"
             echo "  Install wheel + import smoke test  : ${{ steps.install_smoke.outcome }}"
             echo "  Save warm marker                   : ${{ steps.save_marker.outcome }}"
+            echo "  Decide publication                 : ${{ steps.publication.outcome }}"
             echo "  Build manifest                     : ${{ steps.manifest.outcome }}"
             echo "  Upload artifact                    : ${{ steps.upload.outcome }}"
             echo "  Create or update GitHub Release    : ${{ steps.release.outcome }}"
+            echo "  Publish nightly pre-release        : ${{ steps.nightly_release.outcome }}"
+            echo "  Prune nightly pre-releases         : ${{ steps.prune_nightlies.outcome }}"
             echo
             echo "--- df -h ---"
             df -h
