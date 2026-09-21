@@ -6,9 +6,30 @@ go through an upstream PR.
 
 ## What this CI is for
 
-Pushing a tag `fork/<version>` (e.g. `fork/0.21.7+fork.2`) builds a NATTEN wheel and publishes it as a
-GitHub pre-release, so downstream projects can install a specific fork build without building from
-source themselves.
+Building a NATTEN wheel and publishing it where downstream projects can install it, without anyone
+having to build from source themselves. `wheel.yml` does that on three **channels**, in the PyTorch
+tradition: a permanent release you pin against, a nightly you track, and a warm build that publishes
+nothing and only exists to keep the compiler cache current.
+
+| Channel | Triggered by | Version | Published as | Kept |
+| --- | --- | --- | --- | --- |
+| `release` | push of a `fork/*` tag, or a dispatch whose `ref` input is a `fork/*` tag | `src/natten/version.py` exactly as `assemble.sh` stamped it, e.g. `0.21.7+fork.3` | a normal GitHub **Release** on that tag, wheel + manifest attached | permanently |
+| `nightly` | a dispatch with `channel=nightly` — normally the 19:00 UTC schedule in `nightly.yml` on `main` | stamped by CI as `<newest fork/* tag's version>.dev<YYYYMMDD>`, e.g. `0.21.7+fork.3.dev20260922` | a GitHub **pre-release** tagged `nightly/<YYYYMMDD>`, created on the commit that was built, wheel + manifest attached | 14 days, then deleted tag and all |
+| `warm` | push to `dev`, or any dispatch that does not name a `fork/*` tag | whatever the branch already carries | nothing is published — the wheel is a workflow artifact only | 30 days (artifact retention) |
+
+A dispatch picks its channel with the `channel` input; the default, `auto`, means "a `fork/*` tag is a
+release, anything else is warm". All three channels run the identical `gate` → `warm` → `build`
+pipeline and compile the identical tree with identical flags — the channel only decides what version
+the wheel carries and where it goes afterwards.
+
+Why `.dev<date>` sorts where it should: PEP 440 compares local-version labels part by part, so
+`0.21.7+fork.3` < `0.21.7+fork.3.dev20260922` < `0.21.7+fork.4`. A nightly therefore reads, to `pip`
+and to any version-range check, as "after the last release, before the next one", which is exactly
+what it is.
+
+A nightly whose `dev` has not moved since the previous nightly is **built but not published** — the
+build still runs, because that is what keeps sccache warm, but there is no new pre-release, and the
+manifest records `Published: skipped-unchanged`.
 
 Each build targets exactly one combination:
 
@@ -25,14 +46,30 @@ The wheel declares no `torch` dependency (checked: its metadata has no `Requires
 `Requires-Python: >=3.9`), so `pip` will not pull one in for you — install it into an environment that
 already has a matching torch (2.11, cu128).
 
-## Consumer flow: installing a released wheel
+## Consumer flow: installing a wheel
 
-Download the wheel and its manifest for a given tag:
+**Pin a release** (`fork/<version>`) for anything you expect to reproduce later — those are permanent,
+and they are the only thing that is. **Track a nightly** (`nightly/<date>`) only when you need a fix
+that has not been cut into a release yet, and expect it to be gone in 14 days; nothing that has to be
+rebuildable months from now should depend on one. **Never depend on a warm build** — it publishes
+nothing at all, and the workflow artifact it does leave behind is unreachable from this network
+anyway.
+
+Download the wheel and its manifest, by tag:
 
 ```bash
+# a release
 gh release download fork/0.21.7+fork.N --repo luowyang/NATTEN --pattern '*.whl'
 gh release download fork/0.21.7+fork.N --repo luowyang/NATTEN --pattern 'MANIFEST-*.txt'
+
+# a nightly (see `gh release list --repo luowyang/NATTEN` for what still exists)
+gh release download nightly/20260922 --repo luowyang/NATTEN --pattern '*.whl'
+gh release download nightly/20260922 --repo luowyang/NATTEN --pattern 'MANIFEST-*.txt'
 ```
+
+Release attachments are the one GitHub surface this network can reach; Actions artifacts and run logs
+are not (see "Reading CI logs" below). That is why every channel that publishes anything publishes it
+as a release asset.
 
 Verify the wheel against the SHA256 recorded in the manifest before installing it:
 
@@ -51,25 +88,72 @@ pip install --no-deps natten-0.21.7+fork.N-cp311-cp311-linux_x86_64.whl
 `--no-deps` is required (see above: the wheel intentionally declares no dependencies, so a plain
 `pip install` would not fail on a mismatched torch, it would just not know to check).
 
-## Maintainer flow: cutting a release
+The manifest inside each release says which channel produced it (`Channel:`), which commit was built
+(`Built from commit:`), and, for a nightly, which release its version is expressed against
+(`Base tag:`).
+
+## Maintainer flow
 
 `dev` is a throwaway integration branch, rebuilt from scratch each time: `origin/main` (upstream) with
 every topic branch in `integration/branches.txt` merged on top (`integration/assemble.sh`), then one
-commit that stamps a PEP 440 local-version label (`<base>+fork.N`) onto `src/natten/version.py`. `dev`
-itself is never pushed and never opened as a PR; only the tag is pushed. `fork-ci` (this branch) is a
-separate, permanent topic branch carrying just the `.github/` workflow files — `assemble.sh` merges it
-into `dev` like any other topic branch, so every fork build gets these workflows too.
+commit that stamps a PEP 440 local-version label (`<base>+fork.N`) onto `src/natten/version.py`.
+`fork-ci` (this branch) is a separate, permanent topic branch carrying just the `.github/` workflow
+files — `assemble.sh` merges it into `dev` like any other topic branch, so every fork build gets these
+workflows too.
+
+### Cutting a release
 
 ```bash
 integration/assemble.sh N <path-to-fork-checkout> --tag
 git -C <assemble.sh's --worktree, default wt_dev> push origin refs/tags/fork/<version>
 ```
 
-Pushing that tag triggers `wheel.yml`, which builds the wheel, runs a CPU-only import smoke test,
-uploads the wheel + manifest as a workflow artifact, and creates (or updates, if one already exists)
-a GitHub pre-release for the tag with the wheel and manifest attached. `wheel.yml` never deletes or
-recreates a release that already exists — it only creates one if missing, or replaces
-(`--clobber`) the wheel + manifest on an existing one.
+Pushing that tag runs `wheel.yml` on the `release` channel: it builds the wheel, runs a CPU-only
+import smoke test, uploads the wheel + manifest as a workflow artifact, and creates (or updates, if
+one already exists) a GitHub Release for the tag with the wheel and manifest attached. A release is
+**not** marked pre-release — `fork/*` is this fork's real release channel, and a pre-release is
+excluded from "latest" and from tooling that only looks at full releases. `wheel.yml` never deletes or
+recreates a release that already exists; it only creates one if missing, or replaces (`--clobber`) the
+wheel + manifest on an existing one.
+
+If you also push `dev` in the same breath, push it **before** the tag, or expect two runs: a `dev`
+push is a `warm` build in its own right, and the two serialize behind the `wheel-build` concurrency
+group. The warm one is redundant when a tag build of the same tree is already queued.
+
+The `fork/*` releases cut before this changed were created with `--prerelease`, and CI leaves an
+existing release's flags alone. Flip the old ones by hand once, if you want "latest" to mean anything:
+
+```bash
+gh release edit fork/<version> --repo luowyang/NATTEN --prerelease=false
+```
+
+### Keeping the cache warm
+
+Pushing `dev` runs `wheel.yml` on the `warm` channel: same build, nothing published. Its only job is
+to leave sccache warm so the next release or nightly of that tree skips straight to the real build.
+You can also dispatch one by hand against any ref:
+
+```bash
+gh workflow run wheel.yml --repo luowyang/NATTEN --ref fork-ci -f ref=<branch-or-sha> -f channel=warm
+```
+
+### Nightlies
+
+`nightly.yml` on `main` dispatches one every day at 19:00 UTC (03:00 Beijing). To run one by hand:
+
+```bash
+gh workflow run wheel.yml --repo luowyang/NATTEN --ref fork-ci -f ref=dev -f channel=nightly
+```
+
+CI stamps the version itself (`<newest fork/* tag's version>.dev<YYYYMMDD>`) by rewriting
+`src/natten/version.py` in the runner's workspace, without committing it — `setup.py`'s
+`get_version()` reads that file and nothing else, so it is the only hook, and it is the same one
+`assemble.sh` uses for a tag. The stamp cannot make a nightly compile cold: the version string never
+reaches a compiler, so every nvcc command line, and therefore every sccache key, is identical to an
+unstamped build of the same tree.
+
+Nightlies older than 14 days are deleted, tag and all, at the end of each nightly run. Only
+`nightly/<YYYYMMDD>` tags are ever considered; `fork/*` releases are permanent.
 
 ### Backfilling assets for an existing tag
 
@@ -77,13 +161,39 @@ To rebuild and publish a wheel for a tag that already exists (e.g. after a workf
 re-running `assemble.sh`:
 
 ```bash
-gh workflow run wheel.yml --ref fork-ci -f ref=fork/<version>
+gh workflow run wheel.yml --repo luowyang/NATTEN --ref fork-ci -f ref=fork/<version>
 ```
 
 `--ref fork-ci` selects which copy of the workflow *file* runs; `-f ref=fork/<version>` tells it what
-to actually check out and build. This also doubles as the recovery path when a build run is killed by
-the job timeout (see below) — re-dispatch the same command; the build resumes from cache rather than
-starting cold.
+to actually check out and build, and `channel` can be left at `auto` because a `fork/*` ref resolves
+to `release` on its own. This also doubles as the recovery path when a build run is killed by the job
+timeout (see below) — re-dispatch the same command; the build resumes from cache rather than starting
+cold.
+
+## The nightly dispatcher on `main`
+
+`main` is this fork's default branch and an otherwise untouched mirror of upstream. It carries exactly
+one fork-specific file, `.github/workflows/nightly.yml`, for one reason: **GitHub fires `schedule`
+only from the default branch.** A cron on `fork-ci` would never run.
+
+So `nightly.yml` holds the schedule and nothing else. Its single job dispatches the real build:
+
+```bash
+gh workflow run wheel.yml --repo luowyang/NATTEN --ref fork-ci -f ref=dev -f channel=nightly
+```
+
+`--ref fork-ci` and `-f ref=dev` are answering two different questions — which copy of the workflow
+*file* runs, and what gets *built*. Splitting them means a nightly always uses the current `fork-ci`
+workflow, even when `dev` was last assembled from an older one.
+
+The dispatch is also why this works at all: events created with the automatic `GITHUB_TOKEN`
+deliberately do not start new workflow runs, so that workflows cannot trigger each other in a loop.
+`workflow_dispatch` is one of the two documented exceptions. The same rule, plus the fact that
+`wheel.yml`'s push trigger only matches `fork/*` and `dev`, is why the `nightly/<date>` tag a run
+creates for itself cannot start another run.
+
+The job needs `actions: write` and nothing else — it creates no tag, release or commit of its own.
+`wheel.yml` does all of that under its own `contents: write`.
 
 ## Reading CI logs
 
@@ -192,6 +302,11 @@ fingerprint names a tiny marker cache entry.
   preprocessed source, independently of the gate fingerprint, so a stale marker can waste time but
   cannot make the build reuse a stale object.
 
+The channel is deliberately **not** part of the fingerprint, and neither is the nightly version stamp.
+All three channels compile the identical tree with identical flags, so they must share one marker and
+one set of sccache entries — that is what lets a nightly of an unchanged `dev` hit the marker that
+yesterday's build saved and skip the warm shards entirely.
+
 The gate prints its fingerprint and decision in the Actions log; the build repeats them in
 `runs/<run_id>-<attempt>/summary.txt` on `ci-logs`.
 
@@ -265,26 +380,27 @@ correctness. **GPU validation happens outside this CI**, via this fork's own bui
 (`integration/build_wheel.sh`'s own smoke-test phase, `run_extended.sh`, etc.) — those are unrelated to
 and unaffected by anything in `.github/`.
 
-## The three workflows
+## The workflows
 
-- **`ci.yml`** — `ubuntu-latest`, on push to `fork-ci`/`dev` and on `workflow_dispatch`. Lint
-  (`ufmt check`, `flake8`, `mypy` on `src/natten`) plus `tests/test_varlen_layout.py`'s host-only
+- **`ci.yml`** (`fork-ci`) — `ubuntu-latest`, on push to `fork-ci`/`dev` and on `workflow_dispatch`.
+  Lint (`ufmt check`, `flake8`, `mypy` on `src/natten`) plus `tests/test_varlen_layout.py`'s host-only
   classes, when that file exists on the ref being tested (it's added by this fork's varlen topic
   branches, not upstream — see that file's own comment in the workflow for which refs have it). No CUDA
   build.
 
-- **`wheel.yml`** — `ubuntu-latest`, on push of tags matching `fork/*` and on `workflow_dispatch`
-  (inputs: `ref`, `cache_namespace`). Three jobs: `gate` checks whether this exact build fingerprint is
-  already warm; `warm` conditionally runs the sharded precompile described above; `build` always builds
-  the wheel, uploads it + a manifest as an artifact, and on a `fork/*` tag ref creates/updates that tag's
-  GitHub Release.
+- **`wheel.yml`** (`fork-ci`) — `ubuntu-latest`, on push of tags matching `fork/*`, on push to `dev`,
+  and on `workflow_dispatch` (inputs: `ref`, `channel`, `cache_namespace`). Three jobs: `gate` resolves
+  the channel and checks whether this exact build fingerprint is already warm; `warm` conditionally
+  runs the sharded precompile described above; `build` always builds the wheel, uploads it + a manifest
+  as an artifact, and then publishes according to the channel — a Release for `release`, a
+  `nightly/<date>` pre-release plus a 14-day prune for `nightly`, nothing for `warm`.
 
-- **`extended.yml`** — **currently non-functional**, see the status note at the top of the file itself.
-  It targets a self-hosted runner this fork no longer has; a dispatch will queue forever. Left in
-  place, unaddressed, pending a decision (delete it, or redesign what "extended coverage" means without
-  a GPU runner in CI).
+- **`nightly.yml`** (`main`) — the 19:00 UTC schedule, and nothing else. One job, `actions: write`,
+  which dispatches `wheel.yml` on the `nightly` channel. It lives on `main` because that is the only
+  branch GitHub fires `schedule` from; see "The nightly dispatcher on `main`" above.
 
 ## Fork-only
 
-Everything under `.github/` exists only on `fork-ci` (and, once merged, `dev`) — it is never meant to
-go upstream via a PR.
+Everything under `.github/` on `fork-ci` (and, once merged, `dev`) exists only in this fork — it is
+never meant to go upstream via a PR. The same goes for the single `nightly.yml` on `main`, which is
+otherwise an untouched upstream mirror.
