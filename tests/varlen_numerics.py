@@ -116,6 +116,7 @@ def product_interval(
     relative: float = TF32_RELATIVE,
     absolute: float = TF32_ABSOLUTE,
     magnitude=None,
+    widen=None,
 ) -> Dict[str, Any]:
     """Elementwise 3xTF32 product tolerance, for a quantity the kernel obtains by
     multiplying by one.
@@ -125,12 +126,18 @@ def product_interval(
     3xTF32 product per query head, pass the sum of the per-head magnitudes instead:
     each term carries its own error, so a sum that cancels would otherwise buy an
     allowance far below the error it has to cover.
+
+    ``widen`` is an elementwise allowance added on top, for a factor the kernel
+    obtains as something other than an exact one; ``single_key_value_interval``
+    builds the only one of those.
     """
     a = actual.detach().cpu().double()
     b = expected.detach().cpu().double()
     difference = (a - b).abs()
     basis = b.abs() if magnitude is None else magnitude.detach().cpu().double()
     allowed = basis * relative + absolute
+    if widen is not None:
+        allowed = allowed + widen.detach().cpu().double()
     inside = difference <= allowed
     return {
         "pass": bool(torch.isfinite(a).all() and bool(inside.all())),
@@ -139,6 +146,9 @@ def product_interval(
         "of": int(inside.numel()),
         "outside": int((~inside).sum()),
         "max_abs": float(difference.max()) if difference.numel() else 0.0,
+        "max_bound_occupancy": (
+            float((difference / allowed).max()) if difference.numel() else 0.0
+        ),
         "relative": relative,
         "absolute": absolute,
         "magnitude_basis": "expected" if magnitude is None else "pre-sum",
@@ -168,6 +178,58 @@ def dtype_interval(
     if dtype == torch.float32:
         return product_interval(actual, expected, magnitude=magnitude)
     return exact_interval(actual, expected)
+
+
+def single_key_value_interval(
+    actual: torch.Tensor,
+    expected: torch.Tensor,
+    upstream: torch.Tensor,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    dtype: torch.dtype,
+    scale: float,
+) -> Dict[str, Any]:
+    """Gate for the dV of rows whose window holds a single key, whose exact value is
+    the upstream gradient.
+
+    The flash-style backward does not reuse the forward's softmax weight: it recomputes
+    ``P = exp(S * scale - lse)`` from a transposed GEMM whose score differs from the
+    forward's by a few ulps, so such a row's weight comes back as a float32 neighbour of
+    1.0 rather than the exact 1 the forward had, and ``dV = P * dO`` misses the
+    ``1 * dO`` product by ``(P - 1) * dO``. ``single_key_scalar_bound`` on the row's
+    scaled score bounds that exponent, and a float32 next to 1.0 quantizes it away below
+    half the spacing under 1.0 (``2 ** -25``) or to at most that bound plus the largest
+    step above it (``2 ** -24``). The forward keeps the plain product interval -- its
+    weight is ``exp(0)``, exactly 1 -- and fp16/bf16 spacing is coarser than the whole
+    deviation, so they keep the exact gate.
+
+    All five tensors are indexed by the same row, ``key[i]`` being the one key row ``i``
+    sees. A row whose upstream gradient is zero widens by nothing, whatever ``query``
+    and ``key`` hold there.
+    """
+    if dtype != torch.float32:
+        return exact_interval(actual, expected)
+    query = query.detach().cpu()
+    key = key.detach().cpu()
+    magnitude = upstream.detach().cpu().double().abs()
+    rows, heads, vdim = magnitude.shape
+    kv_heads = key.shape[-2]
+    repeats = heads // kv_heads
+    widen = torch.zeros_like(magnitude)
+    for row in range(rows):
+        for head in range(heads):
+            bound = abs(scale) * single_key_scalar_bound(
+                query[row, head], key[row, head // repeats], dtype
+            )
+            quantum = bound + 2.0**-24 if bound >= 2.0**-25 else 0.0
+            widen[row, head] = quantum * magnitude[row, head]
+    grouped = (rows, kv_heads, repeats, vdim)
+    return product_interval(
+        actual,
+        expected,
+        magnitude=magnitude.reshape(grouped).sum(2),
+        widen=widen.reshape(grouped).sum(2),
+    )
 
 
 def rank_one_scalar(

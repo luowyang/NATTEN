@@ -65,6 +65,12 @@
   API contracts, and paired packed-versus-per-document timings, each with its
   own verdict rather than one composite score. `docs/mixed-batch-bench.md`
   describes what every mode judges and what its verdicts do not cover.
+* Widened the single-key-row gate's FP32 `dV` interval by `|dO| * q(b)`, where
+  `b` is the `single_key_scalar_bound` of that row's scaled score and `q`
+  quantizes it to a float32 next to 1.0: the flash-style backward recomputes
+  the softmax weight from a transposed GEMM rather than reusing the forward's
+  exact `exp(0) = 1`, so `dV = P * dO` misses the `1 * dO` product the gate had
+  been holding it to.
 
 ## [0.21.7] - 2026-07-26
 * Switched to int64 strides in cutlass-fna to avoid overflows in larger use cases.

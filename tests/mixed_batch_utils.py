@@ -16,6 +16,7 @@ from .varlen_numerics import (
     rank_one_scalar,
     reference_interval,
     single_key_scalar_bound,
+    single_key_value_interval,
 )
 
 
@@ -656,10 +657,12 @@ def singleton_kernel_checks(result, data, grad, case, row, key):
         .reshape(case.kv_heads, repeats, case.vdim)
         .sum(1)
     )
-    dv_magnitude = torch.zeros_like(expected_dv, dtype=torch.float64)
-    dv_magnitude[key] = (
-        upstream[row].double().abs().reshape(case.kv_heads, repeats, case.vdim).sum(1)
-    )
+    dv_upstream = torch.zeros_like(upstream)
+    dv_upstream[key] = upstream[row]
+    dv_query = torch.zeros_like(q)
+    dv_query[key] = q[row]
+    dv_key = torch.zeros_like(k)
+    dv_key[key] = k[key]
     other_queries = torch.ones(result["dq"].shape[0], dtype=torch.bool)
     other_queries[row] = False
     other_keys = torch.ones(result["dk"].shape[0], dtype=torch.bool)
@@ -753,10 +756,8 @@ def singleton_kernel_checks(result, data, grad, case, row, key):
         "singleton_out_is_v": interval(result["out"][row], expected_out),
         "singleton_dq_zero": dq_check,
         "singleton_dk_zero": dk_check,
-        "singleton_dv_route": (
-            product_interval(result["dv"], expected_dv, magnitude=dv_magnitude)
-            if dtype == torch.float32
-            else exact_interval(result["dv"], expected_dv)
+        "singleton_dv_route": single_key_value_interval(
+            result["dv"], expected_dv, dv_upstream, dv_query, dv_key, dtype, scale
         ),
         "singleton_row": {"row": row, "key": key, "path": "cuda-kernel"},
     }
@@ -810,19 +811,12 @@ def single_key_document_checks(packed, isolated, data, grad, case, lo, hi):
     isolated_slices = {name: value[lo:hi] for name, value in isolated.items()}
 
     if dtype == torch.float32:
-        magnitude = (
-            upstream.double()
-            .abs()
-            .reshape(tokens, case.kv_heads, repeats, case.vdim)
-            .sum(2)
-        )
         out_check = product_interval(slices["out"], isolated_slices["out"])
-        dv_check = product_interval(
-            slices["dv"], isolated_slices["dv"], magnitude=magnitude
-        )
     else:
         out_check = exact_interval(slices["out"], isolated_slices["out"])
-        dv_check = exact_interval(slices["dv"], isolated_slices["dv"])
+    dv_check = single_key_value_interval(
+        slices["dv"], isolated_slices["dv"], upstream, q, k, dtype, scale
+    )
 
     fits = {"dq": [], "dk": []}
     score_bound = torch.zeros(tokens, case.heads, dtype=torch.float64)
