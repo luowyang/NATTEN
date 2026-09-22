@@ -498,6 +498,14 @@ def document_comparison_rule(kernel, dilation, shapes, shape) -> str:
     (``isolated_takes_identity_path``), ``reference-interval`` when it is not:
     a heterogeneous pack leaves this document's narrowing to the CUDA kernel's
     own per-document clamp, which the isolated call does not share.
+
+    ``bitwise`` presumes both sides reach the same kernel family, which is what
+    the bench's ``call`` secures: pack and isolated call are both
+    ``na{1,2,3}d_varlen(..., backend="cutlass-fna")``. The public fixed-shape
+    ``na{1,2,3}d`` answers an axis whose window covers the whole extent with an
+    FMHA kernel instead when no backend is named, and that kernel agrees with
+    CUTLASS FNA only to within rounding, so an isolated reference built on it
+    has to name the backend too.
     """
     if math.prod(shape) == 0:
         return "bitwise"
