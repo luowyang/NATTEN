@@ -219,6 +219,11 @@ void fna_forward_generic(
       // on the host the batch offset the kernel adds on the device for the
       // batches a chunk starts past.
       constexpr int32_t kMaxBatchPerLaunch = 65535;
+      // An empty batch makes no launch at all, and the output tensor belongs
+      // to the caller: report it, which is what the single launch this loop
+      // replaced did (gridDim.z = 0 is an invalid configuration).
+      NATTEN_CHECK(
+          batch_size > 0, "Fixed-shape FNA requires a non-empty batch.");
       const int64_t spatial =
           static_cast<int64_t>(natten::flatten(spatial_extent));
       // q/k_strideB = num_queries.prod() * num_heads * head_dim, and

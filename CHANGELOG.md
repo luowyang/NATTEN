@@ -88,6 +88,10 @@
   batches. Output, logsumexp and gradients are bit-for-bit what a caller
   chunking the batch by hand gets, and what a batch of 65535 or less got
   before.
+* A batch of zero is still an error, in fixed-shape CUTLASS FNA and in the
+  `dO * O` reduction alike: an empty batch has no launch to make, and the
+  chunking above would otherwise hand the caller back its own output tensor
+  untouched.
 * A CUTLASS kernel the Hopper and Blackwell FNA/FMHA backends fail to launch
   now raises instead of printing one line to `stderr` and returning, which left
   the caller holding an uninitialized output tensor. The two status checks those

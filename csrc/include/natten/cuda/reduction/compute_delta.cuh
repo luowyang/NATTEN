@@ -76,6 +76,10 @@ void compute_delta(
   // block computes an independent dot product, so chunking changes nothing
   // about what any block does.
   constexpr int kMaxBatchPerLaunch = 65535;
+  // An empty batch makes no launch at all, and `ptr_sum_OdO` belongs to the
+  // caller: report it, which is what the single launch this loop replaced did
+  // (gridDim.z = 0 is an invalid configuration).
+  NATTEN_CHECK(batch > 0, "`compute_delta` requires a non-empty batch.");
   for (int batch_start = 0; batch_start < batch;
        batch_start += kMaxBatchPerLaunch) {
     ProblemShape problem_shape = cute::make_tuple(

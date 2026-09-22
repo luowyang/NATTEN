@@ -166,6 +166,27 @@ class LargeBatchFNATest(unittest.TestCase):
             dtypes.append(torch.bfloat16)
         return dtypes
 
+    # The other end of the chunk loop: no chunk at all. CUDA rejects a
+    # gridDim.z of 0, so this was an error before the loop existed, and it
+    # stays one.
+    @skip_if_libnatten_is_not_supported()
+    def test_empty_batch_is_rejected(self):
+        for na_op, input_shape, kernel_size in (
+            (na1d, (32,), (5,)),
+            (na2d, (4, 8), (3, 3)),
+        ):
+            for dtype in self._dtypes():
+                with self.subTest(op=na_op.__name__, dtype=dtype):
+                    q, k, v, _ = self._make_inputs(0, input_shape, 1, 32, dtype)
+                    with self.assertRaisesRegex(RuntimeError, "non-empty batch"):
+                        na_op(
+                            q,
+                            k,
+                            v,
+                            kernel_size=kernel_size,
+                            backend="cutlass-fna",
+                        )
+
     # The batches that fit in one launch, and the smallest that does not. These
     # two together are what says "behavior below the limit is unchanged, and the
     # first batch past it agrees with the chunked caller".

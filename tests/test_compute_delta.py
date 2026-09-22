@@ -105,6 +105,16 @@ class ComputeDeltaTests(unittest.TestCase):
             )
 
     @skip_if_libnatten_is_not_supported()
+    def test_empty_batch_is_rejected(self):
+        # The kernel maps batch onto grid.z, which CUDA will not accept as 0,
+        # so an empty batch has no launch to make and is reported as an error.
+        out = torch.randn((0, 16, 2, 32), device="cuda", dtype=torch.float32)
+        d_out = torch.randn_like(out)
+        delta = torch.empty(out.shape[:-1], device="cuda", dtype=torch.float32)
+        with self.assertRaisesRegex(RuntimeError, "non-empty batch"):
+            compute_delta(out, d_out, delta)
+
+    @skip_if_libnatten_is_not_supported()
     def test_exactly_representable_dot_products(self):
         for dtype in (torch.float32, torch.float16, torch.bfloat16):
             if dtype == torch.float16 and not supports_float16(torch.device("cuda")):
