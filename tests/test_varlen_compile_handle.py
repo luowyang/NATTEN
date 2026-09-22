@@ -365,7 +365,14 @@ def test_explicit_tile_shapes_reach_the_compiled_call():
     case = CASES[0]
     query, key, value = _inputs(case, torch.float32)
     layout = natten.VarlenLayout(case.shapes)
-    kwargs = dict(_call_kwargs(case), q_tile_shape=(2, 4, 4), kv_tile_shape=(2, 4, 4))
+    # Ask the library which tile shapes this device/dtype/head_dim supports
+    # rather than hardcoding a pair that may not be in the set.
+    probe = query.new_zeros((1, 1, 1, 1, case.heads, case.head_dim))
+    configs = natten.get_configs_for_cutlass_fna(probe, probe, probe)
+    if not configs:
+        pytest.skip("no CUTLASS FNA forward config for this device")
+    q_tile, kv_tile = configs[0]
+    kwargs = dict(_call_kwargs(case), q_tile_shape=q_tile, kv_tile_shape=kv_tile)
     expected = natten.na3d_varlen(query, key, value, layout, **kwargs)
     actual = _compiled(3)(query, key, value, layout, **kwargs)
     assert torch.equal(expected, actual)
