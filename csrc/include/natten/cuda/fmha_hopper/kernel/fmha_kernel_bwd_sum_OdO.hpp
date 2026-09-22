@@ -173,7 +173,7 @@ struct FmhaKernelBwdSumOdO {
             *reinterpret_cast<const Vec*>(&ptr_dO_bhq[idx_d]);
 
         for (int v = 0; v < kElementsPerLoad; v++) {
-          acc += value_O[v] * value_dO[v];
+          acc += ElementAcc(value_O[v]) * ElementAcc(value_dO[v]);
         }
       }
 
