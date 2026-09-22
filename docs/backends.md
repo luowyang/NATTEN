@@ -88,7 +88,10 @@ on that axis; axes with `kernel_size > 1` and `dilation > 1` still require the
 document to fit `kernel_size * dilation`. A layout whose documents all share
 the same shape (uniform) dispatches to the fixed-shape CUTLASS FNA kernels on a
 batched view instead of building a varlen schedule, matching `na{1,2,3}d(...,
-backend="cutlass-fna")` bit-for-bit.
+backend="cutlass-fna")` bit-for-bit. That match needs the explicit `backend=`:
+with the backend left to `na{1,2,3}d` to pick, a call whose window covers a
+whole axis may be answered by an FMHA kernel instead, which agrees with the
+CUTLASS FNA one only to within rounding.
 
 A `kernel_size` entry may be `1`: that axis mixes nothing (each query
 attends only to tokens sharing its coordinate on that axis), and

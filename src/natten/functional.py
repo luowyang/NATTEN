@@ -663,7 +663,12 @@ def neighborhood_attention_generic(
         additional_keys is not None and additional_values is not None
     )
 
-    if is_self_attention(
+    # `attention` picks an FMHA backend of its own, which is a different kernel
+    # family from anything `backend=` can name, and the two agree only to within
+    # rounding. So the shortcut is taken only when the caller left the choice open;
+    # name a backend and you get that kernel family. To steer the shortcut itself,
+    # pass `attention_kwargs={"backend": ...}`.
+    if backend is None and is_self_attention(
         query,
         kernel_size=kernel_size,
         is_causal=is_causal,
@@ -976,8 +981,9 @@ def na1d(
             [merges][natten.merge_attentions] the results.
 
             If for a given use case, the neighborhood attention problem is equivalent to self
-            attention (not causal, `kernel_size == seqlen`), NATTEN will also attempt to directly
-            use [attention][natten.attention].
+            attention (not causal, `kernel_size == seqlen`), and `backend` is left unspecified,
+            NATTEN will also attempt to directly use [attention][natten.attention].
+            Naming a `backend` runs that neighborhood attention backend instead.
 
             You can override arguments to [attention][natten.attention] by passing a
             dictionary here.
@@ -1185,8 +1191,10 @@ def na2d(
             [merges][natten.merge_attentions] the results.
 
             If for a given use case, the neighborhood attention problem is equivalent to self
-            attention (not causal along any dims, `kernel_size == (X, Y)`), NATTEN will also
-            attempt to directly use [attention][natten.attention].
+            attention (not causal along any dims, `kernel_size == (X, Y)`), and `backend` is
+            left unspecified, NATTEN will also attempt to directly use
+            [attention][natten.attention].
+            Naming a `backend` runs that neighborhood attention backend instead.
 
             You can override arguments to [attention][natten.attention] by passing a
             dictionary here.
@@ -1394,8 +1402,10 @@ def na3d(
             [merges][natten.merge_attentions] the results.
 
             If for a given use case, the neighborhood attention problem is equivalent to self
-            attention (not causal along any dims, `kernel_size == (X, Y, Z)`), NATTEN will also
-            attempt to directly use [attention][natten.attention].
+            attention (not causal along any dims, `kernel_size == (X, Y, Z)`), and `backend` is
+            left unspecified, NATTEN will also attempt to directly use
+            [attention][natten.attention].
+            Naming a `backend` runs that neighborhood attention backend instead.
 
             You can override arguments to [attention][natten.attention] by passing a
             dictionary here.
@@ -1493,6 +1503,10 @@ def na1d_varlen(
     returns results bit-for-bit identical to `na{1,2,3}d(..., backend=
     "cutlass-fna")` on the equivalent batched view -- including the
     per-document clamp above, applied once for the whole (shared) shape.
+    That comparison needs the explicit `backend=`: with the backend left to
+    `na{1,2,3}d` to pick, a call whose window covers a whole axis may be
+    answered by an FMHA kernel instead, which agrees with the CUTLASS FNA one
+    only to within rounding.
 
     `kernel_size` entries may be `1`: that axis mixes nothing -- each query
     attends only to tokens sharing its coordinate on that axis -- and

@@ -29,13 +29,15 @@ Oracle: `cutlass_fna_generic(view, kernel_size=k_eff, ...)` on the packed
 tensor reshaped to `[num_docs, *shape, heads, head_dim]` -- the exact
 backend-private call the dispatch itself makes internally (see the layering
 rule in its docstring), so the comparison is `torch.equal`, not a tolerance:
-both paths reach the identical kernel launch with identical bytes. The
-public `na{1,2,3}d` is deliberately not used as the oracle: for a fully
-clamped axis (`k_eff == extent`), its own `is_self_attention` optimization
-reroutes 1-D (and causal-free full-window 2-D/3-D) calls to a different
-(FMHA) kernel regardless of the `backend=` hint -- a pre-existing, orthogonal
-optimization in that public wrapper, not part of what "runs on the
-fixed-shape CUTLASS FNA kernel" means here.
+both paths reach the identical kernel launch with identical bytes.
+
+The public `na{1,2,3}d(..., backend="cutlass-fna")` is an oracle for the same
+comparison, and `test_full_window_matches_public_entry_bit_for_bit` uses it on
+the case that needs it most: a fully clamped axis (`k_eff == extent`), where
+the public wrapper's `is_self_attention` shortcut hands the call to an FMHA
+kernel when -- and only when -- the caller names no backend. Every other case
+keeps the backend-private oracle, which leaves them independent of the public
+wrapper's own argument handling.
 """
 
 import unittest
@@ -257,6 +259,89 @@ class VarlenUniformDispatchTests(unittest.TestCase):
         for case in UNIFORM_CASES:
             with self.subTest(case=case.name):
                 self._run_case(case)
+
+    @skip_if_libnatten_is_not_supported()
+    def test_full_window_matches_public_entry_bit_for_bit(self):
+        # Full window along the only non-degenerate axis, which is where the
+        # public entry point's `is_self_attention` shortcut would otherwise pick
+        # an FMHA kernel: the shapes are the two temporal attention layers of a
+        # packed video encoder (one uniform document per sample), the case that
+        # first showed the two entry points disagreeing in BF16.
+        cases = (
+            ((5, 32, 40), (5, 1, 1), (True, False, False)),
+            ((3, 16, 20), (3, 1, 1), (False, False, False)),
+        )
+        if not _dtype_is_supported(torch.bfloat16):
+            self.skipTest("bfloat16 is unavailable on this device")
+        heads, head_dim, num_docs = 3, 64, 2
+        previous = _set_deterministic(True)
+        try:
+            for shape, kernel_size, is_causal in cases:
+                with self.subTest(shape=shape, kernel_size=kernel_size):
+                    torch.manual_seed(6600 + shape[0])
+                    total = num_docs * _prod(shape)
+                    inputs = tuple(
+                        torch.randn(
+                            total,
+                            heads,
+                            head_dim,
+                            device="cuda",
+                            dtype=torch.bfloat16,
+                        )
+                        for _ in range(3)
+                    )
+                    query, key, value = (
+                        tensor.detach().clone().requires_grad_(True)
+                        for tensor in inputs
+                    )
+                    reference = tuple(
+                        tensor.detach().clone().requires_grad_(True)
+                        for tensor in inputs
+                    )
+
+                    layout = natten.VarlenLayout((shape,) * num_docs, device="cuda")
+                    output, logsumexp = natten.na3d_varlen(
+                        query,
+                        key,
+                        value,
+                        layout,
+                        kernel_size=kernel_size,
+                        is_causal=is_causal,
+                        return_lse=True,
+                    )
+                    output_ref, logsumexp_ref = natten.na3d(
+                        *(
+                            tensor.view(num_docs, *shape, heads, head_dim)
+                            for tensor in reference
+                        ),
+                        kernel_size=kernel_size,
+                        is_causal=is_causal,
+                        backend="cutlass-fna",
+                        return_lse=True,
+                    )
+                    output_ref = output_ref.reshape(total, heads, head_dim)
+                    logsumexp_ref = logsumexp_ref.reshape(total, heads)
+
+                    self.assertTrue(
+                        torch.equal(output, output_ref), msg="output mismatch"
+                    )
+                    self.assertTrue(
+                        torch.equal(logsumexp, logsumexp_ref), msg="lse mismatch"
+                    )
+
+                    gradient = torch.randn_like(output)
+                    output.backward(gradient)
+                    output_ref.backward(gradient)
+                    for observed, expected, name in (
+                        (query.grad, reference[0].grad, "dq"),
+                        (key.grad, reference[1].grad, "dk"),
+                        (value.grad, reference[2].grad, "dv"),
+                    ):
+                        self.assertTrue(
+                            torch.equal(observed, expected), msg=f"{name} mismatch"
+                        )
+        finally:
+            torch.use_deterministic_algorithms(previous)
 
     @skip_if_libnatten_is_not_supported()
     def test_return_lse_false_returns_tensor_only(self):

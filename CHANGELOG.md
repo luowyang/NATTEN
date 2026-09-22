@@ -1,6 +1,13 @@
 # Changelog
 
 ## [Main branch]
+* `na{1,2,3}d` take the self-attention fast path only when the caller names no
+  `backend`. A window covering a whole axis makes the problem equivalent to
+  (causal, in 1-D) self attention, which NATTEN can answer with `attention` and
+  an FMHA backend of its own choosing -- a different kernel family from any
+  `backend=` names, agreeing with it only to within rounding. A call that names
+  a backend now runs that backend. `attention_kwargs={"backend": ...}` still
+  steers the fast path itself.
 * Fixed precision loss in the CUTLASS `dO * O` reduction kernel: each product
   was formed in the input element type before reaching the FP32 accumulator, so
   on FP16/BF16 it could round early, underflow to zero, or overflow to `Inf`
