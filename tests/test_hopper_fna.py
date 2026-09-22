@@ -643,7 +643,7 @@ class HopperFNAComputeDeltaRangeTest(unittest.TestCase):
 class HopperFNAPartialKVTileRangeTest(unittest.TestCase):
     """The Hopper FP16 backward over a partial last KV tile: dQ turns to NaN.
 
-    Known issue, luowyang/NATTEN#<待填>. Same family as the `dO * O` reduction
+    Known issue, luowyang/NATTEN#1. Same family as the `dO * O` reduction
     overflow above -- a `0 * Inf` once an intermediate leaves FP16's range --
     but a different site: this one is inside the Hopper backward itself, and
     the FP32 conversion in the reduction does not reach it.
@@ -665,7 +665,7 @@ class HopperFNAPartialKVTileRangeTest(unittest.TestCase):
 
     @pytest.mark.xfail(
         reason="Hopper FP16 backward leaves half's range on a partial last KV "
-        "tile; luowyang/NATTEN#<待填>.",
+        "tile; luowyang/NATTEN#1.",
         strict=True,
     )
     @skip_if_libnatten_is_not_supported()

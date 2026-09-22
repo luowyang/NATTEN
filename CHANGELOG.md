@@ -16,7 +16,7 @@
   exactly one KV tile, or magnitudes that keep `O * dO` inside FP16, avoid it.
   Registered as an expected failure in
   `tests/test_hopper_fna.py::HopperFNAPartialKVTileRangeTest`
-  (luowyang/NATTEN#<待填>).
+  (luowyang/NATTEN#1).
 
 ## [0.21.7] - 2026-07-26
 * Switched to int64 strides in cutlass-fna to avoid overflows in larger use cases.
