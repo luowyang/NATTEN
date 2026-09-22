@@ -59,9 +59,7 @@ _HEADS = 3
 _HEAD_DIM = 64
 
 
-def _leaves(
-    total: int, dtype: torch.dtype, count: int = 3
-) -> Tuple[torch.Tensor, ...]:
+def _leaves(total: int, dtype: torch.dtype, count: int = 3) -> Tuple[torch.Tensor, ...]:
     return tuple(
         torch.randn(total, _HEADS, _HEAD_DIM, device="cuda", dtype=dtype)
         for _ in range(count)
@@ -97,18 +95,19 @@ class SelfAttentionBackendHintTests(unittest.TestCase):
                             for tensor in inputs
                         )
 
-                        with mock.patch(
-                            "natten.functional.attention",
-                            wraps=natten.functional.attention,
-                        ) as shortcut, mock.patch(
-                            "natten.functional.cutlass_fna_generic",
-                            wraps=natten.functional.cutlass_fna_generic,
-                        ) as fna:
+                        with (
+                            mock.patch(
+                                "natten.functional.attention",
+                                wraps=natten.functional.attention,
+                            ) as shortcut,
+                            mock.patch(
+                                "natten.functional.cutlass_fna_generic",
+                                wraps=natten.functional.cutlass_fna_generic,
+                            ) as fna,
+                        ):
                             output, logsumexp = natten.na3d(
                                 *(
-                                    tensor.view(
-                                        1, *shape, _HEADS, _HEAD_DIM
-                                    )
+                                    tensor.view(1, *shape, _HEADS, _HEAD_DIM)
                                     for tensor in reference
                                 ),
                                 kernel_size=kernel_size,
@@ -201,13 +200,16 @@ class SelfAttentionBackendHintTests(unittest.TestCase):
                 tensor.detach().clone().requires_grad_(True) for tensor in inputs
             )
 
-            with mock.patch(
-                "natten.functional.attention",
-                wraps=natten.functional.attention,
-            ) as shortcut, mock.patch(
-                "natten.functional.cutlass_fna_generic",
-                wraps=natten.functional.cutlass_fna_generic,
-            ) as fna:
+            with (
+                mock.patch(
+                    "natten.functional.attention",
+                    wraps=natten.functional.attention,
+                ) as shortcut,
+                mock.patch(
+                    "natten.functional.cutlass_fna_generic",
+                    wraps=natten.functional.cutlass_fna_generic,
+                ) as fna,
+            ):
                 output, logsumexp = natten.na3d(
                     *(
                         tensor.view(1, *shape, _HEADS, _HEAD_DIM)
@@ -234,8 +236,6 @@ class SelfAttentionBackendHintTests(unittest.TestCase):
             self._assert_bitwise(
                 output.reshape(total, _HEADS, _HEAD_DIM), output_ref, "output"
             )
-            self._assert_bitwise(
-                logsumexp.reshape(total, _HEADS), logsumexp_ref, "lse"
-            )
+            self._assert_bitwise(logsumexp.reshape(total, _HEADS), logsumexp_ref, "lse")
         finally:
             torch.use_deterministic_algorithms(previous)
