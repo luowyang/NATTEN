@@ -90,7 +90,9 @@
   before.
 * A CUTLASS kernel the Hopper and Blackwell FNA/FMHA backends fail to launch
   now raises instead of printing one line to `stderr` and returning, which left
-  the caller holding an uninitialized output tensor.
+  the caller holding an uninitialized output tensor. The two status checks those
+  headers make ahead of the launch -- a kernel CUTLASS reports as unsupported,
+  and one it fails to initialize -- raise the same way.
 * Fixed a 32-bit overflow in the CUTLASS FMHA forward's batch offsets for
   output, the output accumulator and logsumexp: `batch_id * num_queries` was
   formed in 32 bits before being widened, so it wrapped once batch times
