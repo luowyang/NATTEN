@@ -71,6 +71,12 @@ from natten.modules import (
     NeighborhoodAttention3D,
 )
 from natten.varlen import VarlenLayout
+from natten.varlen_compile import (
+    na1d_varlen_handle,
+    na2d_varlen_handle,
+    na3d_varlen_handle,
+    VarlenLayoutHandle,
+)
 from natten.version import __version__
 
 __all__ = [
@@ -114,7 +120,11 @@ __all__ = [
     "na1d_varlen",
     "na2d_varlen",
     "na3d_varlen",
+    "na1d_varlen_handle",
+    "na2d_varlen_handle",
+    "na3d_varlen_handle",
     "attention",
     "merge_attentions",
     "VarlenLayout",
+    "VarlenLayoutHandle",
 ]

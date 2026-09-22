@@ -1,6 +1,24 @@
 # Changelog
 
 ## [Main branch]
+* Added `natten.VarlenLayoutHandle` and
+  `natten.na1d_varlen_handle`/`na2d_varlen_handle`/`na3d_varlen_handle`, a
+  `torch.compile`-friendly form of the variable-length entry points: the layout
+  travels as a CPU 0-dim int64 handle tensor and the call goes through a custom
+  op, so dynamo records one opaque call instead of tracing the schedule
+  resolution and guarding on the per-document extents it reads. A stream of
+  differently-shaped packings then shares one graph rather than specializing
+  per packing. The numerics are the stock path's -- the operator body calls
+  `na{1,2,3}d_varlen` itself. **Backward re-runs that forward once** under
+  `enable_grad` and returns `torch.autograd.grad`: bit-for-bit identical to the
+  stock backward by construction, degenerate-axis lowering included, at the
+  cost of one extra forward per backward (roughly +29% of attention backward
+  time); a backward that drives the inner kernels from a saved
+  output/logsumexp instead is the planned follow-up. Explicit tile shapes and
+  `backward_kv_splits` are not accepted (a `kernel_size = 1` axis changes the
+  call's rank, where the stock entry point rejects them anyway), and a handle
+  is process-local, not picklable, and valid only while the
+  `VarlenLayoutHandle` object is alive.
 * `na{1,2,3}d` take the self-attention fast path only when the caller names no
   `backend`. A window covering a whole axis makes the problem equivalent to
   (causal, in 1-D) self attention, which NATTEN can answer with `attention` and
