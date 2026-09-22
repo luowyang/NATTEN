@@ -199,10 +199,10 @@ struct AttentionKernel {
         query_ptr += batch_id * q_strideB;
         key_ptr += batch_id * k_strideB;
         value_ptr += batch_id * v_strideB;
-        output_ptr += int64_t(batch_id * num_queries) * o_strideM;
+        output_ptr += int64_t(batch_id) * num_queries * o_strideM;
         if (output_accum_ptr != nullptr) {
           output_accum_ptr +=
-              int64_t(batch_id * num_queries) * (head_dim_value * num_heads);
+              int64_t(batch_id) * num_queries * (head_dim_value * num_heads);
         }
         q_start = 0;
         k_start = 0;
@@ -227,7 +227,7 @@ struct AttentionKernel {
 
       if (logsumexp_ptr != nullptr) {
         // lse[batch_id, query_start, head_id]
-        logsumexp_ptr += batch_id * num_queries * num_heads + head_id +
+        logsumexp_ptr += int64_t(batch_id) * num_queries * num_heads + head_id +
             (q_start + query_start) * num_heads;
       }
 

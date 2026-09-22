@@ -1,6 +1,11 @@
 # Changelog
 
 ## [Main branch]
+* Fixed precision loss in the CUTLASS `dO * O` reduction kernel: each product
+  was formed in the input element type before reaching the FP32 accumulator, so
+  on FP16/BF16 it could round early, underflow to zero, or overflow to `Inf`
+  and turn a whole row into `NaN` once a masked position contributed `0 * Inf`.
+  Both operands are converted to FP32 first.
 * Test isolation: `torch._dynamo`'s recompile and cache-size limits are
   restored after every test, so a module that tightens a compile budget for its
   own cases no longer decides how the tests after it behave.
@@ -84,6 +89,26 @@
   to an identity if every axis is `1`) before reaching a backend kernel. `is_causal` and
   `dilation` have no effect on such an axis, and it imposes no `kernel_size * dilation` fit
   requirement on the input's extent there.
+* Fixed-shape CUTLASS FNA accepts any batch size. It maps batch onto
+  `gridDim.z`, which CUDA caps at 65535, so a larger batch used to fail the
+  launch -- in the forward, and in both the `dO * O` reduction and the backward
+  kernel itself. All three now launch one grid per chunk of at most 65535
+  batches. Output, logsumexp and gradients are bit-for-bit what a caller
+  chunking the batch by hand gets, and what a batch of 65535 or less got
+  before.
+* A batch of zero is still an error, in fixed-shape CUTLASS FNA and in the
+  `dO * O` reduction alike: an empty batch has no launch to make, and the
+  chunking above would otherwise hand the caller back its own output tensor
+  untouched.
+* A CUTLASS kernel the Hopper and Blackwell FNA/FMHA backends fail to launch
+  now raises instead of printing one line to `stderr` and returning, which left
+  the caller holding an uninitialized output tensor. The two status checks those
+  headers make ahead of the launch -- a kernel CUTLASS reports as unsupported,
+  and one it fails to initialize -- raise the same way.
+* Fixed a 32-bit overflow in the CUTLASS FMHA forward's batch offsets for
+  output, the output accumulator and logsumexp: `batch_id * num_queries` was
+  formed in 32 bits before being widened, so it wrapped once batch times
+  sequence length passed `2^32`.
 
 ## [0.21.7] - 2026-07-26
 * Switched to int64 strides in cutlass-fna to avoid overflows in larger use cases.

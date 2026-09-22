@@ -1,0 +1,830 @@
+name: wheel
+
+# Builds the NATTEN fork wheel on GitHub-hosted runners, then (tag
+# builds only) publishes a GitHub Release with the wheel attached. See
+# .github/README-fork-ci.md for the full tag -> release flow.
+#
+# The build runs on GitHub-hosted runners because the organization's
+# network does not allow self-hosted runners to reach GitHub Actions;
+# there is no GPU on hosted runners, so kernel tests run elsewhere.
+#
+# CONSEQUENCE: no GPU on these runners, so this workflow cannot run
+# libnatten's actual kernel tests. It still builds a real CUDA extension
+# (nvcc targets sm_90a) and does a CPU-only import smoke test. GPU
+# correctness validation happens outside this CI, via this fork's own
+# build/test tooling (integration/build_wheel.sh and friends) -- unrelated
+# to and unaffected by this workflow.
+#
+# THREE JOBS, `gate` then (conditionally) `warm` then `build`. `warm`
+# fans a cold compile across SHARD_COUNT runners to prime sccache;
+# `build` produces the real wheel. `gate` skips `warm` when an earlier
+# successful build recorded the same compilation fingerprint. A stale
+# marker can only cost time: sccache independently keys every object
+# from its real compiler inputs, and `build` compiles any miss from
+# source. Shared setup for `warm` and `build` lives in
+# .github/actions/prepare-build-env so their compile environments match.
+#
+# LOG ACCESS: the same organization network that blocks self-hosted
+# runners also blocks reading hosted-run logs and artifacts the normal
+# way (`gh run view --log`, the jobs/logs API, and artifact downloads all
+# redirect through hosts that are unreachable from here) -- confirmed the
+# hard way when a build failed and neither `--log-failed` nor `gh run
+# download` would return anything but "Forbidden". Both jobs work around
+# that by pushing their own logs to an orphan `ci-logs` branch via plain
+# `git` over `github.com` (not blocked -- only the *reading* side, from
+# this network, hits the blocked hosts; a runner pushing to github.com is
+# unaffected): `warm`'s last step pushes each shard's own small report
+# (runs/<run_id>-<attempt>/shard-<index>.txt); `build`'s last step
+# (`Relay build log and diagnostics`) captures the build's own output,
+# extracts likely-relevant lines as `::error::` workflow annotations
+# (visible via `gh run view -v` / the Actions UI without needing the
+# blocked hosts), and pushes the full log + a diagnostics summary
+# (runs/<run_id>-<attempt>/{build.log,summary.txt}).
+#
+# Triggers:
+#   - push of a tag matching fork/* (the normal release path: assemble.sh
+#     ... --tag, then `git push origin refs/tags/fork/<version>`)
+#   - workflow_dispatch, with a `ref` input (tag, branch, or commit) to
+#     build, and a `cache_namespace` input (see below). The workflow
+#     *definition* always comes from whatever ref the dispatch itself
+#     targets (`gh workflow run wheel.yml --ref ...`); `inputs.ref`
+#     decouples that from what actually gets checked out and built, so
+#     e.g. dispatching from fork-ci can still build and publish a release
+#     for an already-existing tag like fork/0.21.7+fork.2.
+
+on:
+  push:
+    tags:
+      - 'fork/*'
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Ref (tag/branch/sha) to check out and build. Blank on a manual dispatch = the ref this workflow run itself was dispatched against.'
+        required: false
+        default: ''
+      cache_namespace:
+        description: 'Optional sccache cache namespace (SCCACHE_GHA_VERSION). Set to a value nothing has used before to force a cold build (e.g. for testing); leave blank for normal use, including tag-triggered releases.'
+        required: false
+        default: ''
+
+concurrency:
+  group: wheel-build
+  cancel-in-progress: false
+
+permissions:
+  contents: write   # needed for the tag-build release step AND the
+                     # ci-logs branch pushes (both jobs); repo default is
+                     # read-only (checked via `gh api repos/luowyang/
+                     # NATTEN/actions/permissions/workflow`), so this
+                     # must be declared here to elevate it.
+
+env:
+  SHARD_COUNT: "8"   # Number of jobs.warm.strategy.matrix.shard entries.
+                      # GitHub Actions has no way to derive a matrix list
+                      # from a single integer, so the list below (shard:
+                      # [0, 1, ..., 7]) is maintained by hand and MUST
+                      # have exactly this many entries, 0-indexed.
+  NATTEN_CUDA_ARCH: "9.0"
+  NATTEN_N_WORKERS: "1"     # Measured locally (dev machine 2, CPU
+                             # only, same NATTEN_CUDA_ARCH=9.0
+                             # flags, "fine"-policy autogen
+                             # output): the 3 largest translation
+                             # units are all in hopper_fna_bwd
+                             # (source_3/7/6.cu), each peaking
+                             # ~10.2-10.8GB (process-tree RSS sum,
+                             # sampled every 2s across the whole
+                             # nvcc->cicc->ptxas tree, not just
+                             # ru_maxrss's single-largest-process
+                             # number -- they matched closely here
+                             # since nvcc's stages ran essentially
+                             # sequentially for one TU, but that
+                             # equivalence breaks the moment N>1
+                             # such TUs compile concurrently).
+                             # Two concurrent workers (prior
+                             # attempts' N_WORKERS=2) means ~21GB
+                             # combined if two hopper_fna_bwd TUs
+                             # land together -- doesn't fit a
+                             # 16GB guest. One worker means at
+                             # most ~10.8GB resident at a time,
+                             # which does fit, with headroom. This
+                             # applies equally to `warm` (each shard
+                             # is its own 16GB runner, same
+                             # constraint) and `build`.
+  NATTEN_AUTOGEN_POLICY: fine   # Confirmed smallest-TU policy:
+                             # setup.py's NUM_SPLITS table splits
+                             # every category into MORE pieces
+                             # under "fine" than "default"/"coarse"
+                             # (e.g. hopper-fna-bwd: coarse=2,
+                             # default=4, fine=8) without changing
+                             # which kernels get generated (same
+                             # `categories` dict, same autogen
+                             # scripts) -- more, smaller compile
+                             # units for the identical
+                             # instantiation set.
+  NATTEN_VERBOSE: "1"
+  SCCACHE_GHA_ENABLED: "true"
+  # Defined here (workflow level, not job or step level) so that
+  # `warm`'s and `build`'s build steps -- and, for NATTEN_CUDA_ARCH/
+  # NATTEN_N_WORKERS/NATTEN_AUTOGEN_POLICY, `build`'s manifest step --
+  # all read the exact same values, with no way for the two jobs to end
+  # up compiling under different flags (which is how the manifest
+  # previously ended up lying about NATTEN_N_WORKERS, back when these
+  # were job-level on the one job that existed then).
+
+jobs:
+  gate:
+    # This is a scheduling hint only. Fingerprint or cache lookup errors
+    # fall back to running `warm`; `build` still handles every cache miss.
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      warm_needed: ${{ steps.decide.outputs.warm_needed }}
+      cache_key: ${{ steps.fingerprint.outputs.cache_key }}
+      fingerprint: ${{ steps.fingerprint.outputs.fingerprint }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref }}
+          submodules: false
+
+      - name: Compute fingerprint
+        id: fingerprint
+        env:
+          CACHE_NAMESPACE: ${{ inputs.cache_namespace }}
+        run: |
+          set -euo pipefail
+          CSRC_TREE="$(git rev-parse HEAD:csrc)"
+          CUTLASS_COMMIT="$(git rev-parse HEAD:third_party/cutlass)"
+          SETUP_PY_SHA="$(sha256sum setup.py | cut -d' ' -f1)"
+          CMAKELISTS_SHA="$(sha256sum csrc/CMakeLists.txt | cut -d' ' -f1)"
+          AUTOGEN_FILES=(scripts/autogen_*.py)
+          AUTOGEN_SHA="$(sha256sum "${AUTOGEN_FILES[@]}" | sha256sum | cut -d' ' -f1)"
+
+          TORCH_VERSION="$(grep -oE 'torch==[0-9][0-9.]*' .github/actions/prepare-build-env/action.yml | head -1 | cut -d= -f3)"
+          CUDA_VERSION="$(grep -oE "cuda: '[0-9][0-9.]*'" .github/actions/prepare-build-env/action.yml | head -1 | grep -oE '[0-9]+(\.[0-9]+)*')"
+          if [[ -z "$TORCH_VERSION" || -z "$CUDA_VERSION" ]]; then
+            echo "::error::gate: could not extract torch/CUDA version pins from .github/actions/prepare-build-env/action.yml -- its format may have changed since these grep patterns were written"
+            exit 1
+          fi
+
+          {
+            echo "csrc_tree                = $CSRC_TREE"
+            echo "cutlass_submodule_commit = $CUTLASS_COMMIT"
+            echo "setup_py_sha256          = $SETUP_PY_SHA"
+            echo "cmakelists_sha256        = $CMAKELISTS_SHA  (csrc/CMakeLists.txt; this repo has no separate root CMakeLists.txt)"
+            echo "autogen_scripts_sha256   = $AUTOGEN_SHA  (${#AUTOGEN_FILES[@]} files: ${AUTOGEN_FILES[*]})"
+            echo "torch_version            = $TORCH_VERSION"
+            echo "cuda_toolkit_version     = $CUDA_VERSION"
+            echo "NATTEN_CUDA_ARCH         = $NATTEN_CUDA_ARCH"
+            echo "NATTEN_N_WORKERS         = $NATTEN_N_WORKERS"
+            echo "NATTEN_AUTOGEN_POLICY    = $NATTEN_AUTOGEN_POLICY"
+            echo "SHARD_COUNT              = $SHARD_COUNT"
+            echo "cache_namespace          = ${CACHE_NAMESPACE:-(blank)}"
+          } > /tmp/gate-inputs.txt
+
+          FINGERPRINT="$(sha256sum /tmp/gate-inputs.txt | cut -d' ' -f1)"
+          echo "fingerprint=$FINGERPRINT" >> "$GITHUB_OUTPUT"
+          echo "cache_key=natten-warm-$FINGERPRINT" >> "$GITHUB_OUTPUT"
+
+      - name: Look up marker cache entry
+        id: lookup
+        uses: actions/cache/restore@v4
+        with:
+          path: gate-marker.txt   # Must match the save action's path:
+                                  # cache version includes the path even
+                                  # when lookup-only skips the download.
+          key: ${{ steps.fingerprint.outputs.cache_key }}
+          lookup-only: true
+
+      - name: Decide
+        id: decide
+        if: always()
+        run: |
+          set +e -u -o pipefail
+          FP="${{ steps.fingerprint.outputs.fingerprint }}"
+          KEY="${{ steps.fingerprint.outputs.cache_key }}"
+          LOOKUP_OUTCOME="${{ steps.lookup.outcome }}"
+          CACHE_HIT="${{ steps.lookup.outputs.cache-hit }}"
+
+          WARM_NEEDED=true
+          if [[ -n "$KEY" && "$LOOKUP_OUTCOME" == "success" && "$CACHE_HIT" == "true" ]]; then
+            WARM_NEEDED=false
+          fi
+          echo "warm_needed=$WARM_NEEDED" >> "$GITHUB_OUTPUT"
+          cat /tmp/gate-inputs.txt 2>/dev/null || true
+          echo "fingerprint=${FP:-N/A} marker_key=${KEY:-N/A} cache_hit=${CACHE_HIT:-N/A} warm_needed=$WARM_NEEDED"
+          exit 0
+
+  warm:
+    needs: gate
+    if: needs.gate.outputs.warm_needed == 'true'
+    # Sharded precompile: SHARD_COUNT parallel runners, each compiling
+    # roughly one SHARD_COUNTth of the real translation units (hash-
+    # selected by the nvcc wrapper, .github/scripts/nvcc-wrapper.sh) for
+    # real through sccache, and every other translation unit as a fast
+    # empty stand-in that bypasses sccache entirely. Every real
+    # translation unit is compiled for real, by exactly one shard, so by
+    # the time all shards finish, sccache holds (almost) every object
+    # `build` will need. See .github/README-fork-ci.md, "How a cold
+    # build is parallelized", for the full design and measured numbers.
+    #
+    # This job's own `python -m build` output/wheel is never used --
+    # only the sccache entries each shard's real compiles wrote are. A
+    # shard's wheel build is very likely to fail (most of its objects
+    # are empty stand-ins), and that is expected and fine; see the
+    # comment on the "Precompile shard" step below for how pass/fail is
+    # actually decided.
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7]   # Must have exactly SHARD_COUNT (8) entries, see env above.
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref }}
+          submodules: recursive
+          # Mandatory: NATTEN's CMake build needs third_party/cutlass/include
+          # populated. Must be a step here, not inside prepare-build-env:
+          # a local composite action (`uses: ./path`) is resolved from
+          # whatever checkout already exists in the job's workspace, so it
+          # cannot do its own first checkout -- confirmed the hard way
+          # (every job failed in seconds with "Can't find 'action.yml' ...
+          # Did you forget to run actions/checkout before running your
+          # local action?") when an earlier revision of this workflow had
+          # prepare-build-env check itself out as its own first step. An
+          # empty ref (push-tag trigger, or a dispatch with no explicit
+          # input) falls back to actions/checkout's own default
+          # (github.sha), which is exactly right for both cases.
+
+      - name: Prepare build environment
+        id: prepare
+        uses: ./.github/actions/prepare-build-env
+        with:
+          cache_namespace: ${{ inputs.cache_namespace }}
+
+      - name: Precompile shard
+        id: shard_build
+        env:
+          NATTEN_CI_SHARD_INDEX: ${{ matrix.shard }}
+          NATTEN_CI_SHARD_COUNT: ${{ env.SHARD_COUNT }}
+        run: |
+          set +e -u -o pipefail
+          # +e deliberately: GitHub Actions' default shell invocation for
+          # `run:` steps already runs with errexit on (`bash --noprofile
+          # --norc -eo pipefail {0}`) regardless of this script's own
+          # `set` line, which only ever ADDS flags, never removes ones
+          # already active. This step manages its own pass/fail
+          # explicitly via the shard failure/compiled marker files the
+          # nvcc wrapper writes, not via errexit or python -m build's own
+          # exit code (see below).
+          echo "--- free -m (before build) ---"
+          free -m
+          export TMPDIR="${{ runner.temp }}"
+          echo "nproc=$(nproc) NATTEN_N_WORKERS=$NATTEN_N_WORKERS CUDA_HOME=$CUDA_HOME shard=$NATTEN_CI_SHARD_INDEX/$NATTEN_CI_SHARD_COUNT"
+          nvcc --version
+
+          START_TS=$(date +%s)
+          python -m build --no-isolation --wheel -o dist/ > /tmp/shard-build.log 2>&1
+          BUILD_RC=$?
+          END_TS=$(date +%s)
+          ELAPSED=$((END_TS - START_TS))
+          echo "elapsed_seconds=$ELAPSED" >> "$GITHUB_OUTPUT"
+          echo "python -m build exited $BUILD_RC after ${ELAPSED}s. This step's own pass/fail is decided below by the shard failure/compiled marker files, not this exit code: whether this shard's own python -m build itself succeeds is immaterial (NATTEN links a plain shared library without strict undefined-symbol checking, so empty stand-in objects from other shards typically do not break the link either way), and even if it does fail, this shard's own wheel is never used -- only the sccache entries its own-shard compiles wrote are."
+
+          echo "--- sccache --show-stats ---"
+          sccache --show-stats || true
+
+          if [[ -s /tmp/natten-shard-failures.txt ]]; then
+            echo "::error::Shard $NATTEN_CI_SHARD_INDEX had own-shard compile failures:"
+            cat /tmp/natten-shard-failures.txt
+            exit 1
+          fi
+          if [[ ! -s /tmp/natten-shard-compiled.txt ]]; then
+            echo "::error::Shard $NATTEN_CI_SHARD_INDEX compiled nothing -- the nvcc wrapper is broken."
+            exit 1
+          fi
+          echo "Shard $NATTEN_CI_SHARD_INDEX compiled $(wc -l < /tmp/natten-shard-compiled.txt) own-shard file(s), 0 failures."
+          exit 0
+
+      - name: Push shard log (ci-logs branch)
+        id: push_shard_log
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set +e -u -o pipefail
+          # +e deliberately: see the Precompile shard step's own comment
+          # (GitHub Actions' default shell already runs with errexit on
+          # regardless of this script's own `set` line) -- this step
+          # manages its own pass/fail explicitly via its final exit.
+          SHARD="${{ matrix.shard }}"
+          {
+            echo "wheel.yml run ${{ github.run_id }} attempt ${{ github.run_attempt }}: warm shard $SHARD/${{ env.SHARD_COUNT }}"
+            echo "Precompile shard step outcome : ${{ steps.shard_build.outcome }}"
+            echo "Elapsed (build step)          : ${{ steps.shard_build.outputs.elapsed_seconds }}s"
+            echo "Compiled (own shard)          : $(wc -l < /tmp/natten-shard-compiled.txt 2>/dev/null || echo 0)"
+            echo "Failed (own shard)            :"
+            if [[ -s /tmp/natten-shard-failures.txt ]]; then
+              cat /tmp/natten-shard-failures.txt
+            else
+              echo "  (none)"
+            fi
+            echo
+            echo "--- sccache --show-stats ---"
+            sccache --show-stats 2>&1 || echo "(unavailable)"
+            echo
+            echo "--- last 60 lines of this shard's python -m build output ---"
+            if [[ -f /tmp/shard-build.log ]]; then
+              tail -n 60 /tmp/shard-build.log
+            else
+              echo "(no shard-build.log -- Precompile shard step likely never ran)"
+            fi
+          } > "shard-${SHARD}.txt"
+          cat "shard-${SHARD}.txt"
+
+          git config --global user.email "ci@users.noreply.github.com"
+          git config --global user.name "NATTEN fork CI"
+          REMOTE_URL="https://x-access-token:${GH_TOKEN}@github.com/luowyang/NATTEN.git"
+          WORKDIR="$(mktemp -d)"
+          if git ls-remote --exit-code "$REMOTE_URL" refs/heads/ci-logs >/dev/null 2>&1; then
+            git clone --quiet --depth 1 --branch ci-logs "$REMOTE_URL" "$WORKDIR"
+          else
+            git init --quiet -b ci-logs "$WORKDIR"
+          fi
+          DEST="$WORKDIR/runs/${{ github.run_id }}-${{ github.run_attempt }}"
+          mkdir -p "$DEST"
+          cp "shard-${SHARD}.txt" "$DEST/"
+          git -C "$WORKDIR" add -A
+          if git -C "$WORKDIR" diff --cached --quiet; then
+            echo "Nothing to commit (unexpected -- shard-${SHARD}.txt should always be new)."
+            exit 0
+          fi
+          git -C "$WORKDIR" commit --quiet -m "wheel.yml run ${{ github.run_id }} attempt ${{ github.run_attempt }}: warm shard $SHARD"
+
+          # Up to SHARD_COUNT (8) shards may reach this push at nearly the
+          # same time; retry with fetch+rebase and a random backoff so a
+          # collision doesn't need a human to re-run anything.
+          PUSHED=0
+          for ATTEMPT in 1 2 3 4 5; do
+            if git -C "$WORKDIR" push --quiet "$REMOTE_URL" "HEAD:refs/heads/ci-logs" 2>/dev/null; then
+              echo "Pushed: runs/${{ github.run_id }}-${{ github.run_attempt }}/shard-${SHARD}.txt on ci-logs (attempt $ATTEMPT)"
+              PUSHED=1
+              break
+            fi
+            SLEEP=$(( (RANDOM % 10) + 1 ))
+            echo "Push attempt $ATTEMPT failed (likely a concurrent shard pushing at the same time); fetch+rebase and retry in ${SLEEP}s..."
+            sleep "$SLEEP"
+            git -C "$WORKDIR" fetch --quiet "$REMOTE_URL" ci-logs
+            git -C "$WORKDIR" rebase --quiet FETCH_HEAD || git -C "$WORKDIR" rebase --abort
+          done
+          if [[ "$PUSHED" -ne 1 ]]; then
+            echo "::error::shard-${SHARD}.txt push failed after 5 attempts"
+            exit 1
+          fi
+          exit 0
+
+  build:
+    needs: [gate, warm]   # gate: this job reads its marker outputs below.
+                            # warm: the cache it was meant to prime, if it ran.
+    if: ${{ !cancelled() }}   # Run even if warm was skipped (gate decided
+                               # it wasn't needed) or a shard failed --
+                               # `build` then simply compiles whatever
+                               # that shard would have primed the cache
+                               # for, itself, cold. Only skip on
+                               # cancellation.
+    runs-on: ubuntu-latest
+    timeout-minutes: 360   # a cold, uncached CUDA compile on a 4-vCPU hosted
+                            # runner is far slower than the 39-worker dev-
+                            # machine builds this fork's tooling was timed
+                            # against; sccache (below) makes repeat builds
+                            # much cheaper once its cache is warm, and `warm`
+                            # (above) exists to make sure it is warm by the
+                            # time this job starts -- but this timeout stays
+                            # at the full cold-build budget as a backstop in
+                            # case a shard failed or the cache didn't take.
+    steps:
+      - name: Resolve build ref
+        id: resolve_ref
+        run: |
+          set -euo pipefail
+          BUILD_REF="${{ inputs.ref }}"
+          if [[ -z "$BUILD_REF" ]]; then
+            BUILD_REF="${{ github.ref_name }}"
+          fi
+          echo "build_ref=$BUILD_REF" >> "$GITHUB_OUTPUT"
+          # A release only makes sense, and only gets attempted, for a ref
+          # that IS one of this fork's fork/<version> tags -- checked by
+          # name, not by github.ref_type, because github.ref_type reflects
+          # the ref the *workflow run* was dispatched against (e.g. the
+          # fork-ci branch), not `inputs.ref` (the ref actually built). A
+          # branch push or a dispatch naming a plain branch both correctly
+          # fall through to "artifact only".
+          if [[ "$BUILD_REF" == fork/* ]]; then
+            echo "is_tag_build=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "is_tag_build=false" >> "$GITHUB_OUTPUT"
+          fi
+          echo "Building ref: $BUILD_REF (tag build: $([[ "$BUILD_REF" == fork/* ]] && echo true || echo false))"
+
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref }}
+          submodules: recursive
+          # Mandatory: NATTEN's CMake build needs third_party/cutlass/include
+          # populated. Must be a step here, not inside prepare-build-env:
+          # a local composite action (`uses: ./path`) is resolved from
+          # whatever checkout already exists in the job's workspace, so it
+          # cannot do its own first checkout -- confirmed the hard way
+          # (every job failed in seconds with "Can't find 'action.yml' ...
+          # Did you forget to run actions/checkout before running your
+          # local action?") when an earlier revision of this workflow had
+          # prepare-build-env check itself out as its own first step. An
+          # empty ref (push-tag trigger, or a dispatch with no explicit
+          # input) falls back to actions/checkout's own default
+          # (github.sha), which is exactly right for both cases.
+
+      - name: Prepare build environment
+        id: prepare
+        uses: ./.github/actions/prepare-build-env
+        with:
+          cache_namespace: ${{ inputs.cache_namespace }}
+
+      - name: Push started.txt (ci-logs branch)
+        id: started_checkpoint
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set +e -u -o pipefail
+          # +e deliberately: GitHub Actions' default shell invocation for
+          # `run:` steps is already `bash --noprofile --norc -eo pipefail
+          # {0}` -- errexit is ON by default regardless of what flags a
+          # script's own `set` line adds, and omitting `-e` from that line
+          # (what earlier revisions of this workflow did) does NOT turn it
+          # off, since `set` only ever ADDS the flags you name. This step
+          # is diagnostics-only and must not itself fail the job over an
+          # incidental nonzero from something like an empty `git diff`.
+          {
+            echo "wheel.yml run ${{ github.run_id }} attempt ${{ github.run_attempt }}: build starting"
+            echo "Ref built: ${{ steps.resolve_ref.outputs.build_ref }}"
+            echo "warm job result: ${{ needs.warm.result }}"
+            date -u
+            echo
+            echo "--- df -h ---"
+            df -h
+            echo
+            echo "--- free -m ---"
+            free -m
+            echo
+            echo "--- nproc ---"
+            nproc
+          } > started.txt
+          cat started.txt
+
+          git config --global user.email "ci@users.noreply.github.com"
+          git config --global user.name "NATTEN fork CI"
+          REMOTE_URL="https://x-access-token:${GH_TOKEN}@github.com/luowyang/NATTEN.git"
+          WORKDIR="$(mktemp -d)"
+          if git ls-remote --exit-code "$REMOTE_URL" refs/heads/ci-logs >/dev/null 2>&1; then
+            git clone --quiet --depth 1 --branch ci-logs "$REMOTE_URL" "$WORKDIR"
+          else
+            git init --quiet -b ci-logs "$WORKDIR"
+          fi
+          DEST="$WORKDIR/runs/${{ github.run_id }}-${{ github.run_attempt }}"
+          mkdir -p "$DEST"
+          cp started.txt "$DEST/"
+          git -C "$WORKDIR" add -A
+          if git -C "$WORKDIR" diff --cached --quiet; then
+            echo "Nothing to commit."
+          else
+            git -C "$WORKDIR" commit --quiet -m "wheel.yml run ${{ github.run_id }} attempt ${{ github.run_attempt }}: started"
+            git -C "$WORKDIR" push --quiet "$REMOTE_URL" "HEAD:refs/heads/ci-logs"
+            echo "Pushed: runs/${{ github.run_id }}-${{ github.run_attempt }}/started.txt on ci-logs"
+          fi
+          exit 0
+
+      - name: Build wheel
+        id: build
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # NATTEN_IS_BUILDING_DIST intentionally NOT set: setup.py would
+          # append a second "+torch<ver>cu<ver>" local-version segment to
+          # whatever src/natten/version.py already has, which is invalid
+          # PEP 440 the moment version.py already carries "+fork.N" (a
+          # real tag build) -- same reasoning integration/build_wheel.sh
+          # documents in its own header, reused here since it applies
+          # identically to this workflow's own `python -m build` call.
+        run: |
+          set +e -u -o pipefail
+          # +e deliberately: GitHub Actions' default shell invocation for
+          # `run:` steps already runs with errexit on (`bash --noprofile
+          # --norc -eo pipefail {0}`) regardless of this script's own
+          # `set` line, which only ever ADDS flags, never removes ones
+          # already active -- so without an explicit +e here, the
+          # foreground sampler loop's own commands (or a nonzero from the
+          # backgrounded build job's pipeline) could abort this whole
+          # step early. This step manages the actual build's pass/fail
+          # via BUILD_RC (from the backgrounded job's own captured exit
+          # code) and its own explicit `exit "$BUILD_RC"` at the end, not
+          # via errexit.
+          echo "--- free -m (before build) ---"
+          free -m
+          export TMPDIR="${{ runner.temp }}"
+
+          echo "nproc=$(nproc) NATTEN_N_WORKERS=$NATTEN_N_WORKERS CUDA_HOME=$CUDA_HOME"
+          nvcc --version | tee /tmp/nvcc-version.txt
+
+          # --- ci-logs push helper (same orphan-branch-via-git pattern as
+          # the started.txt / final relay steps; cloned once here and
+          # reused so the periodic pushes below don't re-clone each time) ---
+          git config --global user.email "ci@users.noreply.github.com"
+          git config --global user.name "NATTEN fork CI"
+          REMOTE_URL="https://x-access-token:${GH_TOKEN}@github.com/luowyang/NATTEN.git"
+          CI_LOGS_DIR="$(mktemp -d)"
+          if git ls-remote --exit-code "$REMOTE_URL" refs/heads/ci-logs >/dev/null 2>&1; then
+            git clone --quiet --depth 1 --branch ci-logs "$REMOTE_URL" "$CI_LOGS_DIR"
+          else
+            git init --quiet -b ci-logs "$CI_LOGS_DIR"
+          fi
+          CI_LOGS_DEST="$CI_LOGS_DIR/runs/${{ github.run_id }}-${{ github.run_attempt }}"
+          mkdir -p "$CI_LOGS_DEST"
+
+          push_sampler() {
+            cp /tmp/sampler.txt "$CI_LOGS_DEST/sampler.txt"
+            git -C "$CI_LOGS_DIR" add -A
+            if git -C "$CI_LOGS_DIR" diff --cached --quiet; then
+              return 0
+            fi
+            git -C "$CI_LOGS_DIR" commit --quiet -m "run ${{ github.run_id }} attempt ${{ github.run_attempt }}: sampler update"
+            for _ in 1 2 3; do
+              git -C "$CI_LOGS_DIR" push --quiet "$REMOTE_URL" HEAD:refs/heads/ci-logs 2>/dev/null && return 0
+              git -C "$CI_LOGS_DIR" pull --quiet --rebase "$REMOTE_URL" ci-logs 2>/dev/null || true
+            done
+            echo "WARNING: sampler push failed after retries" >&2
+          }
+
+          : > /tmp/sampler.txt
+
+          # --- run the build in the background; sample in the foreground ---
+          (
+            set +e -u -o pipefail   # this subshell inherits shell options at fork time too
+            python -m build --no-isolation --wheel -o dist/ 2>&1 | tee "$GITHUB_WORKSPACE/build.log"
+            echo "${PIPESTATUS[0]}" > /tmp/build_exit_code.txt
+          ) &
+          BUILD_PID=$!
+
+          ITER=0
+          while kill -0 "$BUILD_PID" 2>/dev/null; do
+            sleep 60
+            ITER=$((ITER + 1))
+            {
+              echo "=== sample $ITER at $(date -u +%Y-%m-%dT%H:%M:%SZ) (t+${ITER}min) ==="
+              free -m
+              echo "--- top 10 by RSS ---"
+              ps -eo rss,etime,cmd --sort=-rss | head -11
+              echo "--- df -h / ---"
+              df -h /
+              echo
+            } >> /tmp/sampler.txt
+            if (( ITER % 5 == 0 )); then
+              push_sampler
+            fi
+          done
+          wait "$BUILD_PID" || true
+          push_sampler   # final sample, whatever the outcome
+
+          sccache --show-stats || true
+
+          BUILD_RC="$(cat /tmp/build_exit_code.txt 2>/dev/null || echo 1)"
+          exit "$BUILD_RC"
+
+      - name: Install wheel + import smoke test
+        id: install_smoke
+        run: |
+          set -euo pipefail
+          WHEEL="$(ls dist/*.whl)"
+          echo "WHEEL=$WHEEL" >> "$GITHUB_ENV"
+          pip install --no-deps "$WHEEL"
+          # No GPU/driver on this runner (see header) -- this only proves
+          # the wheel installs and the package imports cleanly. libnatten
+          # is a real compiled extension in this wheel (built above with
+          # NATTEN_CUDA_ARCH=9.0); natten/_libnatten/__init__.py's own
+          # `except ImportError: HAS_LIBNATTEN = False` means even a
+          # driver-load failure for the compiled .so degrades to stub
+          # kernels rather than crashing the import. Actual kernel
+          # correctness is validated on the dev machines, not here.
+          python -c "import natten; print('natten.__version__ =', natten.__version__)"
+
+      - name: Save warm marker
+        id: save_marker
+        if: needs.gate.outputs.warm_needed == 'true'
+        # Only when gate told us no marker existed yet for this
+        # fingerprint (a MISS) -- when it told us the opposite (a HIT),
+        # the marker is already there and actions/cache/save would just
+        # fail on "cache already exists" for no benefit. No `if:
+        # always()`: this step should only run, and only mean anything,
+        # once the build has actually proven itself by compiling,
+        # installing and importing above -- an unrelated failure in a
+        # later step (manifest/upload/release) has nothing to do with
+        # whether sccache is warm, and must not block recording that it
+        # is.
+        run: |
+          set -euo pipefail
+          echo "natten fork CI warm marker -- fingerprint ${{ needs.gate.outputs.fingerprint }}, built by run ${{ github.run_id }} attempt ${{ github.run_attempt }}" > gate-marker.txt
+
+      - name: Save warm marker (cache write)
+        if: needs.gate.outputs.warm_needed == 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: gate-marker.txt
+          key: ${{ needs.gate.outputs.cache_key }}
+
+      - name: Build manifest
+        id: manifest
+        run: |
+          set -euo pipefail
+          SHA256="$(sha256sum "$WHEEL" | awk '{print $1}')"
+          VERSION="$(python -c 'import natten; print(natten.__version__)')"
+          BUILT_COMMIT="$(git rev-parse HEAD)"
+          MANIFEST="dist/MANIFEST-${VERSION}.txt"
+          {
+            echo "NATTEN fork CI build manifest"
+            echo "==============================="
+            echo "Wheel file         : $(basename "$WHEEL")"
+            echo "SHA256             : $SHA256"
+            echo "Built (UTC)        : $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "natten.__version__ : $VERSION"
+            echo
+            echo "Built from commit  : $BUILT_COMMIT"
+            echo "Workflow commit    : ${{ github.sha }}"
+            echo "Ref built          : ${{ steps.resolve_ref.outputs.build_ref }}"
+            echo "Workflow run       : ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            echo
+            echo "Toolchain:"
+            echo "  Runner           : GitHub-hosted ubuntu-latest (no GPU/driver)"
+            echo "  Python           : $(python --version 2>&1)"
+            echo "  torch            : $(python -c 'import torch; print(torch.__version__)')"
+            echo "  torch CUDA       : $(python -c 'import torch; print(torch.version.cuda)')"
+            echo "  nvcc             : $(tr '\n' ' ' < /tmp/nvcc-version.txt)"
+            echo "  NATTEN_CUDA_ARCH : $NATTEN_CUDA_ARCH"
+            echo "  NATTEN_N_WORKERS : $NATTEN_N_WORKERS"
+            echo "  NATTEN_AUTOGEN_POLICY : $NATTEN_AUTOGEN_POLICY"
+            echo
+            echo "GPU kernel tests: NOT run in this workflow (no GPU on"
+            echo "ubuntu-latest). Only the CPU-only import smoke test above"
+            echo "ran. GPU correctness validation happens on the dev"
+            echo "machines via integration/build_wheel.sh and friends --"
+            echo "see .github/README-fork-ci.md."
+          } > "$MANIFEST"
+          echo "MANIFEST=$MANIFEST" >> "$GITHUB_ENV"
+          cat "$MANIFEST"
+
+      - name: Upload wheel + manifest as workflow artifact
+        id: upload
+        uses: actions/upload-artifact@v7
+        with:
+          name: natten-wheel-${{ github.run_id }}
+          path: |
+            dist/*.whl
+            dist/MANIFEST-*.txt
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Create or update GitHub Release (fork/* tag builds only)
+        id: release
+        if: steps.resolve_ref.outputs.is_tag_build == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.resolve_ref.outputs.build_ref }}"
+          echo "Publishing release for tag $TAG: $WHEEL + $MANIFEST"
+          if gh release view "$TAG" --repo luowyang/NATTEN >/dev/null 2>&1; then
+            # The tag's release may already exist (e.g. created by hand,
+            # with notes, ahead of a CI-built wheel ever landing) -- never
+            # delete/recreate it, just attach/replace these two assets.
+            gh release upload "$TAG" "$WHEEL" "$MANIFEST" --repo luowyang/NATTEN --clobber
+          else
+            gh release create "$TAG" "$WHEEL" "$MANIFEST" \
+              --repo luowyang/NATTEN \
+              --title "$TAG" \
+              --notes-file "$MANIFEST" \
+              --prerelease
+          fi
+
+      - name: Relay build log and diagnostics (ci-logs branch)
+        id: relay_logs
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GATE_WARM_NEEDED: ${{ needs.gate.outputs.warm_needed }}
+          GATE_FINGERPRINT: ${{ needs.gate.outputs.fingerprint }}
+          GATE_CACHE_KEY: ${{ needs.gate.outputs.cache_key }}
+        run: |
+          set +e -u -o pipefail
+          # +e deliberately: GitHub Actions' default shell invocation
+          # already runs with errexit on regardless of this script's own
+          # `set` line (see the Build wheel step's comment for the full
+          # explanation) -- found the hard way: on a clean, error-free
+          # build.log, the grep below legitimately matches nothing and
+          # exits 1, which with errexit still active (the bug: omitting
+          # -e from a `set` line does not turn off a shell flag already
+          # on) killed this whole best-effort step before it reached the
+          # ci-logs push, even though the build itself had succeeded.
+
+          echo "--- last 60 lines of build.log ---"
+          if [[ -f build.log ]]; then
+            tail -n 60 build.log
+          else
+            echo "(no build.log -- Build wheel step likely never ran)"
+          fi
+
+          if [[ -f build.log ]]; then
+            echo "--- error-pattern lines (last 20) -> workflow annotations ---"
+            grep -aE "error|Error|Killed|No space|fatal" build.log | tail -n 20 | while IFS= read -r line; do
+              esc="${line//$'\r'/}"
+              esc="${esc//%/%25}"
+              echo "::error::${esc}"
+            done || true   # grep matching nothing (a clean build) exits 1 -- not a script error
+          fi
+
+          LOG_FILE=""
+          if [[ -f build.log ]]; then
+            SIZE="$(stat -c%s build.log)"
+            if [[ "$SIZE" -gt 1048576 ]]; then
+              gzip -f build.log
+              LOG_FILE="build.log.gz"
+            else
+              LOG_FILE="build.log"
+            fi
+          fi
+
+          {
+            echo "wheel.yml run ${{ github.run_id }} attempt ${{ github.run_attempt }}"
+            echo "Ref built    : ${{ steps.resolve_ref.outputs.build_ref }}"
+            echo "Commit       : ${{ github.sha }}"
+            echo "Workflow run : ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            echo "warm job result : ${{ needs.warm.result }}"
+            echo "gate decision   : warm_needed=$GATE_WARM_NEEDED fingerprint=$GATE_FINGERPRINT marker_key=$GATE_CACHE_KEY"
+            echo
+            echo "Step outcomes:"
+            echo "  Resolve build ref                 : ${{ steps.resolve_ref.outcome }}"
+            echo "  Prepare build environment          : ${{ steps.prepare.outcome }}"
+            echo "  Push started.txt                   : ${{ steps.started_checkpoint.outcome }}"
+            echo "  Build wheel                        : ${{ steps.build.outcome }}"
+            echo "  Install wheel + import smoke test  : ${{ steps.install_smoke.outcome }}"
+            echo "  Save warm marker                   : ${{ steps.save_marker.outcome }}"
+            echo "  Build manifest                     : ${{ steps.manifest.outcome }}"
+            echo "  Upload artifact                    : ${{ steps.upload.outcome }}"
+            echo "  Create or update GitHub Release    : ${{ steps.release.outcome }}"
+            echo
+            echo "--- df -h ---"
+            df -h
+            echo
+            echo "--- free -m ---"
+            free -m
+            echo
+            echo "--- nproc ---"
+            nproc
+            echo
+            echo "--- sccache --show-stats ---"
+            sccache --show-stats 2>&1 || echo "(unavailable)"
+            echo
+            echo "--- build manifest ---"
+            if [[ -n "${MANIFEST:-}" && -f "$MANIFEST" ]]; then
+              cat "$MANIFEST"
+            else
+              echo "(no manifest -- Build manifest step likely never ran)"
+            fi
+          } > summary.txt
+
+          echo "--- pushing diagnostics to ci-logs branch ---"
+          git config --global user.email "ci@users.noreply.github.com"
+          git config --global user.name "NATTEN fork CI"
+          REMOTE_URL="https://x-access-token:${GH_TOKEN}@github.com/luowyang/NATTEN.git"
+          WORKDIR="$(mktemp -d)"
+          if git ls-remote --exit-code "$REMOTE_URL" refs/heads/ci-logs >/dev/null 2>&1; then
+            git clone --quiet --depth 1 --branch ci-logs "$REMOTE_URL" "$WORKDIR"
+          else
+            git init --quiet -b ci-logs "$WORKDIR"
+          fi
+          DEST="$WORKDIR/runs/${{ github.run_id }}-${{ github.run_attempt }}"
+          mkdir -p "$DEST"
+          if [[ -n "$LOG_FILE" ]]; then
+            cp "$LOG_FILE" "$DEST/"
+          fi
+          cp summary.txt "$DEST/"
+          git -C "$WORKDIR" add -A
+          if git -C "$WORKDIR" diff --cached --quiet; then
+            echo "Nothing to commit (unexpected -- summary.txt should always be new)."
+          else
+            git -C "$WORKDIR" commit --quiet -m "wheel.yml run ${{ github.run_id }} attempt ${{ github.run_attempt }}: ${{ steps.build.outcome }}"
+            git -C "$WORKDIR" push --quiet "$REMOTE_URL" "HEAD:refs/heads/ci-logs"
+            echo "Pushed: runs/${{ github.run_id }}-${{ github.run_attempt }}/ on ci-logs"
+          fi
+          exit 0

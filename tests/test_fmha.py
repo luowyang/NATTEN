@@ -1445,5 +1445,30 @@ class FMHABackendTest(unittest.TestCase):
         self._test_randsweep(backend="hopper-fmha", max_tests=RAND_SWEEP_TESTS)
 
 
+class FMHALaunchFailureTest(unittest.TestCase):
+    def setUp(self):
+        _reset_everything()
+
+    def tearDown(self):
+        _reset_everything()
+
+    @skip_if_libnatten_is_not_supported()
+    @skip_if_hopper_kernels_not_supported()
+    def test_hopper_failed_launch_raises(self):
+        # Hopper FMHA puts batch on grid.y (IndividualTileScheduler in
+        # fmha_tile_scheduler.hpp), which CUDA caps at 65535, so one batch past
+        # that is a launch CUTLASS refuses to make. The failure has to reach the
+        # caller: the output tensor is whatever was in memory until the kernel
+        # writes it, so a returned tensor is a wrong answer, not a slow one.
+        torch.set_default_device("cuda")
+        shape = (65536, 32, 1, 32)
+        q = torch.randn(shape, dtype=torch.bfloat16)
+        k = torch.randn(shape, dtype=torch.bfloat16)
+        v = torch.randn(shape, dtype=torch.bfloat16)
+
+        with self.assertRaisesRegex(RuntimeError, "Failed to launch"):
+            attention(q, k, v, backend="hopper-fmha")
+
+
 if __name__ == "__main__":
     unittest.main()

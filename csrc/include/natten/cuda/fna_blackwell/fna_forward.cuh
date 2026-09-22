@@ -23,6 +23,9 @@
 
 #pragma once
 
+#include <stdexcept>
+#include <string>
+
 #include "cute/tensor.hpp"
 
 #include "cutlass/cutlass.h"
@@ -231,25 +234,26 @@ struct KernelForward {
     cutlass::Status status = cutlass::Status::kSuccess;
     status = op.can_implement(arguments);
     if (status != cutlass::Status::kSuccess) {
-      std::cerr << "This kernel is not supported. Last CUDA error is: "
-                << cudaGetErrorString(cudaGetLastError()) << std::endl;
-      return;
+      throw std::runtime_error(
+          std::string("This kernel is not supported. Last CUDA error is: ") +
+          cudaGetErrorString(cudaGetLastError()));
     }
 
     status = op.initialize(arguments, workspace_ptr, stream);
     if (status != cutlass::Status::kSuccess) {
-      std::cerr
-          << "Failed to initialize the CUTLASS kernel. Last CUDA error is: "
-          << cudaGetErrorString(cudaGetLastError()) << std::endl;
-      return;
+      throw std::runtime_error(
+          std::string(
+              "Failed to initialize the CUTLASS kernel. Last CUDA error is: ") +
+          cudaGetErrorString(cudaGetLastError()));
     }
 
     // Run
     status = op.run(stream);
     if (status != cutlass::Status::kSuccess) {
-      std::cerr << "Failed to launch the CUTLASS kernel. Last CUDA error is: "
-                << cudaGetErrorString(cudaGetLastError()) << std::endl;
-      return;
+      throw std::runtime_error(
+          std::string(
+              "Failed to launch the CUTLASS kernel. Last CUDA error is: ") +
+          cudaGetErrorString(cudaGetLastError()));
     }
 
 #if 0
