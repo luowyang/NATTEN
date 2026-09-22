@@ -589,6 +589,28 @@ def can_run_cutlass_fna(
     return True
 
 
+def check_cutlass_fna_device_compatibility(dtype: torch.dtype, device_cc: int) -> None:
+    if dtype not in (torch.float16, torch.bfloat16, torch.float32):
+        raise ValueError("CUTLASS FNA only supports FP16, BF16, and FP32.")
+    # Mirrors the C++ dispatch guard the kernels are actually launched under
+    # (csrc/src/fna_forward.cu:112, csrc/src/fna_backward.cu:178):
+    #   cc >= 80 || (cc >= 50 && dtype != bf16)
+    # i.e. FP16/FP32 need compute capability >= 50, BF16 needs >= 80. That
+    # expression, not can_run_cutlass_fna's uniform CC >= 60 gate above, is
+    # the source of truth this mirrors.
+    if dtype == torch.bfloat16:
+        if device_cc < 80:
+            raise ValueError(
+                "CUTLASS FNA requires compute capability 80 or higher for "
+                f"BF16 (50 or higher for FP16/FP32), got {device_cc}."
+            )
+    elif device_cc < 50:
+        raise ValueError(
+            "CUTLASS FNA requires compute capability 50 or higher for "
+            f"FP16/FP32 (80 or higher for BF16), got {device_cc}."
+        )
+
+
 ### Flex FMHA/FNA
 
 _FLEX_SUPPORTED = _TORCH_VERSION >= [2, 7]

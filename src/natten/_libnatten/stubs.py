@@ -51,6 +51,14 @@ na1d_backward = libnatten_import_error
 na2d_backward = libnatten_import_error
 na3d_backward = libnatten_import_error
 
+# CUTLASS 2.X variable-length FNA kernels
+varlen_na1d_forward = libnatten_import_error
+varlen_na2d_forward = libnatten_import_error
+varlen_na3d_forward = libnatten_import_error
+varlen_na1d_backward = libnatten_import_error
+varlen_na2d_backward = libnatten_import_error
+varlen_na3d_backward = libnatten_import_error
+
 # CUTLASS 3.X kernels
 ## SM90 - Hopper FMHA
 hopper_fmha_forward = libnatten_import_error
