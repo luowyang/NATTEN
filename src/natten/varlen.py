@@ -24,7 +24,10 @@
 ``utils/varlen.py``, the FMHA varlen parameter helpers).
 """
 
+import itertools
 import math
+import threading
+import weakref
 from typing import (
     Any,
     Callable,
@@ -48,6 +51,50 @@ if TYPE_CHECKING:
     from natten.backends.varlen_fna import _VarlenFnaResolvedState
 
 _VARLEN_INT32_MAX = 2**31 - 1
+
+# Handle id -> layout, for the compile path (natten.varlen_compile): under
+# torch.compile the entry points hand the operator a layout's `_handle`
+# tensor instead of the layout, so that no per-document Python value is
+# traced, and the operator looks the layout back up here. It lives in this
+# module rather than beside the operators because a layout registers itself
+# at construction, and importing the operator module from here would close a
+# cycle (varlen_compile -> natten.functional -> natten.varlen).
+#
+# Values are weak: a strong-valued registry would keep every layout ever
+# built alive forever (and so would never drop an entry), which in training --
+# one geometry per batch composition -- is an unbounded leak. Weak values make
+# the entry die exactly when the layout does, so the registry holds the live
+# layouts and needs no policy of its own.
+_HANDLE_REGISTRY: "weakref.WeakValueDictionary[int, VarlenLayout]" = (
+    weakref.WeakValueDictionary()
+)
+_HANDLE_LOCK = threading.Lock()
+_HANDLE_IDS = itertools.count()
+
+
+def _register_layout(layout: "VarlenLayout") -> int:
+    with _HANDLE_LOCK:
+        key = next(_HANDLE_IDS)
+        _HANDLE_REGISTRY[key] = layout
+    return key
+
+
+def _layout_from_handle(handle: Tensor) -> "VarlenLayout":
+    if handle.dim() != 0 or handle.dtype != torch.int64:
+        raise ValueError(
+            "Layout handle must be a 0-dim int64 tensor; got a "
+            f"{handle.dim()}-dim {handle.dtype} tensor."
+        )
+    key = int(handle.item())
+    with _HANDLE_LOCK:
+        layout = _HANDLE_REGISTRY.get(key)
+    if layout is None:
+        raise RuntimeError(
+            f"Layout handle {key} is not registered. A compiled graph kept a "
+            "handle to a VarlenLayout that has since been collected; keep the "
+            "layout alive for as long as the graph may run."
+        )
+    return layout
 
 
 def _normalize_token_layouts(
@@ -321,8 +368,25 @@ class VarlenLayout:
         self._permute_memo: Dict[
             Tuple[int, ...], Tuple["VarlenLayout", Tensor, Tensor]
         ] = {}
+        self._register_handle()
         if device is not None:
             self._materialize(torch.device(device))
+
+    def _register_handle(self) -> None:
+        """Gives this layout the handle the compile path passes in its place.
+
+        A CPU 0-dim int64 tensor: under ``torch.compile`` dynamo guards it by
+        metadata and never by value, so two layouts with different document
+        shapes are the same graph input. The registry holds this layout weakly,
+        so the entry goes away when the layout does and live layouts bound it.
+
+        ``inference_mode(False)`` for the same reason the rest of this module
+        takes it: a layout built inside inference mode would otherwise carry
+        an inference tensor into later normal-mode calls.
+        """
+        key = _register_layout(self)
+        with torch.inference_mode(False):
+            self._handle = torch.tensor(key, dtype=torch.int64)
 
     def __repr__(self) -> str:
         return (
@@ -723,7 +787,9 @@ class VarlenLayout:
         # local and must not cross a pickle boundary (a materialized CUDA
         # tensor pickled in one process and unpickled in a DataLoader worker
         # would carry device state across a process boundary, which is not
-        # meaningful).
+        # meaningful). The compile handle is process-local in the same way --
+        # its id means nothing in another process -- so it is left out here
+        # and a fresh one is taken in __setstate__.
         return {"shapes": self._shapes}
 
     def __setstate__(self, state: Dict[str, Any]) -> None:
@@ -734,3 +800,4 @@ class VarlenLayout:
         self._token_layouts = None
         self._fold_memo = {}
         self._permute_memo = {}
+        self._register_handle()

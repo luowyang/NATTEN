@@ -20,13 +20,16 @@
 # SOFTWARE.
 #
 #################################################################################################
-"""natten.varlen_compile: the handle registry, parity with the stock varlen
-entry points, and the property the whole module exists for -- a call whose
-document geometry changes does not recompile.
+"""na{1,2,3}d_varlen under torch.compile: same answers, one graph.
 
-Parity is asserted bitwise against na{1,2,3}d_varlen because the operator body
-calls exactly those entry points; anything but equality means the wrapper
-changed an argument on the way in.
+The entry points are the whole public surface; compile-safety is a property
+they have, not a second set of names. So everything here is stated against
+``na{1,2,3}d_varlen`` itself -- compiled against eager -- and the operator
+underneath (``natten.varlen_compile``) is only visible where the test is about
+the operator contract (opcheck) or about what the captured graph contains.
+
+Parity is asserted bitwise because the operator body calls the entry point:
+anything but equality means an argument changed meaning on the way in.
 """
 
 import gc
@@ -39,7 +42,7 @@ import natten
 import pytest
 import torch
 from natten._environment import _IS_CUDA_AVAILABLE, HAS_LIBNATTEN
-from natten.varlen_compile import _REGISTRY
+from natten.varlen import _HANDLE_REGISTRY
 
 # CompileCounter is a private torch._dynamo.testing utility; the sibling
 # test_varlen_layout.py depends on it for the same reason (counting compiled
@@ -79,7 +82,10 @@ class HandleCase:
 # One case per path _neighborhood_attention_varlen_generic can take, since the
 # operator wraps that whole function: the varlen kernel, both degenerate-axis
 # lowerings, the fully-degenerate identity, the uniform fixed-shape dispatch,
-# the all-empty short circuit, plus GQA and the other two ranks.
+# the all-empty short circuit, plus GQA and the other two ranks. The uniform,
+# all-empty and GQA cases are also the sentinels for _recording_autograd: they
+# are the paths whose last step is a plain tensor op, which come back with no
+# gradient at all if the operator body stops re-entering autograd.
 CASES = (
     HandleCase("3d-varlen", ((2, 4, 4), (1, 6, 5)), (2, 3, 3), (True, False, False)),
     HandleCase("3d-fold", ((2, 4, 4), (1, 6, 5)), (1, 3, 3), (False, False, False)),
@@ -101,11 +107,8 @@ CASES = (
 )
 
 
-def _entry_points(rank: int):
-    return (
-        getattr(natten, f"na{rank}d_varlen"),
-        getattr(natten, f"na{rank}d_varlen_handle"),
-    )
+def _entry_point(rank: int):
+    return getattr(natten, f"na{rank}d_varlen")
 
 
 def _inputs(case: HandleCase, dtype: torch.dtype, requires_grad: bool = False):
@@ -131,85 +134,76 @@ def _call_kwargs(case: HandleCase):
     }
 
 
-# ------------------------------------------------------------------ registry
+def _compiled(rank: int, backend="aot_eager"):
+    return torch.compile(
+        _entry_point(rank), backend=backend, fullgraph=True, dynamic=True
+    )
 
 
-def test_handle_registers_and_releases_with_the_object():
+# --------------------------------------------------- layout handle lifetime
+
+
+def test_layout_registers_a_handle_at_construction():
     layout = natten.VarlenLayout(((2, 3), (1, 4)))
-    handle = natten.VarlenLayoutHandle(layout)
-    key = int(handle.tensor)
+    key = int(layout._handle)
 
-    assert handle.tensor.dtype == torch.int64
-    assert handle.tensor.dim() == 0
-    assert handle.tensor.device.type == "cpu"
-    assert handle.layout is layout
-    assert _REGISTRY[key] is layout
-
-    del handle
-    gc.collect()
-    assert key not in _REGISTRY
+    assert layout._handle.dtype == torch.int64
+    assert layout._handle.dim() == 0
+    assert layout._handle.device.type == "cpu"
+    assert _HANDLE_REGISTRY[key] is layout
 
 
-def test_two_handles_for_one_layout_get_distinct_ids():
+def test_registry_entry_dies_with_the_layout():
     layout = natten.VarlenLayout(((2, 3),))
-    first = natten.VarlenLayoutHandle(layout)
-    second = natten.VarlenLayoutHandle(layout)
-    assert int(first.tensor) != int(second.tensor)
-    assert first.layout is second.layout
-
-
-def test_handle_rejects_non_layout():
-    with pytest.raises(TypeError):
-        natten.VarlenLayoutHandle(((2, 3),))  # type: ignore[arg-type]
-
-
-def test_handle_is_not_picklable():
-    handle = natten.VarlenLayoutHandle(natten.VarlenLayout(((2, 3),)))
-    with pytest.raises(TypeError, match="not picklable"):
-        pickle.dumps(handle)
-
-
-def test_released_handle_tensor_fails_loudly():
-    handle = natten.VarlenLayoutHandle(natten.VarlenLayout(((4,),)))
-    tensor = handle.tensor
-    del handle
+    key = int(layout._handle)
+    del layout
     gc.collect()
-    query = torch.zeros(4, 1, 32)
+    assert key not in _HANDLE_REGISTRY
+
+
+def test_two_layouts_get_distinct_handles():
+    first = natten.VarlenLayout(((2, 3),))
+    second = natten.VarlenLayout(((2, 3),))
+    assert int(first._handle) != int(second._handle)
+
+
+def test_pickle_round_trip_reregisters():
+    # A layout pickled to a DataLoader worker or another rank has to keep
+    # working there; the handle id means nothing across processes, so the
+    # unpickled layout takes a fresh one.
+    layout = natten.VarlenLayout(((2, 3), (1, 4)))
+    restored = pickle.loads(pickle.dumps(layout))
+    assert restored.shapes == layout.shapes
+    assert int(restored._handle) != int(layout._handle)
+    assert _HANDLE_REGISTRY[int(restored._handle)] is restored
+
+
+def test_stale_handle_fails_loudly():
+    from natten.varlen import _layout_from_handle
+
+    layout = natten.VarlenLayout(((4,),))
+    handle = layout._handle
+    del layout
+    gc.collect()
     with pytest.raises(RuntimeError, match="not registered"):
-        natten.na1d_varlen_handle(query, query, query, tensor, kernel_size=(2,))
+        _layout_from_handle(handle)
 
 
-def test_malformed_handle_tensor_is_rejected():
-    query = torch.zeros(4, 1, 32)
+def test_malformed_handle_is_rejected():
+    from natten.varlen import _layout_from_handle
+
     with pytest.raises(ValueError, match="0-dim int64"):
-        natten.na1d_varlen_handle(
-            query, query, query, torch.zeros(1, dtype=torch.int64), kernel_size=(2,)
-        )
+        _layout_from_handle(torch.zeros(1, dtype=torch.int64))
 
 
-def test_handle_must_be_a_tensor():
-    handle = natten.VarlenLayoutHandle(natten.VarlenLayout(((4,),)))
-    query = torch.zeros(4, 1, 32)
-    with pytest.raises(TypeError, match="handle.tensor"):
-        natten.na1d_varlen_handle(query, query, query, handle, kernel_size=(2,))
-
-
-def test_boolean_window_arguments_are_rejected_before_the_schema_coerces_them():
-    handle = natten.VarlenLayoutHandle(natten.VarlenLayout(((4,),)))
-    query = torch.zeros(4, 1, 32)
-    with pytest.raises(TypeError, match="not booleans"):
-        natten.na1d_varlen_handle(
-            query, query, query, handle.tensor, kernel_size=(True,)
-        )
-
-
-def test_unsupported_backend_is_rejected():
-    handle = natten.VarlenLayoutHandle(natten.VarlenLayout(((4,),)))
-    query = torch.zeros(4, 1, 32)
-    with pytest.raises(NotImplementedError):
-        natten.na1d_varlen_handle(
-            query, query, query, handle.tensor, kernel_size=(2,), backend="flex-fna"
-        )
+def test_no_handle_names_are_public():
+    # The compile path must not add public API. This is the invariant the
+    # rework exists for.
+    public = set(natten.__all__)
+    assert not [name for name in public if "handle" in name.lower()]
+    assert {"VarlenLayout", "na1d_varlen", "na2d_varlen", "na3d_varlen"} <= public
+    for name in ("VarlenLayoutHandle", "na3d_varlen_handle"):
+        assert not hasattr(natten, name), name
 
 
 # ------------------------------------------------------------------- parity
@@ -219,88 +213,99 @@ def test_unsupported_backend_is_rejected():
 @pytest.mark.parametrize("case", CASES, ids=lambda case: case.name)
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
 @pytest.mark.parametrize("return_lse", [False, True])
-def test_forward_matches_stock_entry_point_bitwise(case, dtype, return_lse):
-    stock, handled = _entry_points(case.rank)
-    query, key, value = _inputs(case, dtype)
-    layout = natten.VarlenLayout(case.shapes)
-    handle = natten.VarlenLayoutHandle(layout)
+def test_compiled_forward_matches_eager_bitwise(case, dtype, return_lse):
+    torch._dynamo.reset()
+    try:
+        entry = _entry_point(case.rank)
+        query, key, value = _inputs(case, dtype)
+        layout = natten.VarlenLayout(case.shapes)
 
-    # The handle stays on the CPU while q/k/v are on the GPU: the operator has
-    # to accept that mix, so every call below exercises it.
-    assert handle.tensor.device.type == "cpu"
-    assert query.device.type == "cuda"
+        # The handle is CPU while q/k/v are CUDA: the operator has to take
+        # that mix, so every case below exercises it.
+        assert layout._handle.device.type == "cpu"
+        assert query.device.type == "cuda"
 
-    expected = stock(
-        query, key, value, layout, return_lse=return_lse, **_call_kwargs(case)
-    )
-    actual = handled(
-        query, key, value, handle.tensor, return_lse=return_lse, **_call_kwargs(case)
-    )
+        expected = entry(
+            query, key, value, layout, return_lse=return_lse, **_call_kwargs(case)
+        )
+        actual = _compiled(case.rank)(
+            query, key, value, layout, return_lse=return_lse, **_call_kwargs(case)
+        )
 
-    if return_lse:
-        for name, want, got in zip(("output", "logsumexp"), expected, actual):
-            assert torch.equal(want, got), name
-    else:
-        assert torch.equal(expected, actual)
+        if return_lse:
+            for name, want, got in zip(("output", "logsumexp"), expected, actual):
+                assert torch.equal(want, got), name
+        else:
+            assert torch.equal(expected, actual)
+    finally:
+        torch._dynamo.reset()
 
 
 @requires_libnatten
 @pytest.mark.parametrize("case", CASES, ids=lambda case: case.name)
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
-def test_backward_matches_stock_entry_point_bitwise(case, dtype):
+def test_compiled_backward_matches_eager_bitwise(case, dtype):
     # Deterministic mode pins the backward's KV-split selection to 1 per axis
     # (backends.varlen_fna._build_varlen_fna_state), without which the split
-    # reduction makes "bitwise" undefined run to run, for the stock path as
+    # reduction makes "bitwise" undefined run to run, for the eager path as
     # much as for this one.
     previous = torch.are_deterministic_algorithms_enabled()
     torch.use_deterministic_algorithms(True)
+    torch._dynamo.reset()
     try:
-        stock, handled = _entry_points(case.rank)
+        entry = _entry_point(case.rank)
         layout = natten.VarlenLayout(case.shapes)
-        handle = natten.VarlenLayoutHandle(layout)
         kwargs = _call_kwargs(case)
 
-        stock_inputs = _inputs(case, dtype, requires_grad=True)
-        output = stock(*stock_inputs, layout, **kwargs)
+        eager_inputs = _inputs(case, dtype, requires_grad=True)
+        output = entry(*eager_inputs, layout, **kwargs)
         grad = torch.ones_like(output)
-        expected = torch.autograd.grad(output, stock_inputs, grad)
+        expected = torch.autograd.grad(output, eager_inputs, grad)
 
-        handle_inputs = _inputs(case, dtype, requires_grad=True)
-        output = handled(*handle_inputs, handle.tensor, **kwargs)
-        actual = torch.autograd.grad(output, handle_inputs, grad)
+        compiled_inputs = _inputs(case, dtype, requires_grad=True)
+        output = _compiled(case.rank)(*compiled_inputs, layout, **kwargs)
+        actual = torch.autograd.grad(output, compiled_inputs, grad)
 
         for name, want, got in zip(("dq", "dk", "dv"), expected, actual):
             assert torch.equal(want, got), name
     finally:
         torch.use_deterministic_algorithms(previous)
+        torch._dynamo.reset()
 
 
 @requires_libnatten
-def test_fully_degenerate_output_does_not_alias_value():
-    # The fully-degenerate path's output is exactly `value`, and a custom op
-    # may not return a view of an input.
-    case = HandleCase("alias", ((2, 4, 4), (1, 6, 5)), (1, 1, 1), (False, False, False))
+def test_eager_is_untouched_by_the_compile_branch():
+    # Nothing about the eager path may change: same call, no compile in sight.
+    case = CASES[0]
     query, key, value = _inputs(case, torch.float32)
-    handle = natten.VarlenLayoutHandle(natten.VarlenLayout(case.shapes))
-    output = natten.na3d_varlen_handle(
-        query, key, value, handle.tensor, **_call_kwargs(case)
-    )
-    assert output.data_ptr() != value.data_ptr()
-    assert torch.equal(output, value)
+    layout = natten.VarlenLayout(case.shapes)
+    first = natten.na3d_varlen(query, key, value, layout, **_call_kwargs(case))
+    second = natten.na3d_varlen(query, key, value, layout, **_call_kwargs(case))
+    assert torch.equal(first, second)
+    assert not torch.compiler.is_compiling()
 
 
-def _op_args(case: HandleCase, query, key, value, handle):
+# ----------------------------------------------------------------- operator
+
+
+def _op_args(case: HandleCase, query, key, value, layout):
     return (
         query,
         key,
         value,
-        handle.tensor,
+        layout._handle,
         case.rank,
         list(case.kernel_size),
         [1] * case.rank,
         [1] * case.rank,
         list(case.is_causal),
         0.125,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
         False,
     )
 
@@ -313,10 +318,10 @@ def test_opcheck_accepts_the_forward_operator(case):
     # everything downstream, and the lowered paths (fold, permute, identity,
     # uniform, all-empty) each build their output differently.
     query, key, value = _inputs(case, torch.float32, requires_grad=True)
-    handle = natten.VarlenLayoutHandle(natten.VarlenLayout(case.shapes))
+    layout = natten.VarlenLayout(case.shapes)
     torch.library.opcheck(
         torch.ops.natten.varlen_attention_fwd,
-        _op_args(case, query, key, value, handle),
+        _op_args(case, query, key, value, layout),
     )
 
 
@@ -329,8 +334,8 @@ def test_opcheck_accepts_the_backward_operator(case):
         device="cuda",
         dtype=torch.float32,
     )
-    handle = natten.VarlenLayoutHandle(natten.VarlenLayout(case.shapes))
-    args = _op_args(case, query, key, value, handle)
+    layout = natten.VarlenLayout(case.shapes)
+    args = _op_args(case, query, key, value, layout)
     torch.library.opcheck(
         torch.ops.natten.varlen_attention_bwd,
         (*args[:3], grad_output, *args[3:]),
@@ -340,56 +345,90 @@ def test_opcheck_accepts_the_backward_operator(case):
     )
 
 
+@requires_libnatten
+def test_fully_degenerate_output_does_not_alias_value():
+    # The fully-degenerate path's output is exactly `value`, and a custom op
+    # may not return a view of an input.
+    case = HandleCase("alias", ((2, 4, 4), (1, 6, 5)), (1, 1, 1), (False, False, False))
+    query, key, value = _inputs(case, torch.float32)
+    layout = natten.VarlenLayout(case.shapes)
+    output = _compiled(3)(query, key, value, layout, **_call_kwargs(case))
+    assert output.data_ptr() != value.data_ptr()
+    assert torch.equal(output, value)
+
+
+@requires_libnatten
+def test_explicit_tile_shapes_reach_the_compiled_call():
+    # The operator schema carries the tile knobs, so a compiled call accepts
+    # exactly what an eager one does -- including the arguments that make the
+    # eager path raise, which must raise the same way.
+    case = CASES[0]
+    query, key, value = _inputs(case, torch.float32)
+    layout = natten.VarlenLayout(case.shapes)
+    kwargs = dict(_call_kwargs(case), q_tile_shape=(2, 4, 4), kv_tile_shape=(2, 4, 4))
+    expected = natten.na3d_varlen(query, key, value, layout, **kwargs)
+    actual = _compiled(3)(query, key, value, layout, **kwargs)
+    assert torch.equal(expected, actual)
+
+
 # ------------------------------------------------------------------ compile
 
 
-def _compiled_geometry_stream(attention, layout_argument):
-    """Runs two different packings through one compiled callable."""
-
-    def run(query, key, value, layout_like):
-        return attention(
-            query, key, value, layout_like, kernel_size=(2, 3, 3), scale=0.125
-        )
-
+@requires_libnatten
+def test_changing_geometry_compiles_once():
+    torch._dynamo.reset()
     counter = CompileCounter()
-    compiled = torch.compile(run, backend=counter, fullgraph=True, dynamic=True)
-    for shapes in (((2, 4, 4), (1, 6, 5)), ((3, 4, 4), (2, 6, 5), (1, 2, 2))):
-        case = HandleCase("stream", shapes, (2, 3, 3), (False, False, False))
-        query, key, value = _inputs(case, torch.float32)
-        compiled(query, key, value, layout_argument(shapes))
-    return counter.frame_count
-
-
-@requires_libnatten
-def test_changing_geometry_compiles_once_with_a_handle():
-    torch._dynamo.reset()
-    handles = []
-
-    def layout_argument(shapes):
-        handle = natten.VarlenLayoutHandle(natten.VarlenLayout(shapes))
-        handles.append(handle)  # keep alive for the duration of the run
-        return handle.tensor
-
+    compiled = torch.compile(
+        natten.na3d_varlen, backend=counter, fullgraph=True, dynamic=True
+    )
+    layouts = []
     try:
-        frames = _compiled_geometry_stream(natten.na3d_varlen_handle, layout_argument)
+        for shapes in (((2, 4, 4), (1, 6, 5)), ((3, 4, 4), (2, 6, 5), (1, 2, 2))):
+            case = HandleCase("stream", shapes, (2, 3, 3), (False, False, False))
+            query, key, value = _inputs(case, torch.float32)
+            layout = natten.VarlenLayout(shapes)
+            layouts.append(layout)  # keep alive for the duration of the run
+            compiled(query, key, value, layout, kernel_size=(2, 3, 3), scale=0.125)
     finally:
         torch._dynamo.reset()
-    assert frames == 1
+    assert counter.frame_count == 1
 
 
 @requires_libnatten
-def test_changing_geometry_recompiles_without_a_handle():
-    # Negative control for the test above: with the layout passed as a Python
-    # object, the same stream specializes. Without this, a stream that never
-    # reached the compiler at all would pass the positive test.
+def test_captured_graph_holds_exactly_one_natten_op():
+    # The positive form of "the layout was not traced": whatever dynamo
+    # captured contains the one opaque call and nothing else of natten's --
+    # no schedule build, no lowering, no second kernel dispatch.
+    captured = []
+
+    def inspecting_backend(gm, example_inputs):
+        names = []
+        for node in gm.graph.nodes:
+            if node.op != "call_function":
+                continue
+            name = getattr(node.target, "name", None)
+            qualified = name() if callable(name) else str(node.target)
+            if "natten" in qualified:
+                names.append(qualified)
+        captured.append(names)
+        return gm.forward
+
     torch._dynamo.reset()
+    case = CASES[0]
+    layout = natten.VarlenLayout(case.shapes)
     try:
-        frames = _compiled_geometry_stream(
-            natten.na3d_varlen, lambda shapes: natten.VarlenLayout(shapes)
+        compiled = torch.compile(
+            natten.na3d_varlen,
+            backend=inspecting_backend,
+            fullgraph=True,
+            dynamic=True,
         )
+        compiled(*_inputs(case, torch.float32), layout, **_call_kwargs(case))
     finally:
         torch._dynamo.reset()
-    assert frames > 1
+
+    assert len(captured) == 1, captured
+    assert captured[0] == ["natten::varlen_attention_fwd"], captured[0]
 
 
 @requires_libnatten
@@ -398,27 +437,23 @@ def test_backward_survives_aot_autograd():
     # operator's body: dereferencing the handle there (rather than inside
     # natten::varlen_attention_bwd) raises GuardOnDataDependentSymNode on
     # .item(). This is that regression.
-    torch._dynamo.reset()
-    case = CASES[0]
-    handle = natten.VarlenLayoutHandle(natten.VarlenLayout(case.shapes))
     previous = torch.are_deterministic_algorithms_enabled()
     torch.use_deterministic_algorithms(True)
+    torch._dynamo.reset()
+    case = CASES[0]
+    layout = natten.VarlenLayout(case.shapes)
 
-    def run(query, key, value, layout_handle):
-        output = natten.na3d_varlen_handle(
-            query, key, value, layout_handle, **_call_kwargs(case)
-        )
-        return output.square().sum()
+    def run(entry, query, key, value):
+        return entry(query, key, value, layout, **_call_kwargs(case)).square().sum()
 
     try:
-        compiled = torch.compile(run, backend="aot_eager", fullgraph=True, dynamic=True)
         inputs = _inputs(case, torch.float32, requires_grad=True)
-        compiled(*inputs, handle.tensor).backward()
+        run(_compiled(3), *inputs).backward()
         for name, tensor in zip(("dq", "dk", "dv"), inputs):
             assert tensor.grad is not None, name
 
         eager_inputs = _inputs(case, torch.float32, requires_grad=True)
-        run(*eager_inputs, handle.tensor).backward()
+        run(natten.na3d_varlen, *eager_inputs).backward()
         for name, compiled_input, eager_input in zip(
             ("dq", "dk", "dv"), inputs, eager_inputs
         ):

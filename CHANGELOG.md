@@ -1,24 +1,27 @@
 # Changelog
 
 ## [Main branch]
-* Added `natten.VarlenLayoutHandle` and
-  `natten.na1d_varlen_handle`/`na2d_varlen_handle`/`na3d_varlen_handle`, a
-  `torch.compile`-friendly form of the variable-length entry points: the layout
-  travels as a CPU 0-dim int64 handle tensor and the call goes through a custom
-  op, so dynamo records one opaque call instead of tracing the schedule
-  resolution and guarding on the per-document extents it reads. A stream of
-  differently-shaped packings then shares one graph rather than specializing
-  per packing. The numerics are the stock path's -- the operator body calls
-  `na{1,2,3}d_varlen` itself. **Backward re-runs that forward once** under
-  `enable_grad` and returns `torch.autograd.grad`: bit-for-bit identical to the
-  stock backward by construction, degenerate-axis lowering included, at the
+* `na{1,2,3}d_varlen` are now safe to call from inside `torch.compile` without
+  specializing on the packing. They used to resolve their schedule from the
+  `VarlenLayout` in traced Python, so dynamo guarded on every per-document
+  extent that resolution read, and a caller whose document shapes changed from
+  call to call -- sequence packing's whole point -- got one graph per packing,
+  with the geometry baked in. Each entry point now checks
+  `torch.compiler.is_compiling()` first and, when it is, routes the call
+  through an opaque operator instead, carrying the layout as a private handle
+  tensor the layout registers at construction. The compiled graph then holds no
+  document geometry at all and one graph serves every packing. **No new public
+  names, and eager is untouched:** `VarlenLayout` and
+  `na{1,2,3}d_varlen` are the whole surface, the compiled path accepts exactly
+  the same arguments as the eager one, and the operator body calls the entry
+  point itself, so the numerics are the eager path's.
+* Variable-length backward under `torch.compile` replays the forward once
+  rather than driving the inner kernels from a saved output/logsumexp: it is
+  bit-for-bit the eager backward, degenerate-axis lowering included, at the
   cost of one extra forward per backward (roughly +29% of attention backward
-  time); a backward that drives the inner kernels from a saved
-  output/logsumexp instead is the planned follow-up. Explicit tile shapes and
-  `backward_kv_splits` are not accepted (a `kernel_size = 1` axis changes the
-  call's rank, where the stock entry point rejects them anyway), and a handle
-  is process-local, not picklable, and valid only while the
-  `VarlenLayoutHandle` object is alive.
+  time). `backward(create_graph=True)` is not supported through it, the same
+  limit the eager path has. Driving the kernels from saved state is the
+  planned follow-up.
 * `na{1,2,3}d` take the self-attention fast path only when the caller names no
   `backend`. A window covering a whole axis makes the problem equivalent to
   (causal, in 1-D) self attention, which NATTEN can answer with `attention` and

@@ -68,6 +68,7 @@ from natten.utils.checks import (
     varlen_tensor_checks,
 )
 from natten.varlen import VarlenLayout
+from natten.varlen_compile import _varlen_compiled_call
 
 logger = log.get_logger(__name__)
 
@@ -1607,6 +1608,31 @@ def na1d_varlen(
         logsumexp (Tensor): only returned when `return_lse=True`.
             `[total_tokens, heads]` packed logsumexp.
     """
+    # First statement, before anything reads `layout`: under torch.compile the
+    # call goes through an opaque operator instead, so that dynamo never traces
+    # the schedule resolution below and never guards on this layout's
+    # per-document extents. See natten.varlen_compile. Eager is unaffected.
+    if torch.compiler.is_compiling():
+        return _varlen_compiled_call(
+            1,
+            query,
+            key,
+            value,
+            layout,
+            kernel_size,
+            stride,
+            dilation,
+            is_causal,
+            scale,
+            backend,
+            q_tile_shape,
+            kv_tile_shape,
+            backward_q_tile_shape,
+            backward_kv_tile_shape,
+            backward_kv_splits,
+            backward_use_pt_reduction,
+            return_lse,
+        )
     return _neighborhood_attention_varlen_generic(
         na_dim=1,
         query=query,
@@ -1718,6 +1744,31 @@ def na2d_varlen(
         logsumexp (Tensor): only returned when `return_lse=True`.
             `[total_tokens, heads]` packed logsumexp.
     """
+    # First statement, before anything reads `layout`: under torch.compile the
+    # call goes through an opaque operator instead, so that dynamo never traces
+    # the schedule resolution below and never guards on this layout's
+    # per-document extents. See natten.varlen_compile. Eager is unaffected.
+    if torch.compiler.is_compiling():
+        return _varlen_compiled_call(
+            2,
+            query,
+            key,
+            value,
+            layout,
+            kernel_size,
+            stride,
+            dilation,
+            is_causal,
+            scale,
+            backend,
+            q_tile_shape,
+            kv_tile_shape,
+            backward_q_tile_shape,
+            backward_kv_tile_shape,
+            backward_kv_splits,
+            backward_use_pt_reduction,
+            return_lse,
+        )
     return _neighborhood_attention_varlen_generic(
         na_dim=2,
         query=query,
@@ -1829,6 +1880,31 @@ def na3d_varlen(
         logsumexp (Tensor): only returned when `return_lse=True`.
             `[total_tokens, heads]` packed logsumexp.
     """
+    # First statement, before anything reads `layout`: under torch.compile the
+    # call goes through an opaque operator instead, so that dynamo never traces
+    # the schedule resolution below and never guards on this layout's
+    # per-document extents. See natten.varlen_compile. Eager is unaffected.
+    if torch.compiler.is_compiling():
+        return _varlen_compiled_call(
+            3,
+            query,
+            key,
+            value,
+            layout,
+            kernel_size,
+            stride,
+            dilation,
+            is_causal,
+            scale,
+            backend,
+            q_tile_shape,
+            kv_tile_shape,
+            backward_q_tile_shape,
+            backward_kv_tile_shape,
+            backward_kv_splits,
+            backward_use_pt_reduction,
+            return_lse,
+        )
     return _neighborhood_attention_varlen_generic(
         na_dim=3,
         query=query,
