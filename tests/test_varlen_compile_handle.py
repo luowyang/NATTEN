@@ -289,26 +289,54 @@ def test_fully_degenerate_output_does_not_alias_value():
     assert torch.equal(output, value)
 
 
+def _op_args(case: HandleCase, query, key, value, handle):
+    return (
+        query,
+        key,
+        value,
+        handle.tensor,
+        case.rank,
+        list(case.kernel_size),
+        [1] * case.rank,
+        [1] * case.rank,
+        list(case.is_causal),
+        0.125,
+        False,
+    )
+
+
 @requires_libnatten
-def test_opcheck_accepts_the_operator():
-    case = CASES[0]
+@pytest.mark.parametrize("case", CASES, ids=lambda case: case.name)
+def test_opcheck_accepts_the_forward_operator(case):
+    # Every case, not just the plain varlen kernel: inductor takes the fake
+    # kernel's metadata -- shape, dtype and strides -- at face value for
+    # everything downstream, and the lowered paths (fold, permute, identity,
+    # uniform, all-empty) each build their output differently.
     query, key, value = _inputs(case, torch.float32, requires_grad=True)
     handle = natten.VarlenLayoutHandle(natten.VarlenLayout(case.shapes))
     torch.library.opcheck(
         torch.ops.natten.varlen_attention_fwd,
-        (
-            query,
-            key,
-            value,
-            handle.tensor,
-            3,
-            list(case.kernel_size),
-            [1, 1, 1],
-            [1, 1, 1],
-            list(case.is_causal),
-            0.125,
-            False,
-        ),
+        _op_args(case, query, key, value, handle),
+    )
+
+
+@requires_libnatten
+@pytest.mark.parametrize("case", CASES, ids=lambda case: case.name)
+def test_opcheck_accepts_the_backward_operator(case):
+    query, key, value = _inputs(case, torch.float32)
+    grad_output = torch.ones(
+        (case.total_tokens, case.heads, case.head_dim_v),
+        device="cuda",
+        dtype=torch.float32,
+    )
+    handle = natten.VarlenLayoutHandle(natten.VarlenLayout(case.shapes))
+    args = _op_args(case, query, key, value, handle)
+    torch.library.opcheck(
+        torch.ops.natten.varlen_attention_bwd,
+        (*args[:3], grad_output, *args[3:]),
+        # This operator *is* a backward and registers no autograd of its own,
+        # so the autograd-registration check has nothing to check here.
+        test_utils=("test_schema", "test_faketensor", "test_aot_dispatch_dynamic"),
     )
 
 

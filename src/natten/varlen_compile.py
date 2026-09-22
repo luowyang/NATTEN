@@ -344,6 +344,10 @@ def _varlen_attention_bwd(
     would have to reproduce the fold, the permute and its inverse, and the
     uniform path's separate fixed-shape configuration). It costs one extra
     forward per backward.
+
+    This operator registers no autograd of its own, so
+    ``backward(create_graph=True)`` is unsupported -- same as the stock path,
+    whose ``VarlenCutlassFNAAutogradFn.backward`` is not differentiable either.
     """
     layout = _lookup(layout_handle)
     with _recording_autograd(), torch.enable_grad():
