@@ -13,7 +13,7 @@ nothing and only exists to keep the compiler cache current.
 
 | Channel | Triggered by | Version | Published as | Kept |
 | --- | --- | --- | --- | --- |
-| `release` | push of a `fork/*` tag, or a dispatch whose `ref` input is a `fork/*` tag | `src/natten/version.py` exactly as `assemble.sh` stamped it, e.g. `0.21.7+fork.3` | a normal GitHub **Release** on that tag, wheel + manifest attached | permanently |
+| `release` | push of a `fork/*` tag (`release.yml` dispatches the build onto `fork-ci`, see below), or a dispatch whose `ref` input is a `fork/*` tag | `src/natten/version.py` exactly as `assemble.sh` stamped it, e.g. `0.21.7+fork.3` | a normal GitHub **Release** on that tag, wheel + manifest attached | permanently |
 | `nightly` | a dispatch with `channel=nightly` — normally the 19:00 UTC schedule in `nightly.yml` on `main` | stamped by CI as `<newest fork/* tag's version>.dev<YYYYMMDD>`, e.g. `0.21.7+fork.3.dev20260922` | a GitHub **pre-release** tagged `nightly/<YYYYMMDD>`, created on the commit that was built, wheel + manifest attached | 14 days, then deleted tag and all |
 | `warm` | push to `dev`, or any dispatch that does not name a `fork/*` tag | whatever the branch already carries | nothing is published — the wheel is a workflow artifact only | 30 days (artifact retention) |
 
@@ -108,7 +108,13 @@ integration/assemble.sh N <path-to-fork-checkout> --tag
 git -C <assemble.sh's --worktree, default wt_dev> push origin refs/tags/fork/<version>
 ```
 
-Pushing that tag runs `wheel.yml` on the `release` channel: it builds the wheel, runs a CPU-only
+Pushing that tag fires `release.yml`, a one-step workflow that dispatches `wheel.yml` on `fork-ci`
+with `ref=<the tag>` and `channel=release`. The indirection is for the cache: GitHub's Actions cache is
+readable only from the ref that wrote it or from the default branch, so a build triggered directly by
+the tag push could never reuse what the nightlies (dispatched on `fork-ci`) left in sccache and every
+release was a cold build (fork.3: 1h56m). Dispatched onto `fork-ci`, a release of a tree the nightly
+already built skips the warm shards and finishes in about 40 minutes. The build then runs on the
+`release` channel exactly as before: it builds the wheel, runs a CPU-only
 import smoke test, uploads the wheel + manifest as a workflow artifact, and creates (or updates, if
 one already exists) a GitHub Release for the tag with the wheel and manifest attached. A release is
 **not** marked pre-release — `fork/*` is this fork's real release channel, and a pre-release is

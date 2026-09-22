@@ -7,7 +7,9 @@ name: wheel
 # THREE CHANNELS, ONE PIPELINE (gate -> warm -> build). Everything up to
 # and including the wheel is identical in all three; the channel only
 # decides what version the wheel carries and where it goes afterwards:
-#   - release  a fork/* tag. Version comes from src/natten/version.py as
+#   - release  a fork/* tag, built via release.yml's dispatch onto
+#              fork-ci (so it shares the nightlies' cache scope; see
+#              that file). Version comes from src/natten/version.py as
 #              assemble.sh stamped it. Publishes a normal (not pre-)
 #              GitHub Release on that tag, kept forever.
 #   - nightly  a dispatch with channel=nightly (normally from nightly.yml
@@ -62,8 +64,10 @@ name: wheel
 # (runs/<run_id>-<attempt>/{build.log,summary.txt}).
 #
 # Triggers:
-#   - push of a tag matching fork/* (the normal release path: assemble.sh
-#     ... --tag, then `git push origin refs/tags/fork/<version>`)
+#   - a dispatch from release.yml, which fires on a push of a tag matching
+#     fork/* (the normal release path: assemble.sh ... --tag, then
+#     `git push origin refs/tags/fork/<version>`) and runs this workflow
+#     with ref=<the tag>, channel=release
 #   - push to dev (the warm channel: keeps sccache current with the
 #     integration branch, so the next release or nightly is cheap)
 #   - workflow_dispatch, with a `ref` input (tag, branch, or commit) to
@@ -79,8 +83,6 @@ name: wheel
 
 on:
   push:
-    tags:
-      - 'fork/*'
     branches:
       - dev
   workflow_dispatch:
@@ -211,8 +213,8 @@ jobs:
           # marker that yesterday's build saved and skip the warm shards.
 
           # What gets built: `inputs.ref` when a dispatch names one,
-          # otherwise the ref this run was triggered on (a fork/* tag push,
-          # a dev push, or a dispatch that left `ref` blank). Checked by
+          # otherwise the ref this run was triggered on (a dev push, or a
+          # dispatch that left `ref` blank). Checked by
           # name, not by github.ref_type, because github.ref_type describes
           # the ref the *run* was dispatched against (e.g. the fork-ci
           # branch), not the ref actually built.
@@ -394,7 +396,7 @@ jobs:
           # Did you forget to run actions/checkout before running your
           # local action?") when an earlier revision of this workflow had
           # prepare-build-env check itself out as its own first step. An
-          # empty ref (push-tag trigger, or a dispatch with no explicit
+          # empty ref (dev push, or a dispatch with no explicit
           # input) falls back to actions/checkout's own default
           # (github.sha), which is exactly right for both cases.
 
@@ -563,7 +565,7 @@ jobs:
           # Did you forget to run actions/checkout before running your
           # local action?") when an earlier revision of this workflow had
           # prepare-build-env check itself out as its own first step. An
-          # empty ref (push-tag trigger, or a dispatch with no explicit
+          # empty ref (dev push, or a dispatch with no explicit
           # input) falls back to actions/checkout's own default
           # (github.sha), which is exactly right for both cases.
 
