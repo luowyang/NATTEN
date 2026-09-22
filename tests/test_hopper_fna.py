@@ -26,6 +26,7 @@ import random
 import unittest
 from itertools import product
 
+import pytest
 import torch
 from natten._environment import _NUM_RAND_SWEEP_TESTS as RAND_SWEEP_TESTS
 from natten.backends.configs.cutlass_hopper import (
@@ -637,6 +638,78 @@ class HopperFNAComputeDeltaRangeTest(unittest.TestCase):
                 rtol=atol,
                 msg=lambda m, name=name: f"{name}: {m}",
             )
+
+
+class HopperFNAPartialKVTileRangeTest(unittest.TestCase):
+    """The Hopper FP16 backward over a partial last KV tile: dQ turns to NaN.
+
+    Known issue, luowyang/NATTEN#<待填>. Same family as the `dO * O` reduction
+    overflow above -- a `0 * Inf` once an intermediate leaves FP16's range --
+    but a different site: this one is inside the Hopper backward itself, and
+    the FP32 conversion in the reduction does not reach it.
+
+    With a `kernel_size` of 3 or 7 the NaNs land on the last `kernel_size // 2`
+    queries of dQ, and only when the extent is not a whole number of KV tiles;
+    dK and dV stay finite, and `cutlass-fna` is unaffected. Two independent
+    changes make it disappear: an extent of exactly one KV tile (128 for this
+    configuration, whose backward KV tile is 128), and magnitudes whose
+    `O * dO` stays inside FP16 (`v = 128`, `dO = 256`, product 3.3e4). That is
+    why HopperFNAComputeDeltaRangeTest above uses an extent of 128.
+    """
+
+    def setUp(self):
+        _reset_everything()
+
+    def tearDown(self):
+        _reset_everything()
+
+    @pytest.mark.xfail(
+        reason="Hopper FP16 backward leaves half's range on a partial last KV "
+        "tile; luowyang/NATTEN#<待填>.",
+        strict=True,
+    )
+    @skip_if_libnatten_is_not_supported()
+    @skip_if_hopper_kernels_not_supported()
+    def test_backward_over_a_partial_last_kv_tile(self):
+        if not supports_float16(torch.device("cuda")):
+            self.skipTest("float16 is not supported on this device.")
+
+        torch.set_default_device("cuda")
+        # 64 is half a KV tile for this configuration, so the last tile is
+        # partial.
+        batch, extent, heads, head_dim = 2, 64, 2, 32
+        kernel_size = (7,)
+        shape = (batch, extent, heads, head_dim)
+
+        with torch.no_grad():
+            q_ = torch.randn(shape, dtype=torch.float32) * 0.1
+            k_ = torch.randn(shape, dtype=torch.float32) * 0.1
+            # Every output lands on 256 and every incident gradient is 512, so
+            # every `O * dO` is 131072 -- twice FP16's largest value.
+            v_ = torch.full(shape, 256.0, dtype=torch.float32)
+            d_out_ = torch.full(shape, 512.0, dtype=torch.float32)
+
+        q = q_.half().requires_grad_(True)
+        k = k_.half().requires_grad_(True)
+        v = v_.half().requires_grad_(True)
+        out = na1d(q, k, v, kernel_size=kernel_size, backend="hopper-fna")
+        out.backward(d_out_.half())
+        assert q.grad is not None
+
+        dq = q.grad.float()
+        nan_queries = (
+            torch.isnan(dq)
+            .any(dim=0)
+            .any(dim=-1)
+            .any(dim=-1)
+            .nonzero()
+            .flatten()
+            .tolist()
+        )
+        self.assertTrue(
+            torch.isfinite(dq).all(),
+            f"dQ is not finite; NaN at queries {nan_queries}",
+        )
 
 
 if __name__ == "__main__":

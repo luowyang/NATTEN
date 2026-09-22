@@ -9,6 +9,15 @@
   Both operands are converted to FP32 first. The Blackwell copy is untested --
   no device available.
 
+### Known issues
+* The Hopper FNA backward in FP16 can produce `NaN` in dQ when the token extent
+  is not a whole number of KV tiles and `O * dO` leaves half's range: the last
+  `kernel_size // 2` queries are affected, dK and dV are not. An extent of
+  exactly one KV tile, or magnitudes that keep `O * dO` inside FP16, avoid it.
+  Registered as an expected failure in
+  `tests/test_hopper_fna.py::HopperFNAPartialKVTileRangeTest`
+  (luowyang/NATTEN#<待填>).
+
 ## [0.21.7] - 2026-07-26
 * Switched to int64 strides in cutlass-fna to avoid overflows in larger use cases.
 * Fixed longstanding issue in CUTLASS FNA backward's mask that evaded nearly all unit tests, and
