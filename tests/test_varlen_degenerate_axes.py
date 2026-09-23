@@ -82,6 +82,7 @@ from .varlen_numerics import (
     rank_one_scalar,
     reference_interval,
     single_key_scalar_bound,
+    single_key_value_interval,
 )
 
 _VARLEN_FN_BY_RANK: Dict[int, Callable[..., Any]] = {
@@ -481,7 +482,15 @@ class VarlenDegenerateAxesOracleTests(unittest.TestCase):
         dq, dk, dv = torch.autograd.grad(output, (query, key, value), gradient)
         _assert_check(
             self,
-            dtype_interval(dv[rows], gradient[rows], dtype),
+            single_key_value_interval(
+                dv[rows],
+                gradient[rows],
+                gradient[rows],
+                query[rows],
+                key[rows],
+                dtype,
+                scale,
+            ),
             "image dV is the upstream gradient",
         )
         _assert_single_key_rows(
@@ -605,11 +614,8 @@ class VarlenMixedPackTests(unittest.TestCase):
                         )
                         _assert_check(
                             self,
-                            dtype_interval(
-                                dv,
-                                expected_dv,
-                                dtype,
-                                magnitude=grouped.abs().sum(2),
+                            single_key_value_interval(
+                                dv, expected_dv, grad, q, k, dtype, 16**-0.5
                             ),
                             "dV routes grad_output",
                         )
