@@ -33,12 +33,15 @@ resolution reads (``VarlenLayout._shapes``, and everything derived from it in
 from call to call -- sequence packing's whole point -- would get one
 specialization per packing, and a graph with the geometry baked into it.
 
-So under compile the layout travels as its own ``_handle``: a CPU 0-dim int64
-tensor that dynamo guards by metadata and never by value
-(``natten.varlen._register_handle``). The call goes through a
-``torch.library.custom_op``, which dynamo records as one opaque node and never
-enters. The schedule resolution then happens at execution time, and the graph
-carries no document geometry at all: one graph serves every packing.
+So under compile the call goes through a ``torch.library.custom_op``, which
+dynamo records as one opaque node and never enters, and the layout is that
+operator's argument as itself. ``VarlenLayout`` is a reference-type opaque
+object (registered in ``natten.varlen``): dynamo makes it a graph input guarded
+by its type alone, and when the graph runs the operator receives the caller's
+own layout, memo included. The schedule resolution then happens at execution
+time, and the graph carries no document geometry at all: one graph serves every
+packing. While the operators are traced they see a ``FakeScriptObject`` in the
+layout's place, and their fake kernels read tensor metadata only.
 
 This is a different boundary from the two operators already in the varlen path
 (``natten::varlen_build_permutation_tensors`` in ``natten.varlen``,
@@ -53,6 +56,10 @@ The numerics are the entry point's own: the operator body calls
 ordinary path. Backward re-runs that call under ``enable_grad`` and returns
 ``torch.autograd.grad``, which costs one extra forward per backward; driving
 the inner kernels from a saved output/logsumexp is the planned follow-up.
+
+The operators exist only where torch can pass a ``VarlenLayout`` to an operator
+(``_LAYOUT_IS_OPAQUE``); elsewhere the entry points trace their own Python under
+compile.
 """
 
 from typing import Any, Callable, List, Optional, Sequence, Tuple, Union
@@ -60,7 +67,7 @@ from typing import Any, Callable, List, Optional, Sequence, Tuple, Union
 import torch
 from torch import Tensor
 
-from natten.varlen import _layout_from_handle
+from natten.varlen import _LAYOUT_IS_OPAQUE, VarlenLayout
 
 # natten.functional imports this module, so the entry points are resolved
 # inside the operator bodies instead of here. Those bodies run at execution
@@ -139,7 +146,7 @@ def _stock_call(
     query: Tensor,
     key: Tensor,
     value: Tensor,
-    layout_handle: Tensor,
+    layout: VarlenLayout,
     kernel_size: List[int],
     stride: List[int],
     dilation: List[int],
@@ -154,7 +161,7 @@ def _stock_call(
     backward_use_pt_reduction: bool,
     return_lse: bool,
 ) -> Any:
-    """The public entry point, called with the layout the handle names.
+    """The public entry point, called with the caller's own layout.
 
     ``torch.compiler.is_compiling()`` is False here -- this runs when the
     compiled graph executes, not while it is traced -- so the entry point
@@ -165,7 +172,7 @@ def _stock_call(
         query,
         key,
         value,
-        _layout_from_handle(layout_handle),
+        layout,
         kernel_size=tuple(kernel_size),
         stride=tuple(stride),
         dilation=tuple(dilation),
@@ -182,227 +189,226 @@ def _stock_call(
     )
 
 
-@torch.library.custom_op("natten::varlen_attention_fwd", mutates_args=())
-def _varlen_attention_fwd(
-    query: Tensor,
-    key: Tensor,
-    value: Tensor,
-    layout_handle: Tensor,
-    na_dim: int,
-    kernel_size: List[int],
-    stride: List[int],
-    dilation: List[int],
-    is_causal: List[bool],
-    scale: Optional[float],
-    backend: Optional[str],
-    q_tile_shape: Optional[List[int]],
-    kv_tile_shape: Optional[List[int]],
-    backward_q_tile_shape: Optional[List[int]],
-    backward_kv_tile_shape: Optional[List[int]],
-    backward_kv_splits: Optional[List[int]],
-    backward_use_pt_reduction: bool,
-) -> Tuple[Tensor, Tensor]:
-    """Opaque forward: the entry point's own work, where dynamo cannot see it.
+if _LAYOUT_IS_OPAQUE:
 
-    Argument checks, degenerate-axis lowering, the uniform and all-empty fast
-    paths and schedule memoization all happen here, at execution time.
+    @torch.library.custom_op("natten::varlen_attention_fwd", mutates_args=())
+    def _varlen_attention_fwd(
+        query: Tensor,
+        key: Tensor,
+        value: Tensor,
+        layout: VarlenLayout,
+        na_dim: int,
+        kernel_size: List[int],
+        stride: List[int],
+        dilation: List[int],
+        is_causal: List[bool],
+        scale: Optional[float],
+        backend: Optional[str],
+        q_tile_shape: Optional[List[int]],
+        kv_tile_shape: Optional[List[int]],
+        backward_q_tile_shape: Optional[List[int]],
+        backward_kv_tile_shape: Optional[List[int]],
+        backward_kv_splits: Optional[List[int]],
+        backward_use_pt_reduction: bool,
+    ) -> Tuple[Tensor, Tensor]:
+        """Opaque forward: the entry point's own work, where dynamo cannot see it.
 
-    ``logsumexp`` comes back unconditionally because an operator's schema
-    cannot vary its return type with a bool argument; the caller drops it when
-    ``return_lse=False``. The only place that costs anything is the
-    fully-degenerate path, which computes lse from q/k rather than getting it
-    from a kernel for free.
-    """
-    # Grad is already off inside the generated autograd Function's forward;
-    # stated explicitly so a direct call below the autograd key behaves the
-    # same and never records the inner autograd.Function's saved tensors.
-    with torch.no_grad():
-        output, logsumexp = _stock_call(
-            na_dim,
-            query,
-            key,
-            value,
-            layout_handle,
-            kernel_size,
-            stride,
-            dilation,
-            is_causal,
-            scale,
-            backend,
-            q_tile_shape,
-            kv_tile_shape,
-            backward_q_tile_shape,
-            backward_kv_tile_shape,
-            backward_kv_splits,
-            backward_use_pt_reduction,
-            True,
+        Argument checks, degenerate-axis lowering, the uniform and all-empty fast
+        paths and schedule memoization all happen here, at execution time.
+
+        ``logsumexp`` comes back unconditionally because an operator's schema
+        cannot vary its return type with a bool argument; the caller drops it when
+        ``return_lse=False``. The only place that costs anything is the
+        fully-degenerate path, which computes lse from q/k rather than getting it
+        from a kernel for free.
+        """
+        # Grad is already off inside the generated autograd Function's forward;
+        # stated explicitly so a direct call below the autograd key behaves the
+        # same and never records the inner autograd.Function's saved tensors.
+        with torch.no_grad():
+            output, logsumexp = _stock_call(
+                na_dim,
+                query,
+                key,
+                value,
+                layout,
+                kernel_size,
+                stride,
+                dilation,
+                is_causal,
+                scale,
+                backend,
+                q_tile_shape,
+                kv_tile_shape,
+                backward_q_tile_shape,
+                backward_kv_tile_shape,
+                backward_kv_splits,
+                backward_use_pt_reduction,
+                True,
+            )
+        return output, logsumexp
+
+    @_varlen_attention_fwd.register_fake
+    def _(
+        query: Tensor,
+        key: Tensor,
+        value: Tensor,
+        layout: VarlenLayout,
+        na_dim: int,
+        kernel_size: List[int],
+        stride: List[int],
+        dilation: List[int],
+        is_causal: List[bool],
+        scale: Optional[float],
+        backend: Optional[str],
+        q_tile_shape: Optional[List[int]],
+        kv_tile_shape: Optional[List[int]],
+        backward_q_tile_shape: Optional[List[int]],
+        backward_kv_tile_shape: Optional[List[int]],
+        backward_kv_splits: Optional[List[int]],
+        backward_use_pt_reduction: bool,
+    ) -> Tuple[Tensor, Tensor]:
+        # Reads tensor metadata only -- no layout, no document geometry. This is
+        # what keeps a compiled graph geometry-free: the packed token count stays
+        # whatever symbol the caller had, and the layout/token-count agreement is
+        # checked at execution time by the entry point itself instead.
+        total_tokens, heads = query.shape[0], query.shape[1]
+        return (
+            query.new_empty((total_tokens, heads, value.shape[-1])),
+            query.new_empty((total_tokens, heads), dtype=torch.float32),
         )
-    return output, logsumexp
 
+    @torch.library.custom_op("natten::varlen_attention_bwd", mutates_args=())
+    def _varlen_attention_bwd(
+        query: Tensor,
+        key: Tensor,
+        value: Tensor,
+        grad_output: Tensor,
+        layout: VarlenLayout,
+        na_dim: int,
+        kernel_size: List[int],
+        stride: List[int],
+        dilation: List[int],
+        is_causal: List[bool],
+        scale: Optional[float],
+        backend: Optional[str],
+        q_tile_shape: Optional[List[int]],
+        kv_tile_shape: Optional[List[int]],
+        backward_q_tile_shape: Optional[List[int]],
+        backward_kv_tile_shape: Optional[List[int]],
+        backward_kv_splits: Optional[List[int]],
+        backward_use_pt_reduction: bool,
+    ) -> Tuple[Tensor, Tensor, Tensor]:
+        """Opaque backward: replays the entry point on detached inputs and returns
+        its gradients.
 
-@_varlen_attention_fwd.register_fake
-def _(
-    query: Tensor,
-    key: Tensor,
-    value: Tensor,
-    layout_handle: Tensor,
-    na_dim: int,
-    kernel_size: List[int],
-    stride: List[int],
-    dilation: List[int],
-    is_causal: List[bool],
-    scale: Optional[float],
-    backend: Optional[str],
-    q_tile_shape: Optional[List[int]],
-    kv_tile_shape: Optional[List[int]],
-    backward_q_tile_shape: Optional[List[int]],
-    backward_kv_tile_shape: Optional[List[int]],
-    backward_kv_splits: Optional[List[int]],
-    backward_use_pt_reduction: bool,
-) -> Tuple[Tensor, Tensor]:
-    # Reads tensor metadata only -- no layout, no document geometry. This is
-    # what keeps a compiled graph geometry-free: the packed token count stays
-    # whatever symbol the caller had, and the layout/token-count agreement is
-    # checked at execution time by the entry point itself instead.
-    total_tokens, heads = query.shape[0], query.shape[1]
-    return (
-        query.new_empty((total_tokens, heads, value.shape[-1])),
-        query.new_empty((total_tokens, heads), dtype=torch.float32),
-    )
+        An operator, rather than plain Python inside the ``register_autograd``
+        callback, because that callback *is* traced by AOTAutograd, where the layout
+        is a ``FakeScriptObject`` whose contents cannot be read and q/k/v are fake.
+        The replay needs the real layout and real tensors, which only an operator
+        body gets, same as the forward's -- which is also why the replay needs
+        ``_recording_autograd`` to get a graph at all.
 
+        Replaying instead of driving the kernels from a saved output/logsumexp
+        keeps the numerics identical to the entry point's own backward by
+        construction, degenerate-axis lowering included (a hand-written backward
+        would have to reproduce the fold, the permute and its inverse, and the
+        uniform path's separate fixed-shape configuration). It costs one extra
+        forward per backward.
 
-@torch.library.custom_op("natten::varlen_attention_bwd", mutates_args=())
-def _varlen_attention_bwd(
-    query: Tensor,
-    key: Tensor,
-    value: Tensor,
-    grad_output: Tensor,
-    layout_handle: Tensor,
-    na_dim: int,
-    kernel_size: List[int],
-    stride: List[int],
-    dilation: List[int],
-    is_causal: List[bool],
-    scale: Optional[float],
-    backend: Optional[str],
-    q_tile_shape: Optional[List[int]],
-    kv_tile_shape: Optional[List[int]],
-    backward_q_tile_shape: Optional[List[int]],
-    backward_kv_tile_shape: Optional[List[int]],
-    backward_kv_splits: Optional[List[int]],
-    backward_use_pt_reduction: bool,
-) -> Tuple[Tensor, Tensor, Tensor]:
-    """Opaque backward: replays the entry point on detached inputs and returns
-    its gradients.
-
-    An operator, rather than plain Python inside the ``register_autograd``
-    callback, because that callback *is* traced by AOTAutograd: dereferencing
-    the handle there raises ``GuardOnDataDependentSymNode`` on ``.item()``. The
-    dereference has to sit one level further down, in an operator body, same as
-    the forward's -- which is also why the replay needs ``_recording_autograd``
-    to get a graph at all.
-
-    Replaying instead of driving the kernels from a saved output/logsumexp
-    keeps the numerics identical to the entry point's own backward by
-    construction, degenerate-axis lowering included (a hand-written backward
-    would have to reproduce the fold, the permute and its inverse, and the
-    uniform path's separate fixed-shape configuration). It costs one extra
-    forward per backward.
-
-    This operator registers no autograd of its own, so
-    ``backward(create_graph=True)`` is unsupported -- same as the stock path,
-    whose ``VarlenCutlassFNAAutogradFn.backward`` is not differentiable either.
-    """
-    with _recording_autograd(), torch.enable_grad():
-        query_ = query.detach().requires_grad_(True)
-        key_ = key.detach().requires_grad_(True)
-        value_ = value.detach().requires_grad_(True)
-        output = _stock_call(
-            na_dim,
-            query_,
-            key_,
-            value_,
-            layout_handle,
-            kernel_size,
-            stride,
-            dilation,
-            is_causal,
-            scale,
-            backend,
-            q_tile_shape,
-            kv_tile_shape,
-            backward_q_tile_shape,
-            backward_kv_tile_shape,
-            backward_kv_splits,
-            backward_use_pt_reduction,
-            False,
+        This operator registers no autograd of its own, so
+        ``backward(create_graph=True)`` is unsupported -- same as the stock path,
+        whose ``VarlenCutlassFNAAutogradFn.backward`` is not differentiable either.
+        """
+        with _recording_autograd(), torch.enable_grad():
+            query_ = query.detach().requires_grad_(True)
+            key_ = key.detach().requires_grad_(True)
+            value_ = value.detach().requires_grad_(True)
+            output = _stock_call(
+                na_dim,
+                query_,
+                key_,
+                value_,
+                layout,
+                kernel_size,
+                stride,
+                dilation,
+                is_causal,
+                scale,
+                backend,
+                q_tile_shape,
+                kv_tile_shape,
+                backward_q_tile_shape,
+                backward_kv_tile_shape,
+                backward_kv_splits,
+                backward_use_pt_reduction,
+                False,
+            )
+            gradients = torch.autograd.grad(
+                output, (query_, key_, value_), grad_output.contiguous()
+            )
+        d_query, d_key, d_value = _copy_aliases_of(
+            gradients, (query, key, value, grad_output)
         )
-        gradients = torch.autograd.grad(
-            output, (query_, key_, value_), grad_output.contiguous()
+        return d_query, d_key, d_value
+
+    @_varlen_attention_bwd.register_fake
+    def _(
+        query: Tensor,
+        key: Tensor,
+        value: Tensor,
+        grad_output: Tensor,
+        layout: VarlenLayout,
+        na_dim: int,
+        kernel_size: List[int],
+        stride: List[int],
+        dilation: List[int],
+        is_causal: List[bool],
+        scale: Optional[float],
+        backend: Optional[str],
+        q_tile_shape: Optional[List[int]],
+        kv_tile_shape: Optional[List[int]],
+        backward_q_tile_shape: Optional[List[int]],
+        backward_kv_tile_shape: Optional[List[int]],
+        backward_kv_splits: Optional[List[int]],
+        backward_use_pt_reduction: bool,
+    ) -> Tuple[Tensor, Tensor, Tensor]:
+        return (
+            torch.empty_like(query),
+            torch.empty_like(key),
+            torch.empty_like(value),
         )
-    d_query, d_key, d_value = _copy_aliases_of(
-        gradients, (query, key, value, grad_output)
+
+    def _varlen_attention_setup_context(ctx: Any, inputs: Any, output: Any) -> None:
+        query, key, value, layout = inputs[:4]
+        ctx.save_for_backward(query, key, value)
+        # save_for_backward takes tensors only; the layout rides on ctx, and
+        # AOTAutograd saves it for the backward graph like any non-tensor value.
+        ctx.layout = layout
+        ctx.varlen_args = tuple(inputs[4:])
+
+    def _varlen_attention_backward(
+        ctx: Any, grad_output: Optional[Tensor], grad_logsumexp: Optional[Tensor]
+    ) -> Tuple[Optional[Tensor], ...]:
+        # grad_logsumexp is ignored, exactly as the stock autograd Function ignores
+        # it (natten.backends.varlen_fna.VarlenCutlassFNAAutogradFn.backward): FNA's
+        # logsumexp is a differentiable output whose incoming gradient the family
+        # does not propagate. With no gradient on the output either, q/k/v get none
+        # from this call, which is what the stock path's all-zero gradients would
+        # accumulate to anyway.
+        if grad_output is None:
+            return (None,) * 17
+        query, key, value = ctx.saved_tensors
+        d_query, d_key, d_value = _varlen_attention_bwd(
+            query, key, value, grad_output, ctx.layout, *ctx.varlen_args
+        )
+        return (d_query, d_key, d_value) + (None,) * 14
+
+    torch.library.register_autograd(
+        "natten::varlen_attention_fwd",
+        _varlen_attention_backward,
+        setup_context=_varlen_attention_setup_context,
     )
-    return d_query, d_key, d_value
-
-
-@_varlen_attention_bwd.register_fake
-def _(
-    query: Tensor,
-    key: Tensor,
-    value: Tensor,
-    grad_output: Tensor,
-    layout_handle: Tensor,
-    na_dim: int,
-    kernel_size: List[int],
-    stride: List[int],
-    dilation: List[int],
-    is_causal: List[bool],
-    scale: Optional[float],
-    backend: Optional[str],
-    q_tile_shape: Optional[List[int]],
-    kv_tile_shape: Optional[List[int]],
-    backward_q_tile_shape: Optional[List[int]],
-    backward_kv_tile_shape: Optional[List[int]],
-    backward_kv_splits: Optional[List[int]],
-    backward_use_pt_reduction: bool,
-) -> Tuple[Tensor, Tensor, Tensor]:
-    return (
-        torch.empty_like(query),
-        torch.empty_like(key),
-        torch.empty_like(value),
-    )
-
-
-def _varlen_attention_setup_context(ctx: Any, inputs: Any, output: Any) -> None:
-    query, key, value, layout_handle = inputs[:4]
-    ctx.save_for_backward(query, key, value, layout_handle)
-    ctx.varlen_args = tuple(inputs[4:])
-
-
-def _varlen_attention_backward(
-    ctx: Any, grad_output: Optional[Tensor], grad_logsumexp: Optional[Tensor]
-) -> Tuple[Optional[Tensor], ...]:
-    # grad_logsumexp is ignored, exactly as the stock autograd Function ignores
-    # it (natten.backends.varlen_fna.VarlenCutlassFNAAutogradFn.backward): FNA's
-    # logsumexp is a differentiable output whose incoming gradient the family
-    # does not propagate. With no gradient on the output either, q/k/v get none
-    # from this call, which is what the stock path's all-zero gradients would
-    # accumulate to anyway.
-    if grad_output is None:
-        return (None,) * 17
-    query, key, value, layout_handle = ctx.saved_tensors
-    d_query, d_key, d_value = _varlen_attention_bwd(
-        query, key, value, grad_output, layout_handle, *ctx.varlen_args
-    )
-    return (d_query, d_key, d_value) + (None,) * 14
-
-
-torch.library.register_autograd(
-    "natten::varlen_attention_fwd",
-    _varlen_attention_backward,
-    setup_context=_varlen_attention_setup_context,
-)
 
 
 def _as_int_list(value: Any, na_dim: int, name: str) -> List[int]:
@@ -435,7 +441,7 @@ def _varlen_compiled_call(
     query: Tensor,
     key: Tensor,
     value: Tensor,
-    layout: Any,
+    layout: VarlenLayout,
     kernel_size: Any,
     stride: Any,
     dilation: Any,
@@ -452,15 +458,16 @@ def _varlen_compiled_call(
 ) -> Union[Tensor, Tuple[Tensor, Tensor]]:
     """What ``na{1,2,3}d_varlen`` runs while it is being traced.
 
-    Reads exactly one thing off the layout -- the handle tensor -- and hands
-    everything else through unchanged, so nothing that varies with the packing
-    is ever a Python value in the graph.
+    The layout object itself goes into the graph, and nothing is read off it:
+    dynamo guards it by its type alone, so nothing that varies with the packing
+    is ever a Python value in the graph. Everything else is handed through
+    unchanged.
     """
     output, logsumexp = _varlen_attention_fwd(
         query,
         key,
         value,
-        layout._handle,
+        layout,
         na_dim,
         _as_int_list(kernel_size, na_dim, "kernel_size"),
         _as_int_list(stride, na_dim, "stride"),

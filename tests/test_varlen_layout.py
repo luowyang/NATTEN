@@ -35,6 +35,7 @@ from natten.utils.testing import (
     skip_if_fewer_than_n_gpus,
     skip_if_libnatten_is_not_supported,
 )
+from natten.varlen import _LAYOUT_IS_OPAQUE
 
 # CompileCounter is a private torch._dynamo.testing utility, validated
 # against torch 2.11; the frame-count expectations below may shift across
@@ -49,6 +50,14 @@ def _fake_build(counter):
         return counter[0]
 
     return build
+
+
+# Where torch has opaque objects, VarlenLayout is one: dynamo refuses to read a
+# layout inside a compiled region, and the entry points hand it to an operator
+# instead, so the memo is never traced there.
+skip_if_layout_is_opaque = unittest.skipIf(
+    _LAYOUT_IS_OPAQUE, "VarlenLayout is opaque to dynamo; its memo is not traced"
+)
 
 
 class VarlenLayoutConstructionTests(unittest.TestCase):
@@ -251,6 +260,7 @@ class VarlenLayoutMemoMechanismTests(unittest.TestCase):
         self.assertEqual(layout_b._resolve(key, build), 2)
         self.assertEqual(counter[0], 2)
 
+    @skip_if_layout_is_opaque
     def test_compile_cold_miss_default_budget_builds_and_hits(self):
         # A cold miss traced inside torch.compile takes the build branch
         # (one compile), and the next call's now-warm memo flips the
@@ -326,6 +336,7 @@ class VarlenLayoutMemoMechanismTests(unittest.TestCase):
 
         self.assertLessEqual(cold_frame_count - warm_compile_counter.frame_count, 1)
 
+    @skip_if_layout_is_opaque
     def test_compile_positive_prewarmed_hit_passes_tight_budget(self):
         torch._dynamo.reset()
         layout = VarlenLayout([(8,), (4,)])

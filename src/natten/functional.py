@@ -68,7 +68,7 @@ from natten.utils.checks import (
     varlen_tensor_checks,
 )
 from natten.varlen import VarlenLayout
-from natten.varlen_compile import _varlen_compiled_call
+from natten.varlen_compile import _LAYOUT_IS_OPAQUE, _varlen_compiled_call
 
 logger = log.get_logger(__name__)
 
@@ -1612,7 +1612,7 @@ def na1d_varlen(
     # call goes through an opaque operator instead, so that dynamo never traces
     # the schedule resolution below and never guards on this layout's
     # per-document extents. See natten.varlen_compile. Eager is unaffected.
-    if torch.compiler.is_compiling():
+    if _LAYOUT_IS_OPAQUE and torch.compiler.is_compiling():
         return _varlen_compiled_call(
             1,
             query,
@@ -1748,7 +1748,7 @@ def na2d_varlen(
     # call goes through an opaque operator instead, so that dynamo never traces
     # the schedule resolution below and never guards on this layout's
     # per-document extents. See natten.varlen_compile. Eager is unaffected.
-    if torch.compiler.is_compiling():
+    if _LAYOUT_IS_OPAQUE and torch.compiler.is_compiling():
         return _varlen_compiled_call(
             2,
             query,
@@ -1884,7 +1884,7 @@ def na3d_varlen(
     # call goes through an opaque operator instead, so that dynamo never traces
     # the schedule resolution below and never guards on this layout's
     # per-document extents. See natten.varlen_compile. Eager is unaffected.
-    if torch.compiler.is_compiling():
+    if _LAYOUT_IS_OPAQUE and torch.compiler.is_compiling():
         return _varlen_compiled_call(
             3,
             query,

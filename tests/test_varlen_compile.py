@@ -28,11 +28,15 @@ they have, not a second set of names. So everything here is stated against
 underneath (``natten.varlen_compile``) is only visible where the test is about
 the operator contract (opcheck) or about what the captured graph contains.
 
+The layout reaches that operator as itself: ``VarlenLayout`` is a reference-type
+opaque object, which dynamo guards by its type alone.
+
 Parity is asserted bitwise because the operator body calls the entry point:
 anything but equality means an argument changed meaning on the way in.
 """
 
-import gc
+import copy
+import inspect
 import math
 import pickle
 from dataclasses import dataclass
@@ -42,7 +46,7 @@ import natten
 import pytest
 import torch
 from natten._environment import _IS_CUDA_AVAILABLE, HAS_LIBNATTEN
-from natten.varlen import _HANDLE_REGISTRY
+from natten.varlen_compile import _LAYOUT_IS_OPAQUE
 
 # CompileCounter is a private torch._dynamo.testing utility; the sibling
 # test_varlen_layout.py depends on it for the same reason (counting compiled
@@ -50,6 +54,13 @@ from natten.varlen import _HANDLE_REGISTRY
 from torch._dynamo.testing import CompileCounter
 
 SEED = 20260922
+
+# The operator path exists only where torch can pass a VarlenLayout to an
+# operator, and everything here is about that path.
+pytestmark = pytest.mark.skipif(
+    not _LAYOUT_IS_OPAQUE,
+    reason="this torch cannot pass a VarlenLayout to a custom op",
+)
 
 # The sibling suites' skip_if_libnatten_is_not_supported is a unittest method
 # decorator (it calls self.skipTest); these are plain pytest functions.
@@ -60,7 +71,7 @@ requires_libnatten = pytest.mark.skipif(
 
 
 @dataclass(frozen=True)
-class HandleCase:
+class VarlenCase:
     name: str
     shapes: Tuple[Tuple[int, ...], ...]
     kernel_size: Tuple[int, ...]
@@ -87,13 +98,13 @@ class HandleCase:
 # are the paths whose last step is a plain tensor op, which come back with no
 # gradient at all if the operator body stops re-entering autograd.
 CASES = (
-    HandleCase("3d-varlen", ((2, 4, 4), (1, 6, 5)), (2, 3, 3), (True, False, False)),
-    HandleCase("3d-fold", ((2, 4, 4), (1, 6, 5)), (1, 3, 3), (False, False, False)),
-    HandleCase("3d-permute", ((3, 4, 4), (5, 6, 5)), (3, 1, 1), (True, False, False)),
-    HandleCase("3d-identity", ((2, 4, 4), (1, 6, 5)), (1, 1, 1), (False, False, False)),
-    HandleCase("3d-uniform", ((2, 4, 4), (2, 4, 4)), (2, 3, 3), (False, False, False)),
-    HandleCase("3d-empty", ((0, 4, 4), (0, 2, 2)), (2, 3, 3), (False, False, False)),
-    HandleCase(
+    VarlenCase("3d-varlen", ((2, 4, 4), (1, 6, 5)), (2, 3, 3), (True, False, False)),
+    VarlenCase("3d-fold", ((2, 4, 4), (1, 6, 5)), (1, 3, 3), (False, False, False)),
+    VarlenCase("3d-permute", ((3, 4, 4), (5, 6, 5)), (3, 1, 1), (True, False, False)),
+    VarlenCase("3d-identity", ((2, 4, 4), (1, 6, 5)), (1, 1, 1), (False, False, False)),
+    VarlenCase("3d-uniform", ((2, 4, 4), (2, 4, 4)), (2, 3, 3), (False, False, False)),
+    VarlenCase("3d-empty", ((0, 4, 4), (0, 2, 2)), (2, 3, 3), (False, False, False)),
+    VarlenCase(
         "3d-gqa",
         ((2, 4, 4), (1, 6, 5)),
         (2, 3, 3),
@@ -102,8 +113,8 @@ CASES = (
         heads_kv=2,
         head_dim_v=64,
     ),
-    HandleCase("2d-varlen", ((4, 5), (3, 7)), (3, 3), (False, False)),
-    HandleCase("1d-varlen", ((17,), (9,)), (5,), (True,)),
+    VarlenCase("2d-varlen", ((4, 5), (3, 7)), (3, 3), (False, False)),
+    VarlenCase("1d-varlen", ((17,), (9,)), (5,), (True,)),
 )
 
 
@@ -111,7 +122,7 @@ def _entry_point(rank: int):
     return getattr(natten, f"na{rank}d_varlen")
 
 
-def _inputs(case: HandleCase, dtype: torch.dtype, requires_grad: bool = False):
+def _inputs(case: VarlenCase, dtype: torch.dtype, requires_grad: bool = False):
     generator = torch.Generator(device="cpu").manual_seed(SEED)
     total = case.total_tokens
     tensors = []
@@ -126,7 +137,7 @@ def _inputs(case: HandleCase, dtype: torch.dtype, requires_grad: bool = False):
     return tensors
 
 
-def _call_kwargs(case: HandleCase):
+def _call_kwargs(case: VarlenCase):
     return {
         "kernel_size": case.kernel_size,
         "is_causal": case.is_causal,
@@ -140,70 +151,132 @@ def _compiled(rank: int, backend="aot_eager"):
     )
 
 
-# --------------------------------------------------- layout handle lifetime
+# ---------------------------------------------------------- layout object
+
+# natten's public surface. Compile support lives inside na{1,2,3}d_varlen and
+# VarlenLayout, so it adds nothing here; a new name has to be a deliberate edit
+# of these two sets.
+PUBLIC_NAMES = frozenset(
+    {
+        "__version__",
+        "NeighborhoodAttention1D",
+        "NeighborhoodAttention2D",
+        "NeighborhoodAttention3D",
+        "are_deterministic_algorithms_enabled",
+        "use_deterministic_algorithms",
+        "use_kv_parallelism_in_fused_na",
+        "is_kv_parallelism_in_fused_na_enabled",
+        "set_memory_usage_preference",
+        "get_memory_usage_preference",
+        "is_memory_usage_default",
+        "is_memory_usage_strict",
+        "is_memory_usage_unrestricted",
+        "is_flex_compile_allowed",
+        "is_flex_compile_backprop_allowed",
+        "allow_flex_compile",
+        "allow_flex_compile_backprop",
+        "disable_flex_compile",
+        "disable_flex_compile_backprop",
+        "get_bwd_configs_for_cutlass_fmha",
+        "get_bwd_configs_for_cutlass_fna",
+        "get_configs_for_cutlass_fmha",
+        "get_configs_for_cutlass_fna",
+        "get_configs_for_cutlass_hopper_fmha",
+        "get_bwd_configs_for_cutlass_hopper_fmha",
+        "get_configs_for_cutlass_hopper_fna",
+        "get_bwd_configs_for_cutlass_hopper_fna",
+        "get_bwd_configs_for_cutlass_blackwell_fmha",
+        "get_bwd_configs_for_cutlass_blackwell_fna",
+        "get_configs_for_cutlass_blackwell_fmha",
+        "get_configs_for_cutlass_blackwell_fna",
+        "get_configs_for_flex_fmha",
+        "get_configs_for_flex_fna",
+        "HAS_LIBNATTEN",
+        "na1d",
+        "na2d",
+        "na3d",
+        "na1d_varlen",
+        "na2d_varlen",
+        "na3d_varlen",
+        "attention",
+        "merge_attentions",
+        "VarlenLayout",
+    }
+)
+LAYOUT_PUBLIC_MEMBERS = frozenset(
+    {
+        "cu_seqlens",
+        "device",
+        "from_tensor_list",
+        "is_uniform",
+        "max_seqlen",
+        "num_docs",
+        "rank",
+        "shapes",
+        "split",
+        "token_layouts",
+        "total_tokens",
+        "uniform_shape",
+    }
+)
 
 
-def test_layout_registers_a_handle_at_construction():
-    layout = natten.VarlenLayout(((2, 3), (1, 4)))
-    key = int(layout._handle)
-
-    assert layout._handle.dtype == torch.int64
-    assert layout._handle.dim() == 0
-    assert layout._handle.device.type == "cpu"
-    assert _HANDLE_REGISTRY[key] is layout
-
-
-def test_registry_entry_dies_with_the_layout():
-    layout = natten.VarlenLayout(((2, 3),))
-    key = int(layout._handle)
-    del layout
-    gc.collect()
-    assert key not in _HANDLE_REGISTRY
+def test_public_surface_is_unchanged():
+    public = set(natten.__all__)
+    assert public == PUBLIC_NAMES, (public - PUBLIC_NAMES, PUBLIC_NAMES - public)
+    members = {name for name in dir(natten.VarlenLayout) if not name.startswith("_")}
+    assert members == LAYOUT_PUBLIC_MEMBERS, members ^ LAYOUT_PUBLIC_MEMBERS
+    parameters = inspect.signature(natten.VarlenLayout).parameters
+    assert list(parameters) == ["shapes", "device"]
 
 
-def test_two_layouts_get_distinct_handles():
-    first = natten.VarlenLayout(((2, 3),))
-    second = natten.VarlenLayout(((2, 3),))
-    assert int(first._handle) != int(second._handle)
+def test_layout_is_a_reference_opaque_type():
+    from torch._library.opaque_object import is_opaque_reference_type
+
+    assert is_opaque_reference_type(natten.VarlenLayout)
 
 
-def test_pickle_round_trip_reregisters():
-    # A layout pickled to a DataLoader worker or another rank has to keep
-    # working there; the handle id means nothing across processes, so the
-    # unpickled layout takes a fresh one.
-    layout = natten.VarlenLayout(((2, 3), (1, 4)))
+def _used_layout(case):
+    # A layout that has run: materialized on the device, with derived state.
+    layout = natten.VarlenLayout(case.shapes)
+    entry = _entry_point(case.rank)
+    entry(*_inputs(case, torch.float32), layout, **_call_kwargs(case))
+    assert layout.device is not None
+    assert layout._memo or layout._fold_memo or layout._permute_memo
+    return layout
+
+
+def _assert_host_shapes_only(layout: natten.VarlenLayout) -> None:
+    tensors = [
+        name for name, value in vars(layout).items() if isinstance(value, torch.Tensor)
+    ]
+    assert not tensors, tensors
+    assert layout.device is None
+    assert layout._memo == {}
+    assert layout._fold_memo == {}
+    assert layout._permute_memo == {}
+
+
+@requires_libnatten
+def test_pickle_round_trip_carries_shapes_only():
+    # A layout pickled to a DataLoader worker or another rank takes its host
+    # shapes and nothing else; the copy rebuilds derived state on first use.
+    layout = _used_layout(CASES[0])
+    assert layout.__getstate__() == {"shapes": layout.shapes}
     restored = pickle.loads(pickle.dumps(layout))
     assert restored.shapes == layout.shapes
-    assert int(restored._handle) != int(layout._handle)
-    assert _HANDLE_REGISTRY[int(restored._handle)] is restored
+    _assert_host_shapes_only(restored)
 
 
-def test_stale_handle_fails_loudly():
-    from natten.varlen import _layout_from_handle
-
-    layout = natten.VarlenLayout(((4,),))
-    handle = layout._handle
-    del layout
-    gc.collect()
-    with pytest.raises(RuntimeError, match="not registered"):
-        _layout_from_handle(handle)
-
-
-def test_malformed_handle_is_rejected():
-    from natten.varlen import _layout_from_handle
-
-    with pytest.raises(ValueError, match="0-dim int64"):
-        _layout_from_handle(torch.zeros(1, dtype=torch.int64))
-
-
-def test_no_handle_names_are_public():
-    # The compile path must not add public API. This is the invariant the
-    # rework exists for.
-    public = set(natten.__all__)
-    assert not [name for name in public if "handle" in name.lower()]
-    assert {"VarlenLayout", "na1d_varlen", "na2d_varlen", "na3d_varlen"} <= public
-    for name in ("VarlenLayoutHandle", "na3d_varlen_handle"):
-        assert not hasattr(natten, name), name
+@requires_libnatten
+def test_deepcopy_carries_shapes_only():
+    # torch deep-copies a layout into the FakeScriptObject a traced operator
+    # sees: that copy must not carry device tensors or the memo.
+    layout = _used_layout(CASES[0])
+    copied = copy.deepcopy(layout)
+    assert copied is not layout
+    assert copied.shapes == layout.shapes
+    _assert_host_shapes_only(copied)
 
 
 # ------------------------------------------------------------------- parity
@@ -219,11 +292,6 @@ def test_compiled_forward_matches_eager_bitwise(case, dtype, return_lse):
         entry = _entry_point(case.rank)
         query, key, value = _inputs(case, dtype)
         layout = natten.VarlenLayout(case.shapes)
-
-        # The handle is CPU while q/k/v are CUDA: the operator has to take
-        # that mix, so every case below exercises it.
-        assert layout._handle.device.type == "cpu"
-        assert query.device.type == "cuda"
 
         expected = entry(
             query, key, value, layout, return_lse=return_lse, **_call_kwargs(case)
@@ -288,12 +356,12 @@ def test_eager_is_untouched_by_the_compile_branch():
 # ----------------------------------------------------------------- operator
 
 
-def _op_args(case: HandleCase, query, key, value, layout):
+def _op_args(case: VarlenCase, query, key, value, layout):
     return (
         query,
         key,
         value,
-        layout._handle,
+        layout,
         case.rank,
         list(case.kernel_size),
         [1] * case.rank,
@@ -349,7 +417,7 @@ def test_opcheck_accepts_the_backward_operator(case):
 def test_fully_degenerate_output_does_not_alias_value():
     # The fully-degenerate path's output is exactly `value`, and a custom op
     # may not return a view of an input.
-    case = HandleCase("alias", ((2, 4, 4), (1, 6, 5)), (1, 1, 1), (False, False, False))
+    case = VarlenCase("alias", ((2, 4, 4), (1, 6, 5)), (1, 1, 1), (False, False, False))
     query, key, value = _inputs(case, torch.float32)
     layout = natten.VarlenLayout(case.shapes)
     output = _compiled(3)(query, key, value, layout, **_call_kwargs(case))
@@ -381,24 +449,48 @@ def test_explicit_tile_shapes_reach_the_compiled_call():
 # ------------------------------------------------------------------ compile
 
 
+# Different document counts and shapes, each carried by its own layout.
+GEOMETRIES = (
+    ((2, 4, 4), (1, 6, 5)),
+    ((3, 4, 4), (2, 6, 5), (1, 2, 2)),
+    ((1, 8, 8), (2, 5, 7), (3, 4, 4), (1, 3, 9)),
+)
+
+
 @requires_libnatten
 def test_changing_geometry_compiles_once():
+    # CompileCounter counts frames; the cache entries' guard trees are the only
+    # place the installed guards can be read back (private, like the counter).
+    from torch._dynamo.eval_frame import _debug_get_cache_entry_list
+
     torch._dynamo.reset()
     counter = CompileCounter()
     compiled = torch.compile(
         natten.na3d_varlen, backend=counter, fullgraph=True, dynamic=True
     )
-    layouts = []
     try:
-        for shapes in (((2, 4, 4), (1, 6, 5)), ((3, 4, 4), (2, 6, 5), (1, 2, 2))):
-            case = HandleCase("stream", shapes, (2, 3, 3), (False, False, False))
+        for shapes in GEOMETRIES:
+            case = VarlenCase("stream", shapes, (2, 3, 3), (False, False, False))
             query, key, value = _inputs(case, torch.float32)
             layout = natten.VarlenLayout(shapes)
-            layouts.append(layout)  # keep alive for the duration of the run
             compiled(query, key, value, layout, kernel_size=(2, 3, 3), scale=0.125)
+        guards = "\n".join(
+            str(entry.guard_manager)
+            for entry in _debug_get_cache_entry_list(natten.na3d_varlen)
+        )
     finally:
         torch._dynamo.reset()
+
     assert counter.frame_count == 1
+    # Every guard that mentions the layout is TYPE_MATCH on the object itself:
+    # no identity match, and nothing read off it.
+    lines = [line for line in guards.splitlines() if "L['layout']" in line]
+    managers = [line for line in lines if "GuardManager:" in line]
+    leaves = [line for line in lines if "GuardManager:" not in line]
+    assert managers and all("source=L['layout']," in line for line in managers), lines
+    assert leaves and all(
+        line.strip(" |+-").startswith("TYPE_MATCH:") for line in leaves
+    ), lines
 
 
 @requires_libnatten
@@ -441,9 +533,9 @@ def test_captured_graph_holds_exactly_one_natten_op():
 @requires_libnatten
 def test_backward_survives_aot_autograd():
     # The registered backward is traced by AOTAutograd, unlike the forward
-    # operator's body: dereferencing the handle there (rather than inside
-    # natten::varlen_attention_bwd) raises GuardOnDataDependentSymNode on
-    # .item(). This is that regression.
+    # operator's body: there the layout is a FakeScriptObject whose contents
+    # cannot be read, so the replay has to happen inside
+    # natten::varlen_attention_bwd, which gets the real layout from ctx.
     previous = torch.are_deterministic_algorithms_enabled()
     torch.use_deterministic_algorithms(True)
     torch._dynamo.reset()

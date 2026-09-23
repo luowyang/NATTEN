@@ -8,13 +8,23 @@
   call to call -- sequence packing's whole point -- got one graph per packing,
   with the geometry baked in. Each entry point now checks
   `torch.compiler.is_compiling()` first and, when it is, routes the call
-  through an opaque operator instead, carrying the layout as a private handle
-  tensor the layout registers at construction. The compiled graph then holds no
-  document geometry at all and one graph serves every packing. **No new public
-  names, and eager is untouched:** `VarlenLayout` and
-  `na{1,2,3}d_varlen` are the whole surface, the compiled path accepts exactly
-  the same arguments as the eager one, and the operator body calls the entry
-  point itself, so the numerics are the eager path's.
+  through an opaque operator instead, which takes the layout itself as an
+  argument: `VarlenLayout` is registered with torch as a reference-type opaque
+  object, so dynamo makes it a graph input guarded by its type alone, and the
+  operator receives the caller's own layout when the graph runs. The compiled
+  graph then holds no document geometry at all, and a change of geometry does
+  not recompile. **No new public names, and eager is untouched:**
+  `VarlenLayout` and `na{1,2,3}d_varlen` are the whole surface, the compiled
+  path accepts exactly the same arguments as the eager one, and the operator
+  body calls the entry point itself, so the numerics are the eager path's. On a
+  torch without opaque objects (2.11 has them), compiled calls trace the entry
+  point as before. Limits, as of torch 2.11: inside a compiled region a layout
+  can be passed on but not read (dynamo raises) or built (dynamo graph-breaks),
+  inductor's CUDA graphs (`mode="reduce-overhead"`) skip a graph that takes a
+  layout as input, AOTInductor and `torch.export` do not accept one, and the
+  registration goes through the private
+  `torch._library.opaque_object.register_opaque_type`, which later torch
+  renames `register_custom_class` and keeps as a deprecated alias.
 * Variable-length backward under `torch.compile` replays the forward once
   rather than driving the inner kernels from a saved output/logsumexp: it is
   bit-for-bit the eager backward, degenerate-axis lowering included, at the
