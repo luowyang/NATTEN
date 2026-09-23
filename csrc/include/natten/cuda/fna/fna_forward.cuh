@@ -39,6 +39,8 @@
 
 #pragma once
 
+#include <algorithm>
+
 #include <natten/cuda/utils/cuda.h>
 #include <natten/helpers.h>
 #include <natten/natten.h>
@@ -202,9 +204,58 @@ void fna_forward_generic(
           "This GPU does not have enough shared-memory.");
       NATTEN_CUDA_CHECK(err);
     }
-    auto blocks = p.getBlocksGrid();
     Kernel::check_supported(p);
-    kernel_fn<<<blocks, p.getThreadsGrid(), smem_bytes, stream>>>(p);
+
+    if constexpr (Kernel::kIsVarlen) {
+      // Varlen indexes work items along grid.x and holds grid.z at 1
+      // (Params::getBlocksGrid in kernel_forward.h), so one launch covers any
+      // number of documents.
+      kernel_fn<<<p.getBlocksGrid(), p.getThreadsGrid(), smem_bytes, stream>>>(
+          p);
+    } else {
+      // Fixed shape maps batch onto grid.z (`batch_id = blockIdx.z` in
+      // Params::advance_to_block, kernel_forward.h), and CUDA caps gridDim.z at
+      // 65535. Launch one grid per chunk of at most that many batches, and add
+      // on the host the batch offset the kernel adds on the device for the
+      // batches a chunk starts past.
+      constexpr int32_t kMaxBatchPerLaunch = 65535;
+      // An empty batch makes no launch at all, and the output tensor belongs
+      // to the caller: report it, which is what the single launch this loop
+      // replaced did (gridDim.z = 0 is an invalid configuration).
+      NATTEN_CHECK(
+          batch_size > 0, "Fixed-shape FNA requires a non-empty batch.");
+      const int64_t spatial =
+          static_cast<int64_t>(natten::flatten(spatial_extent));
+      // q/k_strideB = num_queries.prod() * num_heads * head_dim, and
+      // v/o_strideB = num_queries.prod() * num_heads * head_dim_value
+      // (kernel_forward.h, the `q_strideB` block in advance_to_block).
+      const int64_t qk_strideB = spatial * heads * dim;
+      const int64_t vo_strideB = spatial * heads * dim_value;
+      // logsumexp_ptr += batch_id * num_queries.prod32() * num_heads
+      // (kernel_forward.h, the `logsumexp_ptr != nullptr` block in
+      // advance_to_block).
+      const int64_t lse_strideB = spatial * heads;
+      for (int32_t batch_start = 0; batch_start < batch_size;
+           batch_start += kMaxBatchPerLaunch) {
+        auto pc = p;
+        pc.num_batches = std::min(kMaxBatchPerLaunch, batch_size - batch_start);
+        pc.query_ptr += batch_start * qk_strideB;
+        pc.key_ptr += batch_start * qk_strideB;
+        pc.value_ptr += batch_start * vo_strideB;
+        pc.output_ptr += batch_start * vo_strideB;
+        if (pc.output_accum_ptr != nullptr) {
+          pc.output_accum_ptr += batch_start * vo_strideB;
+        }
+        if (pc.logsumexp_ptr != nullptr) {
+          pc.logsumexp_ptr += batch_start * lse_strideB;
+        }
+        kernel_fn<<<
+            pc.getBlocksGrid(),
+            pc.getThreadsGrid(),
+            smem_bytes,
+            stream>>>(pc);
+      }
+    }
   };
 
   // Internal launch-ABI invariant: `varlen_meta` and `total_tokens` are two
