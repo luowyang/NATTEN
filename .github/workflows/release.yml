@@ -1,0 +1,55 @@
+name: release
+
+# Tag-push trigger for the release channel. It builds nothing itself: it
+# dispatches wheel.yml on `fork-ci` with `ref=<the pushed tag>` and
+# `channel=release`. The one reason it exists is cache scope: GitHub's
+# Actions cache is only readable from the ref that wrote it or from the
+# default branch, so a run triggered directly by a tag push never sees
+# the sccache entries the nightlies (dispatched on `fork-ci`) or the
+# previous release left behind, and every release was a cold build
+# (fork.3: 1h56m). A dispatch on `fork-ci` shares the `fork-ci` scope
+# with the nightlies, so releasing an already-built tree skips straight
+# to the real build (39 min measured on the nightly of the same tree).
+#
+# This is the same pattern as nightly.yml on `main`, which also explains
+# why a GITHUB_TOKEN dispatch is allowed to start a run at all. Unlike
+# nightly.yml this file can live on fork-ci: `push` events fire from the
+# pushed ref, and a fork/* tag points at a dev commit that carries this
+# branch's workflows (assemble.sh merges fork-ci into dev).
+#
+# THE TWO REFS ARE DIFFERENT THINGS:
+#   --ref fork-ci      which copy of the wheel.yml FILE runs
+#   -f ref=<the tag>   what gets checked out, built and released
+# wheel.yml resolves channel=release from the fork/* tag name and
+# publishes a normal GitHub Release on that tag, exactly as a direct
+# tag-triggered run did before.
+
+on:
+  push:
+    tags:
+      - 'fork/*'
+
+jobs:
+  dispatch-release-wheel:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: write   # dispatching a run is actions-scoped; the tag,
+                        # release and ci-logs pushes all happen inside
+                        # wheel.yml under its own `contents: write`.
+    steps:
+      - name: Dispatch wheel.yml on the release channel
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          # No checkout: `gh` is preinstalled on hosted runners and
+          # --repo names the target explicitly.
+          gh workflow run wheel.yml \
+            --repo "${{ github.repository }}" \
+            --ref fork-ci \
+            -f "ref=${TAG}" \
+            -f channel=release
+          echo "Dispatched wheel.yml (--ref fork-ci, ref=${TAG}, channel=release)."
+          echo "The build appears under the wheel workflow, not this one: ${{ github.server_url }}/${{ github.repository }}/actions/workflows/wheel.yml"

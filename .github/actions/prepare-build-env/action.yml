@@ -1,6 +1,7 @@
 name: Prepare NATTEN build environment
 description: >-
-  Python 3.11, free disk space, CUDA 12.8, sccache, and the sccache
+  Python (3.11 unless the caller passes python_version), free disk
+  space, CUDA 12.8, sccache, and the sccache
   compiler-wrapper scripts shared by wheel.yml's `warm` and `build`
   jobs. Factored out here so the two jobs cannot drift out of sync with
   each other -- GitHub Actions workflow YAML has no anchors or merge
@@ -22,13 +23,20 @@ inputs:
       Left blank, sccache uses its own default cache namespace.
     required: false
     default: ''
+  python_version:
+    description: >-
+      Python version to build for. `build` passes its matrix leg;
+      `warm` keeps the default, so the warm shards prime the Python
+      3.11 compile only.
+    required: false
+    default: '3.11'
 runs:
   using: composite
   steps:
-    - name: Set up Python 3.11
+    - name: Set up Python
       uses: actions/setup-python@v7
       with:
-        python-version: "3.11"
+        python-version: ${{ inputs.python_version }}
         cache: pip
 
     - name: Free disk space
@@ -94,8 +102,8 @@ runs:
         set -euo pipefail
         # Matches natten_dev's own torch build exactly (confirmed via
         # `python -c 'import torch; print(torch.__version__)'` there:
-        # 2.11.0+cu128) and is a real wheel on this index for cp311/
-        # manylinux_x86_64 (checked: https://download.pytorch.org/whl/cu128/torch/).
+        # 2.11.0+cu128) and is a real wheel on this index for cp310 and
+        # cp311 manylinux_x86_64 (checked: https://download.pytorch.org/whl/cu128/torch/).
         pip install "torch==2.11.0" --index-url https://download.pytorch.org/whl/cu128
         pip install ninja "build>=1.3.0" "setuptools<82"
         # setuptools<82 for the same reason integration/build_wheel.sh
