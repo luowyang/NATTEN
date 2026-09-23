@@ -31,12 +31,15 @@ A nightly whose `dev` has not moved since the previous nightly is **built but no
 build still runs, because that is what keeps sccache warm, but there is no new pre-release, and the
 manifest records `Published: skipped-unchanged`.
 
-Each build targets exactly one combination:
+Each build produces one wheel per Python version, all sharing the rest of the combination:
 
 - **CUDA 12.8**
 - **PyTorch 2.11**
-- **Python 3.11** (cp311, `linux_x86_64`)
+- **Python 3.10 and 3.11** (cp310 and cp311, `linux_x86_64`; one wheel and one manifest each)
 - **sm90 only** (`NATTEN_CUDA_ARCH=9.0`, i.e. Hopper; the wheel has no other architecture's kernels)
+
+Releases up to `fork/0.21.7+fork.4` carry the cp311 wheel only, with its manifest named
+`MANIFEST-<version>.txt`.
 
 The build runs on a GitHub-hosted runner, which has no GPU. It compiles a real CUDA extension and
 verifies `import natten` works, but cannot run GPU kernel tests. GPU correctness is validated
@@ -75,14 +78,15 @@ Verify the wheel against the SHA256 recorded in the manifest before installing i
 
 ```bash
 sha256sum natten-0.21.7+fork.N-cp311-cp311-linux_x86_64.whl
-grep SHA256 MANIFEST-0.21.7+fork.N.txt
-# the two hashes must match
+grep SHA256 MANIFEST-0.21.7+fork.N-cp311.txt
+# the two hashes must match; cp310 likewise
 ```
 
-Install into an environment that already has torch 2.11 (cu128) and Python 3.11:
+Install the wheel for your Python into an environment that already has torch 2.11 (cu128):
 
 ```bash
-pip install --no-deps natten-0.21.7+fork.N-cp311-cp311-linux_x86_64.whl
+pip install --no-deps natten-0.21.7+fork.N-cp311-cp311-linux_x86_64.whl   # Python 3.11
+pip install --no-deps natten-0.21.7+fork.N-cp310-cp310-linux_x86_64.whl   # Python 3.10
 ```
 
 `--no-deps` is required (see above: the wheel intentionally declares no dependencies, so a plain
@@ -212,6 +216,9 @@ via a plain `git push` over `github.com` (only the *reading* side is blocked; a 
 - `shard-<index>.txt` — one per `warm` shard (`<index>` is `0`..`SHARD_COUNT-1`), pushed when that
   shard's job ends (`if: always()`): elapsed time, own-shard compiled/failed file counts and names, and
   `sccache --show-stats` as seen by that shard.
+
+Each `build` matrix leg writes the other four files into its own subdirectory, `py3.10/` or `py3.11/`:
+
 - `started.txt` — pushed by `build`, right after dependencies install; confirms the run started and
   records initial disk/memory/CPU state and `warm`'s aggregate result.
 - `sampler.txt` — resource samples (`free -m`, top-10 RSS processes, `df -h /`) taken every minute during
@@ -225,7 +232,7 @@ via a plain `git push` over `github.com` (only the *reading* side is blocked; a 
 Read any of these with:
 
 ```bash
-gh api "repos/luowyang/NATTEN/contents/runs/<run_id>-<attempt>/summary.txt?ref=ci-logs" --jq .content | base64 -d
+gh api "repos/luowyang/NATTEN/contents/runs/<run_id>-<attempt>/py3.11/summary.txt?ref=ci-logs" --jq .content | base64 -d
 ```
 
 (swap the filename for `started.txt`, `sampler.txt`, or `build.log`; pipe through `gunzip` as well for
@@ -273,6 +280,12 @@ avoid paying that cost serially:
   afterwards (`needs: warm`), it recompiles every file with that identical command line and hits cache on
   (almost) all of them, instead of compiling anything cold.
 
+- **Python 3.11 only.** `warm` runs prepare-build-env with its default Python, 3.11. Every nvcc command
+  line carries the Python and torch include paths, which differ per Python version, so the `build` leg
+  for Python 3.10 never hits what the shards primed: it compiles through its own sccache entries, cold
+  (serially, about as long as the pre-sharding baseline below) the first time a tree is built and warm
+  from then on.
+
 - **Failure handling.** A shard's own `python -m build` very likely fails or produces a useless wheel
   (most of its objects are empty stand-ins) — that's expected and doesn't matter; that artifact is never
   used. What decides the shard's own pass/fail is whether it compiled its *own* shard's real files without
@@ -313,8 +326,8 @@ All three channels compile the identical tree with identical flags, so they must
 one set of sccache entries — that is what lets a nightly of an unchanged `dev` hit the marker that
 yesterday's build saved and skip the warm shards entirely.
 
-The gate prints its fingerprint and decision in the Actions log; the build repeats them in
-`runs/<run_id>-<attempt>/summary.txt` on `ci-logs`.
+The gate prints its fingerprint and decision in the Actions log; each build leg repeats them in
+`runs/<run_id>-<attempt>/py<version>/summary.txt` on `ci-logs`.
 
 ## Measured operating facts
 
@@ -397,9 +410,10 @@ and unaffected by anything in `.github/`.
 - **`wheel.yml`** (`fork-ci`) — `ubuntu-latest`, on push of tags matching `fork/*`, on push to `dev`,
   and on `workflow_dispatch` (inputs: `ref`, `channel`, `cache_namespace`). Three jobs: `gate` resolves
   the channel and checks whether this exact build fingerprint is already warm; `warm` conditionally
-  runs the sharded precompile described above; `build` always builds the wheel, uploads it + a manifest
-  as an artifact, and then publishes according to the channel — a Release for `release`, a
-  `nightly/<date>` pre-release plus a 14-day prune for `nightly`, nothing for `warm`.
+  runs the sharded precompile described above; `build`, one leg per Python version, always builds the
+  wheel, uploads it + a manifest as an artifact, and then publishes according to the channel — a
+  Release for `release`, a `nightly/<date>` pre-release plus a 14-day prune for `nightly`, nothing for
+  `warm`.
 
 - **`nightly.yml`** (`main`) — the 19:00 UTC schedule, and nothing else. One job, `actions: write`,
   which dispatches `wheel.yml` on the `nightly` channel. It lives on `main` because that is the only

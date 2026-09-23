@@ -1,8 +1,9 @@
 name: wheel
 
-# Builds the NATTEN fork wheel on GitHub-hosted runners, then publishes
-# it according to the run's CHANNEL. See .github/README-fork-ci.md for
-# the full channel -> release flow.
+# Builds the NATTEN fork wheels on GitHub-hosted runners, one per Python
+# version in `build`'s matrix, then publishes them according to the
+# run's CHANNEL. See .github/README-fork-ci.md for the full channel ->
+# release flow.
 #
 # THREE CHANNELS, ONE PIPELINE (gate -> warm -> build). Everything up to
 # and including the wheel is identical in all three; the channel only
@@ -61,7 +62,8 @@ name: wheel
 # extracts likely-relevant lines as `::error::` workflow annotations
 # (visible via `gh run view -v` / the Actions UI without needing the
 # blocked hosts), and pushes the full log + a diagnostics summary
-# (runs/<run_id>-<attempt>/{build.log,summary.txt}).
+# (runs/<run_id>-<attempt>/py<version>/{build.log,summary.txt}, one
+# directory per matrix leg).
 #
 # Triggers:
 #   - a dispatch from release.yml, which fires on a push of a tag matching
@@ -540,6 +542,18 @@ jobs:
       # a channel at all (e.g. channel=release against a branch): there is
       # then no version to stamp and nowhere to publish, so spending up to
       # six hours of runner time on the wheel would buy nothing.
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ['3.10', '3.11']   # One wheel per leg. `warm` primes only
+                                    # prepare-build-env's default Python
+                                    # (3.11); the Python and torch include
+                                    # paths differ per version, so every
+                                    # other leg compiles through its own
+                                    # sccache entries -- cold the first
+                                    # time it runs.
+    env:
+      LEG: py${{ matrix.python }}   # this leg's ci-logs subdirectory
     runs-on: ubuntu-latest
     timeout-minutes: 360   # a cold, uncached CUDA compile on a 4-vCPU hosted
                             # runner is far slower than the 39-worker dev-
@@ -574,6 +588,7 @@ jobs:
         uses: ./.github/actions/prepare-build-env
         with:
           cache_namespace: ${{ inputs.cache_namespace }}
+          python_version: ${{ matrix.python }}
 
       - name: Push started.txt (ci-logs branch)
         id: started_checkpoint
@@ -591,7 +606,7 @@ jobs:
           # is diagnostics-only and must not itself fail the job over an
           # incidental nonzero from something like an empty `git diff`.
           {
-            echo "wheel.yml run ${{ github.run_id }} attempt ${{ github.run_attempt }}: build starting"
+            echo "wheel.yml run ${{ github.run_id }} attempt ${{ github.run_attempt }}: build $LEG starting"
             echo "Ref built: ${{ needs.gate.outputs.build_ref }}"
             echo "Channel: ${{ needs.gate.outputs.channel }}"
             echo "warm job result: ${{ needs.warm.result }}"
@@ -617,16 +632,22 @@ jobs:
           else
             git init --quiet -b ci-logs "$WORKDIR"
           fi
-          DEST="$WORKDIR/runs/${{ github.run_id }}-${{ github.run_attempt }}"
+          DEST="$WORKDIR/runs/${{ github.run_id }}-${{ github.run_attempt }}/$LEG"
           mkdir -p "$DEST"
           cp started.txt "$DEST/"
           git -C "$WORKDIR" add -A
           if git -C "$WORKDIR" diff --cached --quiet; then
             echo "Nothing to commit."
           else
-            git -C "$WORKDIR" commit --quiet -m "wheel.yml run ${{ github.run_id }} attempt ${{ github.run_attempt }}: started"
-            git -C "$WORKDIR" push --quiet "$REMOTE_URL" "HEAD:refs/heads/ci-logs"
-            echo "Pushed: runs/${{ github.run_id }}-${{ github.run_attempt }}/started.txt on ci-logs"
+            git -C "$WORKDIR" commit --quiet -m "wheel.yml run ${{ github.run_id }} attempt ${{ github.run_attempt }}: $LEG started"
+            # The matrix legs start together and push to the same branch.
+            for ATTEMPT in 1 2 3; do
+              if git -C "$WORKDIR" push --quiet "$REMOTE_URL" "HEAD:refs/heads/ci-logs" 2>/dev/null; then
+                echo "Pushed: runs/${{ github.run_id }}-${{ github.run_attempt }}/$LEG/started.txt on ci-logs (attempt $ATTEMPT)"
+                break
+              fi
+              git -C "$WORKDIR" pull --quiet --rebase "$REMOTE_URL" ci-logs 2>/dev/null || true
+            done
           fi
           exit 0
 
@@ -706,7 +727,7 @@ jobs:
           else
             git init --quiet -b ci-logs "$CI_LOGS_DIR"
           fi
-          CI_LOGS_DEST="$CI_LOGS_DIR/runs/${{ github.run_id }}-${{ github.run_attempt }}"
+          CI_LOGS_DEST="$CI_LOGS_DIR/runs/${{ github.run_id }}-${{ github.run_attempt }}/$LEG"
           mkdir -p "$CI_LOGS_DEST"
 
           push_sampler() {
@@ -715,7 +736,7 @@ jobs:
             if git -C "$CI_LOGS_DIR" diff --cached --quiet; then
               return 0
             fi
-            git -C "$CI_LOGS_DIR" commit --quiet -m "run ${{ github.run_id }} attempt ${{ github.run_attempt }}: sampler update"
+            git -C "$CI_LOGS_DIR" commit --quiet -m "run ${{ github.run_id }} attempt ${{ github.run_attempt }}: $LEG sampler update"
             for _ in 1 2 3; do
               git -C "$CI_LOGS_DIR" push --quiet "$REMOTE_URL" HEAD:refs/heads/ci-logs 2>/dev/null && return 0
               git -C "$CI_LOGS_DIR" pull --quiet --rebase "$REMOTE_URL" ci-logs 2>/dev/null || true
@@ -841,7 +862,14 @@ jobs:
                 PREV_SHA="$(gh api "repos/luowyang/NATTEN/git/ref/tags/$PREV_TAG" --jq '.object.sha' || echo "")"
               fi
               if [[ "$PREV_SHA" == "$BUILT_SHA" ]]; then
-                PUBLISHED=skipped-unchanged
+                # Unchanged for this leg only if that release already
+                # carries this leg's wheel: the other matrix leg may have
+                # created it minutes ago, from this same sha, without it.
+                PY_TAG="$(basename "$WHEEL" | cut -d- -f3)"
+                PREV_ASSETS="$(gh release view "$PREV_TAG" --repo luowyang/NATTEN --json assets --jq '.assets[].name' || echo "")"
+                if grep -q -- "-${PY_TAG}-${PY_TAG}-" <<< "$PREV_ASSETS"; then
+                  PUBLISHED=skipped-unchanged
+                fi
               fi
             fi
           fi
@@ -863,7 +891,9 @@ jobs:
           SHA256="$(sha256sum "$WHEEL" | awk '{print $1}')"
           VERSION="$(python -c 'import natten; print(natten.__version__)')"
           BUILT_COMMIT="${{ steps.publication.outputs.built_sha }}"
-          MANIFEST="dist/MANIFEST-${VERSION}.txt"
+          # Named for the wheel's Python tag (cp310, cp311): every matrix
+          # leg attaches its own manifest to the same release.
+          MANIFEST="dist/MANIFEST-${VERSION}-$(basename "$WHEEL" | cut -d- -f3).txt"
           {
             echo "NATTEN fork CI build manifest"
             echo "==============================="
@@ -903,7 +933,7 @@ jobs:
         id: upload
         uses: actions/upload-artifact@v7
         with:
-          name: natten-wheel-${{ github.run_id }}
+          name: natten-wheel-${{ github.run_id }}-${{ env.LEG }}
           path: |
             dist/*.whl
             dist/MANIFEST-*.txt
@@ -928,11 +958,13 @@ jobs:
             # No --prerelease: fork/* IS this fork's release channel, and
             # marking it pre-release hides it from "latest" and from any
             # consumer tooling that only looks at full releases. Nightlies
-            # are the pre-releases here.
+            # are the pre-releases here. If the other matrix leg created
+            # the release since the check above, attach to that one.
             gh release create "$TAG" "$WHEEL" "$MANIFEST" \
               --repo luowyang/NATTEN \
               --title "$TAG" \
-              --notes-file "$MANIFEST"
+              --notes-file "$MANIFEST" \
+              || gh release upload "$TAG" "$WHEEL" "$MANIFEST" --repo luowyang/NATTEN --clobber
           fi
 
       - name: Publish nightly pre-release
@@ -954,18 +986,22 @@ jobs:
             gh release upload "$TAG" "$WHEEL" "$MANIFEST" --repo luowyang/NATTEN --clobber
           else
             # --target pins the new tag to the commit actually built, which
-            # is what the next nightly's unchanged-check reads back.
+            # is what the next nightly's unchanged-check reads back. If the
+            # other matrix leg created it since the check above, attach to
+            # that one.
             gh release create "$TAG" "$WHEEL" "$MANIFEST" \
               --repo luowyang/NATTEN \
               --target "$BUILT_SHA" \
               --title "$TAG" \
               --notes-file "$MANIFEST" \
-              --prerelease
+              --prerelease \
+              || gh release upload "$TAG" "$WHEEL" "$MANIFEST" --repo luowyang/NATTEN --clobber
           fi
 
       - name: Prune nightly pre-releases older than 14 days
         id: prune_nightlies
-        if: needs.gate.outputs.channel == 'nightly'
+        # One matrix leg prunes; two would race to delete the same releases.
+        if: needs.gate.outputs.channel == 'nightly' && strategy.job-index == 0
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -1039,7 +1075,7 @@ jobs:
           fi
 
           {
-            echo "wheel.yml run ${{ github.run_id }} attempt ${{ github.run_attempt }}"
+            echo "wheel.yml run ${{ github.run_id }} attempt ${{ github.run_attempt }}, build $LEG"
             echo "Ref built    : ${{ needs.gate.outputs.build_ref }}"
             echo "Built commit : ${{ steps.publication.outputs.built_sha }}"
             echo "Workflow sha : ${{ github.sha }}"
@@ -1092,7 +1128,7 @@ jobs:
           else
             git init --quiet -b ci-logs "$WORKDIR"
           fi
-          DEST="$WORKDIR/runs/${{ github.run_id }}-${{ github.run_attempt }}"
+          DEST="$WORKDIR/runs/${{ github.run_id }}-${{ github.run_attempt }}/$LEG"
           mkdir -p "$DEST"
           if [[ -n "$LOG_FILE" ]]; then
             cp "$LOG_FILE" "$DEST/"
@@ -1102,8 +1138,14 @@ jobs:
           if git -C "$WORKDIR" diff --cached --quiet; then
             echo "Nothing to commit (unexpected -- summary.txt should always be new)."
           else
-            git -C "$WORKDIR" commit --quiet -m "wheel.yml run ${{ github.run_id }} attempt ${{ github.run_attempt }}: ${{ steps.build.outcome }}"
-            git -C "$WORKDIR" push --quiet "$REMOTE_URL" "HEAD:refs/heads/ci-logs"
-            echo "Pushed: runs/${{ github.run_id }}-${{ github.run_attempt }}/ on ci-logs"
+            git -C "$WORKDIR" commit --quiet -m "wheel.yml run ${{ github.run_id }} attempt ${{ github.run_attempt }}: $LEG ${{ steps.build.outcome }}"
+            # The other matrix leg may push to the same branch meanwhile.
+            for ATTEMPT in 1 2 3; do
+              if git -C "$WORKDIR" push --quiet "$REMOTE_URL" "HEAD:refs/heads/ci-logs" 2>/dev/null; then
+                echo "Pushed: runs/${{ github.run_id }}-${{ github.run_attempt }}/$LEG/ on ci-logs (attempt $ATTEMPT)"
+                break
+              fi
+              git -C "$WORKDIR" pull --quiet --rebase "$REMOTE_URL" ci-logs 2>/dev/null || true
+            done
           fi
           exit 0
