@@ -388,21 +388,24 @@ def check_input_size_arg(na_dim: int, input_size: Any) -> DimensionType:
     )
 
 
-def check_kernel_size_arg(na_dim: int, kernel_size: Any) -> DimensionType:
+def check_kernel_size_arg(
+    na_dim: int, kernel_size: Any, allow_ones: bool = False
+) -> DimensionType:
     assert na_dim > 0 and na_dim < 4
+    minimum = 1 if allow_ones else 2
     if (
         isinstance(kernel_size, Sequence)
         and len(kernel_size) == na_dim
-        and all(isinstance(x, int) and x > 1 for x in kernel_size)
+        and all(isinstance(x, int) and x >= minimum for x in kernel_size)
     ):
         return tuple(x for x in kernel_size)
 
-    if isinstance(kernel_size, int) and kernel_size > 1:
+    if isinstance(kernel_size, int) and kernel_size >= minimum:
         return create_dim_from_int(na_dim, value=kernel_size)
 
     raise ValueError(
-        "Invalid value for `kernel_size`; expected an integer or iterable of integers, all >= 2, "
-        f"got {type(kernel_size)=}, {kernel_size=}."
+        "Invalid value for `kernel_size`; expected an integer or iterable of integers, all "
+        f">= {minimum}, got {type(kernel_size)=}, {kernel_size=}."
     )
 
 
@@ -471,10 +474,15 @@ def check_causal_arg(na_dim: int, is_causal: Any) -> CausalArgType:
 
 
 def check_all_args(
-    na_dim: int, kernel_size: Any, stride: Any, dilation: Any, is_causal: Any
+    na_dim: int,
+    kernel_size: Any,
+    stride: Any,
+    dilation: Any,
+    is_causal: Any,
+    allow_ones: bool = False,
 ) -> Tuple[DimensionType, DimensionType, DimensionType, CausalArgType]:
     kernel_size_out, stride_out, dilation_out, is_causal_out = (
-        check_kernel_size_arg(na_dim, kernel_size),
+        check_kernel_size_arg(na_dim, kernel_size, allow_ones=allow_ones),
         check_stride_arg(na_dim, stride),
         check_dilation_arg(na_dim, dilation),
         check_causal_arg(na_dim, is_causal),
