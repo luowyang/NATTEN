@@ -280,11 +280,12 @@ avoid paying that cost serially:
   afterwards (`needs: warm`), it recompiles every file with that identical command line and hits cache on
   (almost) all of them, instead of compiling anything cold.
 
-- **Python 3.11 only.** `warm` runs prepare-build-env with its default Python, 3.11. Every nvcc command
-  line carries the Python and torch include paths, which differ per Python version, so the `build` leg
-  for Python 3.10 never hits what the shards primed: it compiles through its own sccache entries, cold
-  (serially, about as long as the pre-sharding baseline below) the first time a tree is built and warm
-  from then on.
+- **Python 3.11 only.** `warm` runs prepare-build-env with its default Python, 3.11. sccache keys each
+  nvcc stage on that stage's own input, so the `build` leg for Python 3.10 hits what the shards primed
+  for every translation unit that includes no torch header. The ones that do include one (the Hopper
+  kernel families and the `src/` entry points) carry `Python.h` and a per-version include path, miss,
+  and get compiled by that leg itself, serially, the first time a tree is built: on fork.5, 62 of 331
+  nvcc compile requests, which took `Build wheel` 2h55m against 29 min on the 3.11 leg.
 
 - **Failure handling.** A shard's own `python -m build` very likely fails or produces a useless wheel
   (most of its objects are empty stand-ins) — that's expected and doesn't matter; that artifact is never

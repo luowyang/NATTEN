@@ -547,11 +547,12 @@ jobs:
       matrix:
         python: ['3.10', '3.11']   # One wheel per leg. `warm` primes only
                                     # prepare-build-env's default Python
-                                    # (3.11); the Python and torch include
-                                    # paths differ per version, so every
-                                    # other leg compiles through its own
-                                    # sccache entries -- cold the first
-                                    # time it runs.
+                                    # (3.11). Another leg reuses those
+                                    # sccache entries for every translation
+                                    # unit that includes no torch header,
+                                    # and compiles the rest (the Hopper
+                                    # kernels and the src/ entry points)
+                                    # itself the first time a tree builds.
     env:
       LEG: py${{ matrix.python }}   # this leg's ci-logs subdirectory
     runs-on: ubuntu-latest
