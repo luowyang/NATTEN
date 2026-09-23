@@ -1,0 +1,112 @@
+wheel.yml run 35788981838 attempt 1
+Ref built    : dev
+Built commit : 4f3b0aa940e48bf9eb7e9d7e2ff340eeb3ce92d4
+Workflow sha : c0c05bc92fd2b13a7420705ea9bb266e8bfa9c98
+Channel      : nightly (publish=true, published=yes)
+Workflow run : https://github.com/luowyang/NATTEN/actions/runs/35788981838
+warm job result : skipped
+gate decision   : warm_needed=false fingerprint=ea54c13ca57240669f32a7c16868568e8876219c6b522c55669b26ec54834bca marker_key=natten-warm-ea54c13ca57240669f32a7c16868568e8876219c6b522c55669b26ec54834bca
+
+Step outcomes:
+  Prepare build environment          : success
+  Push started.txt                   : success
+  Stamp nightly version              : success
+  Build wheel                        : success
+  Install wheel + import smoke test  : success
+  Save warm marker                   : skipped
+  Decide publication                 : success
+  Build manifest                     : success
+  Upload artifact                    : success
+  Create or update GitHub Release    : skipped
+  Publish nightly pre-release        : success
+  Prune nightly pre-releases         : success
+
+--- df -h ---
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/root       145G   67G   78G  47% /
+tmpfs           7.9G   84K  7.9G   1% /dev/shm
+tmpfs           3.2G 1012K  3.2G   1% /run
+tmpfs           5.0M     0  5.0M   0% /run/lock
+efivarfs        128M   32K  128M   1% /sys/firmware/efi/efivars
+/dev/sda16      881M   64M  756M   8% /boot
+/dev/sda15      105M  6.2M   99M   6% /boot/efi
+tmpfs           1.6G   12K  1.6G   1% /run/user/1001
+
+--- free -m ---
+               total        used        free      shared  buff/cache   available
+Mem:           15989        1171       10861          52        4355       14818
+Swap:           3071           0        3071
+
+--- nproc ---
+4
+
+--- sccache --show-stats ---
+Compile requests                          342
+Compile requests executed                1658
+Cache hits                               1140
+Cache hits (C/C++)                          2
+Cache hits (CUBIN)                        331
+Cache hits (CUDA)                         269
+Cache hits (CUDA (Device code))           269
+Cache hits (PTX)                          269
+Cache misses                              187
+Cache misses (C/C++)                        1
+Cache misses (CUDA)                        62
+Cache misses (CUDA (Device code))          62
+Cache misses (PTX)                         62
+Cache hits rate                         85.91 %
+Cache hits rate (C/C++)                 66.67 %
+Cache hits rate (CUBIN)                100.00 %
+Cache hits rate (CUDA)                  81.27 %
+Cache hits rate (CUDA (Device code))    81.27 %
+Cache hits rate (PTX)                   81.27 %
+Cache timeouts                              0
+Cache read errors                           0
+Forced recaches                             0
+Cache write errors                          0
+Cache errors                                0
+Compilations                              518
+Compilation failures                        0
+Non-cacheable compilations                331
+Non-cacheable calls                         0
+Non-compilation calls                       8
+Unsupported compiler calls                  0
+Average cache write                     0.693 s
+Average compiler                       30.664 s
+Average cache read hit                  0.186 s
+Failed distributed compilations             0
+Cache location                       ghac, name: fe6676c985fe452e4ec4e9acf9d8cae5f56b7fee7caa734482bc6e07b9a2ec16, prefix: /sccache/
+Base directories                     (none)
+Version (client)                     0.18.0
+
+--- build manifest ---
+NATTEN fork CI build manifest
+===============================
+Wheel file         : natten-0.21.7+fork.4.dev20260922-cp311-cp311-linux_x86_64.whl
+SHA256             : 7f6df7fac316652143e2fbf0d455026e8e9ccf1ed3d93d76c6512adfa9d82ed3
+Built (UTC)        : 2026-09-23T00:32:12Z
+natten.__version__ : 0.21.7+fork.4.dev20260922
+
+Channel            : nightly
+Published          : yes
+Base tag           : fork/0.21.7+fork.4
+Built from commit  : 4f3b0aa940e48bf9eb7e9d7e2ff340eeb3ce92d4
+Workflow commit    : c0c05bc92fd2b13a7420705ea9bb266e8bfa9c98
+Ref built          : dev
+Workflow run       : https://github.com/luowyang/NATTEN/actions/runs/35788981838
+
+Toolchain:
+  Runner           : GitHub-hosted ubuntu-latest (no GPU/driver)
+  Python           : Python 3.11.16
+  torch            : 2.11.0+cu128
+  torch CUDA       : 12.8
+  nvcc             : nvcc: NVIDIA (R) Cuda compiler driver Copyright (c) 2005-2025 NVIDIA Corporation Built on Wed_Jan_15_19:20:09_PST_2025 Cuda compilation tools, release 12.8, V12.8.61 Build cuda_12.8.r12.8/compiler.35404655_0 
+  NATTEN_CUDA_ARCH : 9.0
+  NATTEN_N_WORKERS : 1
+  NATTEN_AUTOGEN_POLICY : fine
+
+GPU kernel tests: NOT run in this workflow (no GPU on
+ubuntu-latest). Only the CPU-only import smoke test above
+ran. GPU correctness validation happens on the dev
+machines via integration/build_wheel.sh and friends --
+see .github/README-fork-ci.md.
