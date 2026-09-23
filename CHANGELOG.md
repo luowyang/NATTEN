@@ -1,6 +1,37 @@
 # Changelog
 
 ## [Main branch]
+* `na{1,2,3}d_varlen` are now safe to call from inside `torch.compile` without
+  specializing on the packing. They used to resolve their schedule from the
+  `VarlenLayout` in traced Python, so dynamo guarded on every per-document
+  extent that resolution read, and a caller whose document shapes changed from
+  call to call -- sequence packing's whole point -- got one graph per packing,
+  with the geometry baked in. Each entry point now checks
+  `torch.compiler.is_compiling()` first and, when it is, routes the call
+  through an opaque operator instead, which takes the layout itself as an
+  argument: `VarlenLayout` is registered with torch as a reference-type opaque
+  object, so dynamo makes it a graph input guarded by its type alone, and the
+  operator receives the caller's own layout when the graph runs. The compiled
+  graph then holds no document geometry at all, and a change of geometry does
+  not recompile. **No new public names, and eager is untouched:**
+  `VarlenLayout` and `na{1,2,3}d_varlen` are the whole surface, the compiled
+  path accepts exactly the same arguments as the eager one, and the operator
+  body calls the entry point itself, so the numerics are the eager path's. On a
+  torch without opaque objects (2.11 has them), compiled calls trace the entry
+  point as before. Limits, as of torch 2.11: inside a compiled region a layout
+  can be passed on but not read (dynamo raises) or built (dynamo graph-breaks),
+  inductor's CUDA graphs (`mode="reduce-overhead"`) skip a graph that takes a
+  layout as input, AOTInductor and `torch.export` do not accept one, and the
+  registration goes through the private
+  `torch._library.opaque_object.register_opaque_type`, which later torch
+  renames `register_custom_class` and keeps as a deprecated alias.
+* Variable-length backward under `torch.compile` replays the forward once
+  rather than driving the inner kernels from a saved output/logsumexp: it is
+  bit-for-bit the eager backward, degenerate-axis lowering included, at the
+  cost of one extra forward per backward (roughly +29% of attention backward
+  time). `backward(create_graph=True)` is not supported through it, the same
+  limit the eager path has. Driving the kernels from saved state is the
+  planned follow-up.
 * `na{1,2,3}d` take the self-attention fast path only when the caller names no
   `backend`. A window covering a whole axis makes the problem equivalent to
   (causal, in 1-D) self attention, which NATTEN can answer with `attention` and

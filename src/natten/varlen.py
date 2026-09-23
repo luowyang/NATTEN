@@ -49,6 +49,17 @@ if TYPE_CHECKING:
 
 _VARLEN_INT32_MAX = 2**31 - 1
 
+# Torch's opaque objects let a torch.library.custom_op take a VarlenLayout as
+# itself (natten.varlen_compile); see the registration after the class.
+try:
+    from torch._library.opaque_object import (
+        register_opaque_type as _register_opaque_type,
+    )
+    from torch._opaque_base import OpaqueBase as _OpaqueBase
+except ImportError:
+    _register_opaque_type = None  # type: ignore[assignment]
+    _OpaqueBase = object  # type: ignore[assignment, misc]
+
 
 def _normalize_token_layouts(
     token_layouts: Sequence[DimensionType],
@@ -195,7 +206,7 @@ def _(
     )
 
 
-class VarlenLayout:
+class VarlenLayout(_OpaqueBase):
     """Packed-document layout for variable-length neighborhood attention.
 
     Unrelated to ``torch.layout`` (memory format); this describes how many
@@ -723,7 +734,9 @@ class VarlenLayout:
         # local and must not cross a pickle boundary (a materialized CUDA
         # tensor pickled in one process and unpickled in a DataLoader worker
         # would carry device state across a process boundary, which is not
-        # meaningful).
+        # meaningful). copy.deepcopy takes this path too, and torch deep-copies
+        # a layout into the FakeScriptObject an operator sees while it is
+        # traced, so that copy holds host shapes only.
         return {"shapes": self._shapes}
 
     def __setstate__(self, state: Dict[str, Any]) -> None:
@@ -734,3 +747,14 @@ class VarlenLayout:
         self._token_layouts = None
         self._fold_memo = {}
         self._permute_memo = {}
+
+
+# A reference-type opaque object is passed to a custom op as itself: under
+# torch.compile dynamo makes it a graph input guarded by its type alone, and
+# the operator receives the caller's own layout when the graph runs, so nothing
+# the layout describes enters the graph. In exchange dynamo reads nothing off a
+# layout and builds none: inside a compiled region a layout can only be passed
+# on, and the fake kernels that see it while tracing read tensor metadata only.
+if _register_opaque_type is not None:
+    _register_opaque_type(VarlenLayout, typ="reference")
+_LAYOUT_IS_OPAQUE = _register_opaque_type is not None
