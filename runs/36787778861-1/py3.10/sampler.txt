@@ -598,3 +598,23 @@ Swap:           3071           0        3071
 Filesystem      Size  Used Avail Use% Mounted on
 /dev/root       145G   67G   78G  47% /
 
+=== sample 31 at 2026-09-30T23:26:42Z (t+31min) ===
+               total        used        free      shared  buff/cache   available
+Mem:           15989        1042        4694          50       10650       14947
+Swap:           3071           0        3071
+--- top 10 by RSS ---
+  RSS     ELAPSED CMD
+143692      43:49 /tmp/provjobd1077694323
+138876      36:44 /home/runner/actions-runner/cached/2.337.0/bin/Runner.Worker spawnclient 142 145
+106584      36:46 /home/runner/actions-runner/cached/2.337.0/bin/Runner.Listener run
+73992       44:02 /usr/bin/dockerd -H fd:// --containerd=/run/containerd/containerd.sock
+51248       44:03 php-fpm: master process (/etc/php/8.3/fpm/php-fpm.conf)
+45580       44:03 /usr/bin/containerd
+43716       44:13 /sbin/multipathd -d -s
+37384       43:59 /usr/bin/python3 -u bin/WALinuxAgent-2.16.0.3-py3.12.egg -run-exthandlers
+30784       44:03 /usr/bin/python3 -u /usr/sbin/waagent -daemon
+24292       31:10 /opt/hostedtoolcache/sccache/0.18.0/x64/sccache
+--- df -h / ---
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/root       145G   67G   78G  47% /
+
