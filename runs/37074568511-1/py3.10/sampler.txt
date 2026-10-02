@@ -1,0 +1,100 @@
+=== sample 1 at 2026-10-02T22:58:37Z (t+1min) ===
+               total        used        free      shared  buff/cache   available
+Mem:           15989        1477        4663          48       10243       14512
+Swap:           3071           0        3071
+--- top 10 by RSS ---
+  RSS     ELAPSED CMD
+536024      00:56 /opt/hostedtoolcache/Python/3.10.21/x64/bin/python /opt/hostedtoolcache/Python/3.10.21/x64/lib/python3.10/site-packages/pyproject_hooks/_in_process/_in_process.py build_wheel /home/runner/work/_temp/tmpzoqes6n8
+140840      08:20 /tmp/provjobd1905754417
+135780      08:16 /home/runner/actions-runner/cached/2.337.0/bin/Runner.Worker spawnclient 142 145
+91224       08:18 /home/runner/actions-runner/cached/2.337.0/bin/Runner.Listener run
+74164       08:33 /usr/bin/dockerd -H fd:// --containerd=/run/containerd/containerd.sock
+53436       00:00 /usr/libexec/gcc/x86_64-linux-gnu/13/cc1plus -E -quiet -I /opt/hostedtoolcache/Python/3.10.21/x64/include/python3.10 -I /home/runner/work/NATTEN/NATTEN/csrc/../third_party/cutlass/include -I /home/runner/work/NATTEN/NATTEN/csrc/./include -I /home/runner/work/NATTEN/NATTEN/csrc/./autogen/include -I /usr/local/cuda-12.8/bin/../targets/x86_64-linux/include -imultiarch x86_64-linux-gnu -D_GNU_SOURCE -D __CUDA_ARCH__=900 -D __CUDA_ARCH_FEAT_SM90_ALL -D __CUDA_ARCH_LIST__=900 -D __NV_LEGACY_LAUNCH -D CUDA_DOUBLE_MATH_FUNCTIONS -D __CUDACC__ -D __NVCC__ -D __CUDACC_EXTENDED_LAMBDA__ -D __CUDACC_RELAXED_CONSTEXPR__ -D CUTLASS_ENABLE_TENSOR_CORE_MMA=1 -D NATTEN_WITH_CUTLASS -D NATTEN_WITH_HOPPER_FNA=1 -D TORCH_API_INCLUDE_EXTENSION_H -D TORCH_EXTENSION_NAME=libnatten -D WITH_CUDA -D _GLIBCXX_USE_CXX11_ABI=1 -D natten_EXPORTS -D NDEBUG -D __CUDACC_VER_MAJOR__=12 -D __CUDACC_VER_MINOR__=8 -D __CUDACC_VER_BUILD__=61 -D __CUDA_API_VER_MAJOR__=12 -D __CUDA_API_VER_MINOR__=8 -D __NVCC_DIAG_PRAGMA_SUPPORT__=1 -D __CUDACC_DEVICE_ATOMIC_BUILTINS__=1 -isystem /opt/hostedtoolcache/Python/3.10.21/x64/lib/python3.10/site-packages/torch/include -isystem /opt/hostedtoolcache/Python/3.10.21/x64/lib/python3.10/site-packages/torch/include/torch/csrc/api/include -include cuda_runtime.h /home/runner/work/NATTEN/NATTEN/csrc/autogen/src/cuda/fmha/source_8.cu -o /home/runner/work/_temp/sccache_nvccqpRZnf/x_0.cpp1.ii -m64 -mtune=generic -march=x86-64 -std=c++17 -Wall -Wconversion -fno-strict-aliasing -fPIC -O3 -D_FORTIFY_SOURCE=3 -fasynchronous-unwind-tables -fstack-protector-strong -Wformat-security -fstack-clash-protection -fcf-protection -dumpdir /home/runner/work/_temp/sccache_nvccqpRZnf/ -dumpbase x_0.cpp1.cu -dumpbase-ext .cu
+51504       08:34 php-fpm: master process (/etc/php/8.3/fpm/php-fpm.conf)
+46224       08:34 /usr/bin/containerd
+43716       08:44 /sbin/multipathd -d -s
+38004       08:31 /usr/bin/python3 -u bin/WALinuxAgent-2.16.0.3-py3.12.egg -run-exthandlers
+--- df -h / ---
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/root       145G   67G   78G  47% /
+
+=== sample 2 at 2026-10-02T22:59:37Z (t+2min) ===
+               total        used        free      shared  buff/cache   available
+Mem:           15989        1482        4661          48       10241       14507
+Swap:           3071           0        3071
+--- top 10 by RSS ---
+  RSS     ELAPSED CMD
+536024      01:56 /opt/hostedtoolcache/Python/3.10.21/x64/bin/python /opt/hostedtoolcache/Python/3.10.21/x64/lib/python3.10/site-packages/pyproject_hooks/_in_process/_in_process.py build_wheel /home/runner/work/_temp/tmpzoqes6n8
+143544      09:20 /tmp/provjobd1905754417
+136952      09:16 /home/runner/actions-runner/cached/2.337.0/bin/Runner.Worker spawnclient 142 145
+92388       09:18 /home/runner/actions-runner/cached/2.337.0/bin/Runner.Listener run
+90708       00:00 /usr/libexec/gcc/x86_64-linux-gnu/13/cc1plus -E -quiet -I /opt/hostedtoolcache/Python/3.10.21/x64/include/python3.10 -I /home/runner/work/NATTEN/NATTEN/csrc/../third_party/cutlass/include -I /home/runner/work/NATTEN/NATTEN/csrc/./include -I /home/runner/work/NATTEN/NATTEN/csrc/./autogen/include -I /usr/local/cuda-12.8/bin/../targets/x86_64-linux/include -imultiarch x86_64-linux-gnu -D_GNU_SOURCE -D __CUDA_ARCH_LIST__=900 -D __NV_LEGACY_LAUNCH -D __CUDACC__ -D __NVCC__ -D __CUDACC_EXTENDED_LAMBDA__ -D __CUDACC_RELAXED_CONSTEXPR__ -D CUTLASS_ENABLE_TENSOR_CORE_MMA=1 -D NATTEN_WITH_CUTLASS -D NATTEN_WITH_HOPPER_FNA=1 -D TORCH_API_INCLUDE_EXTENSION_H -D TORCH_EXTENSION_NAME=libnatten -D WITH_CUDA -D _GLIBCXX_USE_CXX11_ABI=1 -D natten_EXPORTS -D NDEBUG -D __CUDACC_VER_MAJOR__=12 -D __CUDACC_VER_MINOR__=8 -D __CUDACC_VER_BUILD__=61 -D __CUDA_API_VER_MAJOR__=12 -D __CUDA_API_VER_MINOR__=8 -D __NVCC_DIAG_PRAGMA_SUPPORT__=1 -D __CUDACC_DEVICE_ATOMIC_BUILTINS__=1 -isystem /opt/hostedtoolcache/Python/3.10.21/x64/lib/python3.10/site-packages/torch/include -isystem /opt/hostedtoolcache/Python/3.10.21/x64/lib/python3.10/site-packages/torch/include/torch/csrc/api/include -include cuda_runtime.h /home/runner/work/NATTEN/NATTEN/csrc/autogen/src/cuda/fna/source_112.cu -o /home/runner/work/_temp/tmpxft_00001483_00000000-6_source_112.cpp4.ii -m64 -mtune=generic -march=x86-64 -std=c++17 -Wall -Wconversion -fno-strict-aliasing -fPIC -O3 -D_FORTIFY_SOURCE=3 -fasynchronous-unwind-tables -fstack-protector-strong -Wformat-security -fstack-clash-protection -fcf-protection -dumpdir /home/runner/work/_temp/ -dumpbase tmpxft_00001483_00000000-6_source_112.cpp4.cu -dumpbase-ext .cu
+74164       09:33 /usr/bin/dockerd -H fd:// --containerd=/run/containerd/containerd.sock
+51504       09:34 php-fpm: master process (/etc/php/8.3/fpm/php-fpm.conf)
+46224       09:34 /usr/bin/containerd
+43716       09:44 /sbin/multipathd -d -s
+38004       09:31 /usr/bin/python3 -u bin/WALinuxAgent-2.16.0.3-py3.12.egg -run-exthandlers
+--- df -h / ---
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/root       145G   67G   78G  47% /
+
+=== sample 3 at 2026-10-02T23:00:37Z (t+3min) ===
+               total        used        free      shared  buff/cache   available
+Mem:           15989        1526        4565          48       10293       14463
+Swap:           3071           0        3071
+--- top 10 by RSS ---
+  RSS     ELAPSED CMD
+536884      02:56 /opt/hostedtoolcache/Python/3.10.21/x64/bin/python /opt/hostedtoolcache/Python/3.10.21/x64/lib/python3.10/site-packages/pyproject_hooks/_in_process/_in_process.py build_wheel /home/runner/work/_temp/tmpzoqes6n8
+143548      10:20 /tmp/provjobd1905754417
+136956      10:16 /home/runner/actions-runner/cached/2.337.0/bin/Runner.Worker spawnclient 142 145
+92540       10:18 /home/runner/actions-runner/cached/2.337.0/bin/Runner.Listener run
+74164       10:33 /usr/bin/dockerd -H fd:// --containerd=/run/containerd/containerd.sock
+51504       10:34 php-fpm: master process (/etc/php/8.3/fpm/php-fpm.conf)
+46224       10:34 /usr/bin/containerd
+43716       10:44 /sbin/multipathd -d -s
+38004       10:31 /usr/bin/python3 -u bin/WALinuxAgent-2.16.0.3-py3.12.egg -run-exthandlers
+31088       02:52 /opt/hostedtoolcache/sccache/0.18.0/x64/sccache
+--- df -h / ---
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/root       145G   67G   78G  47% /
+
+=== sample 4 at 2026-10-02T23:01:37Z (t+4min) ===
+               total        used        free      shared  buff/cache   available
+Mem:           15989        1496        4614          49       10273       14493
+Swap:           3071           0        3071
+--- top 10 by RSS ---
+  RSS     ELAPSED CMD
+537032      03:56 /opt/hostedtoolcache/Python/3.10.21/x64/bin/python /opt/hostedtoolcache/Python/3.10.21/x64/lib/python3.10/site-packages/pyproject_hooks/_in_process/_in_process.py build_wheel /home/runner/work/_temp/tmpzoqes6n8
+143548      11:20 /tmp/provjobd1905754417
+136936      11:16 /home/runner/actions-runner/cached/2.337.0/bin/Runner.Worker spawnclient 142 145
+92644       11:18 /home/runner/actions-runner/cached/2.337.0/bin/Runner.Listener run
+74164       11:33 /usr/bin/dockerd -H fd:// --containerd=/run/containerd/containerd.sock
+51504       11:34 php-fpm: master process (/etc/php/8.3/fpm/php-fpm.conf)
+46224       11:34 /usr/bin/containerd
+43716       11:44 /sbin/multipathd -d -s
+38004       11:31 /usr/bin/python3 -u bin/WALinuxAgent-2.16.0.3-py3.12.egg -run-exthandlers
+31700       03:52 /opt/hostedtoolcache/sccache/0.18.0/x64/sccache
+--- df -h / ---
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/root       145G   67G   78G  47% /
+
+=== sample 5 at 2026-10-02T23:02:37Z (t+5min) ===
+               total        used        free      shared  buff/cache   available
+Mem:           15989        1512        4612          49       10260       14477
+Swap:           3071           0        3071
+--- top 10 by RSS ---
+  RSS     ELAPSED CMD
+537032      04:56 /opt/hostedtoolcache/Python/3.10.21/x64/bin/python /opt/hostedtoolcache/Python/3.10.21/x64/lib/python3.10/site-packages/pyproject_hooks/_in_process/_in_process.py build_wheel /home/runner/work/_temp/tmpzoqes6n8
+143552      12:20 /tmp/provjobd1905754417
+136936      12:16 /home/runner/actions-runner/cached/2.337.0/bin/Runner.Worker spawnclient 142 145
+92720       12:18 /home/runner/actions-runner/cached/2.337.0/bin/Runner.Listener run
+74164       12:33 /usr/bin/dockerd -H fd:// --containerd=/run/containerd/containerd.sock
+51504       12:34 php-fpm: master process (/etc/php/8.3/fpm/php-fpm.conf)
+46224       12:34 /usr/bin/containerd
+43716       12:44 /sbin/multipathd -d -s
+40476       00:00 /usr/libexec/gcc/x86_64-linux-gnu/13/cc1plus -E -quiet -I /opt/hostedtoolcache/Python/3.10.21/x64/include/python3.10 -I /home/runner/work/NATTEN/NATTEN/csrc/../third_party/cutlass/include -I /home/runner/work/NATTEN/NATTEN/csrc/./include -I /home/runner/work/NATTEN/NATTEN/csrc/./autogen/include -I /usr/local/cuda-12.8/bin/../targets/x86_64-linux/include -imultiarch x86_64-linux-gnu -D_GNU_SOURCE -D __CUDA_ARCH_LIST__=900 -D __NV_LEGACY_LAUNCH -D __CUDACC__ -D __NVCC__ -D __CUDACC_EXTENDED_LAMBDA__ -D __CUDACC_RELAXED_CONSTEXPR__ -D CUTLASS_ENABLE_TENSOR_CORE_MMA=1 -D NATTEN_WITH_CUTLASS -D NATTEN_WITH_HOPPER_FNA=1 -D TORCH_API_INCLUDE_EXTENSION_H -D TORCH_EXTENSION_NAME=libnatten -D WITH_CUDA -D _GLIBCXX_USE_CXX11_ABI=1 -D natten_EXPORTS -D NDEBUG -D __CUDACC_VER_MAJOR__=12 -D __CUDACC_VER_MINOR__=8 -D __CUDACC_VER_BUILD__=61 -D __CUDA_API_VER_MAJOR__=12 -D __CUDA_API_VER_MINOR__=8 -D __NVCC_DIAG_PRAGMA_SUPPORT__=1 -D __CUDACC_DEVICE_ATOMIC_BUILTINS__=1 -isystem /opt/hostedtoolcache/Python/3.10.21/x64/lib/python3.10/site-packages/torch/include -isystem /opt/hostedtoolcache/Python/3.10.21/x64/lib/python3.10/site-packages/torch/include/torch/csrc/api/include -include cuda_runtime.h /home/runner/work/NATTEN/NATTEN/csrc/autogen/src/cuda/fna/source_43.cu -o /home/runner/work/_temp/sccache_nvccQPeeXZ/x_0.cpp4.ii -m64 -mtune=generic -march=x86-64 -std=c++17 -Wall -Wconversion -fno-strict-aliasing -fPIC -O3 -D_FORTIFY_SOURCE=3 -fasynchronous-unwind-tables -fstack-protector-strong -Wformat-security -fstack-clash-protection -fcf-protection -dumpdir /home/runner/work/_temp/sccache_nvccQPeeXZ/ -dumpbase x_0.cpp4.cu -dumpbase-ext .cu
+38004       12:31 /usr/bin/python3 -u bin/WALinuxAgent-2.16.0.3-py3.12.egg -run-exthandlers
+--- df -h / ---
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/root       145G   67G   78G  47% /
+
