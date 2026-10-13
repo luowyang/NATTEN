@@ -398,3 +398,43 @@ Swap:           3071           0        3071
 Filesystem      Size  Used Avail Use% Mounted on
 /dev/root       145G   68G   77G  47% /
 
+=== sample 21 at 2026-10-13T01:36:06Z (t+21min) ===
+               total        used        free      shared  buff/cache   available
+Mem:           15989        1740        3844          51       10802       14249
+Swap:           3071           0        3071
+--- top 10 by RSS ---
+  RSS     ELAPSED CMD
+543364      21:06 /opt/hostedtoolcache/Python/3.11.17/x64/bin/python /opt/hostedtoolcache/Python/3.11.17/x64/lib/python3.11/site-packages/pyproject_hooks/_in_process/_in_process.py build_wheel /home/runner/work/_temp/tmps6sac_am
+212940      00:01 /usr/libexec/gcc/x86_64-linux-gnu/13/cc1plus -E -quiet -I /opt/hostedtoolcache/Python/3.11.17/x64/include/python3.11 -I /home/runner/work/NATTEN/NATTEN/csrc/../third_party/cutlass/include -I /home/runner/work/NATTEN/NATTEN/csrc/./include -I /home/runner/work/NATTEN/NATTEN/csrc/./autogen/include -I /usr/local/cuda-12.8/bin/../targets/x86_64-linux/include -imultiarch x86_64-linux-gnu -D_GNU_SOURCE -D __CUDA_ARCH_LIST__=900 -D __NV_LEGACY_LAUNCH -D __CUDACC__ -D __NVCC__ -D __CUDACC_EXTENDED_LAMBDA__ -D __CUDACC_RELAXED_CONSTEXPR__ -D CUTLASS_ENABLE_TENSOR_CORE_MMA=1 -D NATTEN_WITH_CUTLASS -D NATTEN_WITH_HOPPER_FNA=1 -D TORCH_API_INCLUDE_EXTENSION_H -D TORCH_EXTENSION_NAME=libnatten -D WITH_CUDA -D _GLIBCXX_USE_CXX11_ABI=1 -D natten_EXPORTS -D NDEBUG -D __CUDACC_VER_MAJOR__=12 -D __CUDACC_VER_MINOR__=8 -D __CUDACC_VER_BUILD__=61 -D __CUDA_API_VER_MAJOR__=12 -D __CUDA_API_VER_MINOR__=8 -D __NVCC_DIAG_PRAGMA_SUPPORT__=1 -D __CUDACC_DEVICE_ATOMIC_BUILTINS__=1 -isystem /opt/hostedtoolcache/Python/3.11.17/x64/lib/python3.11/site-packages/torch/include -isystem /opt/hostedtoolcache/Python/3.11.17/x64/lib/python3.11/site-packages/torch/include/torch/csrc/api/include -include cuda_runtime.h /home/runner/work/NATTEN/NATTEN/csrc/src/token_permute.cu -o /home/runner/work/_temp/tmpxft_00003bde_00000000-6_token_permute.cpp4.ii -m64 -mtune=generic -march=x86-64 -std=c++17 -Wall -Wconversion -fno-strict-aliasing -fPIC -O3 -D_FORTIFY_SOURCE=3 -fasynchronous-unwind-tables -fstack-protector-strong -Wformat-security -fstack-clash-protection -fcf-protection -dumpdir /home/runner/work/_temp/ -dumpbase tmpxft_00003bde_00000000-6_token_permute.cpp4.cu -dumpbase-ext .cu
+148752      27:34 /home/runner/actions-runner/cached/2.337.0/bin/Runner.Worker spawnclient 142 145
+142852      28:38 /tmp/provjobd3675948601
+97756       27:35 /home/runner/actions-runner/cached/2.337.0/bin/Runner.Listener run
+74024       28:51 /usr/bin/dockerd -H fd:// --containerd=/run/containerd/containerd.sock
+51044       28:52 php-fpm: master process (/etc/php/8.3/fpm/php-fpm.conf)
+47532       28:52 /usr/bin/containerd
+43684       28:59 /sbin/multipathd -d -s
+38584       28:51 /usr/bin/python3 -u bin/WALinuxAgent-2.16.0.2-py3.12.egg -run-exthandlers
+--- df -h / ---
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/root       145G   68G   77G  47% /
+
+=== sample 22 at 2026-10-13T01:37:06Z (t+22min) ===
+               total        used        free      shared  buff/cache   available
+Mem:           15989        1045        4604          51       10737       14944
+Swap:           3071           0        3071
+--- top 10 by RSS ---
+  RSS     ELAPSED CMD
+148756      28:34 /home/runner/actions-runner/cached/2.337.0/bin/Runner.Worker spawnclient 142 145
+142852      29:38 /tmp/provjobd3675948601
+97808       28:35 /home/runner/actions-runner/cached/2.337.0/bin/Runner.Listener run
+74024       29:51 /usr/bin/dockerd -H fd:// --containerd=/run/containerd/containerd.sock
+51044       29:52 php-fpm: master process (/etc/php/8.3/fpm/php-fpm.conf)
+47532       29:52 /usr/bin/containerd
+43684       29:59 /sbin/multipathd -d -s
+38584       29:51 /usr/bin/python3 -u bin/WALinuxAgent-2.16.0.2-py3.12.egg -run-exthandlers
+31060       29:52 /usr/bin/python3 -u /usr/sbin/waagent -daemon
+25624       22:04 /opt/hostedtoolcache/sccache/0.18.0/x64/sccache
+--- df -h / ---
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/root       145G   68G   77G  47% /
+
