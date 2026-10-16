@@ -2898,3 +2898,43 @@ Swap:           3071           0        3071
 Filesystem      Size  Used Avail Use% Mounted on
 /dev/root       145G   67G   78G  47% /
 
+=== sample 146 at 2026-10-16T00:35:34Z (t+146min) ===
+               total        used        free      shared  buff/cache   available
+Mem:           15989        2811        9904          53        3673       13178
+Swap:           3071           0        3071
+--- top 10 by RSS ---
+  RSS     ELAPSED CMD
+1395580     00:12 /usr/libexec/gcc/x86_64-linux-gnu/13/cc1plus -quiet -I /opt/hostedtoolcache/Python/3.11.17/x64/include/python3.11 -I /home/runner/work/NATTEN/NATTEN/csrc/../third_party/cutlass/include -I /home/runner/work/NATTEN/NATTEN/csrc/./include -I /home/runner/work/NATTEN/NATTEN/csrc/./autogen/include -I /usr/local/cuda-12.8/bin/../targets/x86_64-linux/include -imultiarch x86_64-linux-gnu -D_GNU_SOURCE -D __CUDA_ARCH__=900 -D __CUDA_ARCH_FEAT_SM90_ALL -D __CUDA_ARCH_LIST__=900 -D __NV_LEGACY_LAUNCH -D CUDA_DOUBLE_MATH_FUNCTIONS -isystem /opt/hostedtoolcache/Python/3.11.17/x64/lib/python3.11/site-packages/torch/include -isystem /opt/hostedtoolcache/Python/3.11.17/x64/lib/python3.11/site-packages/torch/include/torch/csrc/api/include /home/runner/work/_temp/sccache_nvccXZBusP/x_0.cudafe1.cpp -D_FORTIFY_SOURCE=3 -quiet -dumpdir CMakeFiles/natten.dir/src/ -dumpbase token_unpermute.cu.cpp -dumpbase-ext .cpp -m64 -mtune=generic -march=x86-64 -O3 -Wall -Wconversion -Wno-psabi -std=c++17 -fdiagnostics-color=always -fno-strict-aliasing -fPIC -ftemplate-backtrace-limit=0 -fasynchronous-unwind-tables -fstack-protector-strong -Wformat-security -fstack-clash-protection -fcf-protection -o /home/runner/work/_temp/ccnxPV0l.s
+374600   02:27:09 /opt/hostedtoolcache/Python/3.11.17/x64/bin/python /opt/hostedtoolcache/Python/3.11.17/x64/lib/python3.11/site-packages/pyproject_hooks/_in_process/_in_process.py build_wheel /home/runner/work/_temp/tmp7c361s9u
+146656   02:36:16 /home/runner/actions-runner/cached/2.337.0/bin/Runner.Worker spawnclient 142 145
+139800   02:36:20 /tmp/provjobd3134903136
+117784   02:36:17 /home/runner/actions-runner/cached/2.337.0/bin/Runner.Listener run
+76092    02:36:36 /usr/bin/dockerd -H fd:// --containerd=/run/containerd/containerd.sock
+54908    02:27:07 /opt/hostedtoolcache/sccache/0.18.0/x64/sccache
+50704    02:36:37 php-fpm: master process (/etc/php/8.3/fpm/php-fpm.conf)
+46124    02:36:36 /usr/bin/containerd
+43716    02:36:46 /sbin/multipathd -d -s
+--- df -h / ---
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/root       145G   67G   78G  47% /
+
+=== sample 147 at 2026-10-16T00:36:34Z (t+147min) ===
+               total        used        free      shared  buff/cache   available
+Mem:           15989        1030       11613          53        3745       14959
+Swap:           3071           0        3071
+--- top 10 by RSS ---
+  RSS     ELAPSED CMD
+148400   02:37:16 /home/runner/actions-runner/cached/2.337.0/bin/Runner.Worker spawnclient 142 145
+141080   02:37:20 /tmp/provjobd3134903136
+117796   02:37:17 /home/runner/actions-runner/cached/2.337.0/bin/Runner.Listener run
+76092    02:37:36 /usr/bin/dockerd -H fd:// --containerd=/run/containerd/containerd.sock
+50704    02:37:37 php-fpm: master process (/etc/php/8.3/fpm/php-fpm.conf)
+46124    02:37:36 /usr/bin/containerd
+43716    02:37:46 /sbin/multipathd -d -s
+38272    02:37:36 /usr/bin/python3 -u bin/WALinuxAgent-2.16.0.2-py3.12.egg -run-exthandlers
+30432    02:37:37 /usr/bin/python3 -u /usr/sbin/waagent -daemon
+21380    02:37:36 php-fpm: pool www
+--- df -h / ---
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/root       145G   67G   78G  47% /
+
