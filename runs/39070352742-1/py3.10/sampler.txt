@@ -498,3 +498,43 @@ Swap:           3071           0        3071
 Filesystem      Size  Used Avail Use% Mounted on
 /dev/root       145G   67G   78G  47% /
 
+=== sample 26 at 2026-10-17T21:51:56Z (t+26min) ===
+               total        used        free      shared  buff/cache   available
+Mem:           15989        1688        3702          50       10995       14301
+Swap:           3071           0        3071
+--- top 10 by RSS ---
+  RSS     ELAPSED CMD
+680912      26:05 /opt/hostedtoolcache/Python/3.10.22/x64/bin/python /opt/hostedtoolcache/Python/3.10.22/x64/lib/python3.10/site-packages/pyproject_hooks/_in_process/_in_process.py build_wheel /home/runner/work/_temp/tmpm763ttop
+143016      33:48 /tmp/provjobd4291661091
+140160      33:40 /home/runner/actions-runner/cached/2.337.0/bin/Runner.Worker spawnclient 142 145
+104864      33:41 /home/runner/actions-runner/cached/2.337.0/bin/Runner.Listener run
+75224       34:02 /usr/bin/dockerd -H fd:// --containerd=/run/containerd/containerd.sock
+51164       34:03 php-fpm: master process (/etc/php/8.3/fpm/php-fpm.conf)
+45964       34:03 /usr/bin/containerd
+43716       34:14 /sbin/multipathd -d -s
+37980       34:02 /usr/bin/python3 -u bin/WALinuxAgent-2.16.0.2-py3.12.egg -run-exthandlers
+31440       34:03 /usr/bin/python3 -u /usr/sbin/waagent -daemon
+--- df -h / ---
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/root       145G   68G   78G  47% /
+
+=== sample 27 at 2026-10-17T21:52:56Z (t+27min) ===
+               total        used        free      shared  buff/cache   available
+Mem:           15989        1054        4729          50       10602       14935
+Swap:           3071           0        3071
+--- top 10 by RSS ---
+  RSS     ELAPSED CMD
+141752      34:48 /tmp/provjobd4291661091
+140160      34:40 /home/runner/actions-runner/cached/2.337.0/bin/Runner.Worker spawnclient 142 145
+105020      34:41 /home/runner/actions-runner/cached/2.337.0/bin/Runner.Listener run
+75224       35:02 /usr/bin/dockerd -H fd:// --containerd=/run/containerd/containerd.sock
+51164       35:03 php-fpm: master process (/etc/php/8.3/fpm/php-fpm.conf)
+45964       35:03 /usr/bin/containerd
+43716       35:14 /sbin/multipathd -d -s
+37980       35:02 /usr/bin/python3 -u bin/WALinuxAgent-2.16.0.2-py3.12.egg -run-exthandlers
+31440       35:03 /usr/bin/python3 -u /usr/sbin/waagent -daemon
+22856       27:02 /opt/hostedtoolcache/sccache/0.18.0/x64/sccache
+--- df -h / ---
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/root       145G   67G   78G  47% /
+
