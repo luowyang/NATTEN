@@ -1898,3 +1898,103 @@ Swap:           3071           0        3071
 Filesystem      Size  Used Avail Use% Mounted on
 /dev/root       145G   67G   78G  47% /
 
+=== sample 96 at 2026-10-29T00:46:07Z (t+96min) ===
+               total        used        free      shared  buff/cache   available
+Mem:           15983        2471        8829          51        5081       13512
+Swap:           3071           0        3071
+--- top 10 by RSS ---
+  RSS     ELAPSED CMD
+984056      01:13 /usr/local/cuda-12.8/bin/../nvvm/bin/cicc --c++17 --gnu_version=130300 --display_error_number --orig_src_file_name /home/runner/work/NATTEN/NATTEN/csrc/autogen/src/cuda/hopper_fna/source_6.cu --orig_src_path_name /home/runner/work/NATTEN/NATTEN/csrc/autogen/src/cuda/hopper_fna/source_6.cu --allow_managed --context_limit=0 --extended-lambda --relaxed_constexpr -arch compute_90a -m64 --no-version-ident -ftz=1 -prec_div=0 -prec_sqrt=0 -fmad=1 -fast-math --gen_div_approx_ftz --include_file_name source_6.fatbin.c -tused --module_id_file_name source_6.module_id --gen_c_file_name x_0.cudafe1.c --stub_file_name x_0.cudafe1.stub.c --gen_device_file_name source_6.cudafe1.gpu x_0.cpp1.ii -o /home/runner/work/_temp/sccache_nvcc68UGok/source_6.ptx
+637252   01:36:28 /opt/hostedtoolcache/Python/3.11.17/x64/bin/python /opt/hostedtoolcache/Python/3.11.17/x64/lib/python3.11/site-packages/pyproject_hooks/_in_process/_in_process.py build_wheel /home/runner/work/_temp/tmp39mg_fru
+153924   01:49:27 /tmp/provjobd3396557577
+136716   01:48:21 /home/runner/actions-runner/cached/2.338.0/bin/Runner.Worker spawnclient 142 145
+108408   01:48:23 /home/runner/actions-runner/cached/2.338.0/bin/Runner.Listener run
+69188    01:49:32 /usr/bin/dockerd -H fd:// --containerd=/run/containerd/containerd.sock
+68800    01:36:25 /opt/hostedtoolcache/sccache/0.19.0/x64/sccache
+49784    01:49:33 php-fpm: master process (/etc/php/8.3/fpm/php-fpm.conf)
+43716    01:49:42 /sbin/multipathd -d -s
+42712    01:49:33 /usr/bin/containerd
+--- df -h / ---
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/root       145G   67G   78G  47% /
+
+=== sample 97 at 2026-10-29T00:47:07Z (t+97min) ===
+               total        used        free      shared  buff/cache   available
+Mem:           15983        2021        9497          51        4862       13962
+Swap:           3071           0        3071
+--- top 10 by RSS ---
+  RSS     ELAPSED CMD
+637252   01:37:28 /opt/hostedtoolcache/Python/3.11.17/x64/bin/python /opt/hostedtoolcache/Python/3.11.17/x64/lib/python3.11/site-packages/pyproject_hooks/_in_process/_in_process.py build_wheel /home/runner/work/_temp/tmp39mg_fru
+218636      00:01 /usr/libexec/gcc/x86_64-linux-gnu/13/cc1plus -E -quiet -I /opt/hostedtoolcache/Python/3.11.17/x64/include/python3.11 -I /home/runner/work/NATTEN/NATTEN/csrc/../third_party/cutlass/include -I /home/runner/work/NATTEN/NATTEN/csrc/./include -I /home/runner/work/NATTEN/NATTEN/csrc/./autogen/include -I /usr/local/cuda-12.8/bin/../targets/x86_64-linux/include -imultiarch x86_64-linux-gnu -D_GNU_SOURCE -D __CUDA_ARCH_LIST__=900 -D __NV_LEGACY_LAUNCH -D __CUDACC__ -D __NVCC__ -D __CUDACC_EXTENDED_LAMBDA__ -D __CUDACC_RELAXED_CONSTEXPR__ -D CUTLASS_ENABLE_TENSOR_CORE_MMA=1 -D NATTEN_WITH_CUTLASS -D NATTEN_WITH_HOPPER_FNA=1 -D TORCH_API_INCLUDE_EXTENSION_H -D TORCH_EXTENSION_NAME=libnatten -D WITH_CUDA -D _GLIBCXX_USE_CXX11_ABI=1 -D natten_EXPORTS -D NDEBUG -D __CUDACC_VER_MAJOR__=12 -D __CUDACC_VER_MINOR__=8 -D __CUDACC_VER_BUILD__=61 -D __CUDA_API_VER_MAJOR__=12 -D __CUDA_API_VER_MINOR__=8 -D __NVCC_DIAG_PRAGMA_SUPPORT__=1 -D __CUDACC_DEVICE_ATOMIC_BUILTINS__=1 -isystem /opt/hostedtoolcache/Python/3.11.17/x64/lib/python3.11/site-packages/torch/include -isystem /opt/hostedtoolcache/Python/3.11.17/x64/lib/python3.11/site-packages/torch/include/torch/csrc/api/include -include cuda_runtime.h /home/runner/work/NATTEN/NATTEN/csrc/autogen/src/cuda/hopper_fna/source_7.cu -o /home/runner/work/_temp/sccache_nvcclRsmWx/x_0.cpp4.ii -m64 -mtune=generic -march=x86-64 -std=c++17 -Wall -Wconversion -fno-strict-aliasing -fPIC -O3 -D_FORTIFY_SOURCE=3 -fasynchronous-unwind-tables -fstack-protector-strong -Wformat-security -fstack-clash-protection -fcf-protection -dumpdir /home/runner/work/_temp/sccache_nvcclRsmWx/ -dumpbase x_0.cpp4.cu -dumpbase-ext .cu
+140836   01:50:27 /tmp/provjobd3396557577
+136716   01:49:21 /home/runner/actions-runner/cached/2.338.0/bin/Runner.Worker spawnclient 142 145
+108408   01:49:23 /home/runner/actions-runner/cached/2.338.0/bin/Runner.Listener run
+69188    01:50:32 /usr/bin/dockerd -H fd:// --containerd=/run/containerd/containerd.sock
+49784    01:50:33 php-fpm: master process (/etc/php/8.3/fpm/php-fpm.conf)
+43716    01:50:42 /sbin/multipathd -d -s
+42712    01:50:33 /usr/bin/containerd
+41376    01:37:25 /opt/hostedtoolcache/sccache/0.19.0/x64/sccache
+--- df -h / ---
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/root       145G   67G   78G  47% /
+
+=== sample 98 at 2026-10-29T00:48:07Z (t+98min) ===
+               total        used        free      shared  buff/cache   available
+Mem:           15983        6595        4862          51        4923        9388
+Swap:           3071           0        3071
+--- top 10 by RSS ---
+  RSS     ELAPSED CMD
+5316504     00:29 /usr/local/cuda-12.8/bin/../nvvm/bin/cicc --c++17 --gnu_version=130300 --display_error_number --orig_src_file_name /home/runner/work/NATTEN/NATTEN/csrc/autogen/src/cuda/hopper_fna/source_7.cu --orig_src_path_name /home/runner/work/NATTEN/NATTEN/csrc/autogen/src/cuda/hopper_fna/source_7.cu --allow_managed --context_limit=0 --extended-lambda --relaxed_constexpr -arch compute_90a -m64 --no-version-ident -ftz=1 -prec_div=0 -prec_sqrt=0 -fmad=1 -fast-math --gen_div_approx_ftz --include_file_name source_7.fatbin.c -tused --module_id_file_name source_7.module_id --gen_c_file_name x_0.cudafe1.c --stub_file_name x_0.cudafe1.stub.c --gen_device_file_name source_7.cudafe1.gpu x_0.cpp1.ii -o /home/runner/work/_temp/sccache_nvcclRsmWx/source_7.ptx
+637252   01:38:28 /opt/hostedtoolcache/Python/3.11.17/x64/bin/python /opt/hostedtoolcache/Python/3.11.17/x64/lib/python3.11/site-packages/pyproject_hooks/_in_process/_in_process.py build_wheel /home/runner/work/_temp/tmp39mg_fru
+140716   01:51:27 /tmp/provjobd3396557577
+136716   01:50:21 /home/runner/actions-runner/cached/2.338.0/bin/Runner.Worker spawnclient 142 145
+108420   01:50:23 /home/runner/actions-runner/cached/2.338.0/bin/Runner.Listener run
+69188    01:51:32 /usr/bin/dockerd -H fd:// --containerd=/run/containerd/containerd.sock
+68896    01:38:25 /opt/hostedtoolcache/sccache/0.19.0/x64/sccache
+49784    01:51:33 php-fpm: master process (/etc/php/8.3/fpm/php-fpm.conf)
+43716    01:51:42 /sbin/multipathd -d -s
+42716    01:51:33 /usr/bin/containerd
+--- df -h / ---
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/root       145G   67G   78G  47% /
+
+=== sample 99 at 2026-10-29T00:49:07Z (t+99min) ===
+               total        used        free      shared  buff/cache   available
+Mem:           15983        2395        8893          51        5093       13588
+Swap:           3071           0        3071
+--- top 10 by RSS ---
+  RSS     ELAPSED CMD
+1075264     01:29 /usr/local/cuda-12.8/bin/../nvvm/bin/cicc --c++17 --gnu_version=130300 --display_error_number --orig_src_file_name /home/runner/work/NATTEN/NATTEN/csrc/autogen/src/cuda/hopper_fna/source_7.cu --orig_src_path_name /home/runner/work/NATTEN/NATTEN/csrc/autogen/src/cuda/hopper_fna/source_7.cu --allow_managed --context_limit=0 --extended-lambda --relaxed_constexpr -arch compute_90a -m64 --no-version-ident -ftz=1 -prec_div=0 -prec_sqrt=0 -fmad=1 -fast-math --gen_div_approx_ftz --include_file_name source_7.fatbin.c -tused --module_id_file_name source_7.module_id --gen_c_file_name x_0.cudafe1.c --stub_file_name x_0.cudafe1.stub.c --gen_device_file_name source_7.cudafe1.gpu x_0.cpp1.ii -o /home/runner/work/_temp/sccache_nvcclRsmWx/source_7.ptx
+637252   01:39:28 /opt/hostedtoolcache/Python/3.11.17/x64/bin/python /opt/hostedtoolcache/Python/3.11.17/x64/lib/python3.11/site-packages/pyproject_hooks/_in_process/_in_process.py build_wheel /home/runner/work/_temp/tmp39mg_fru
+139872   01:52:28 /tmp/provjobd3396557577
+136716   01:51:21 /home/runner/actions-runner/cached/2.338.0/bin/Runner.Worker spawnclient 142 145
+108420   01:51:23 /home/runner/actions-runner/cached/2.338.0/bin/Runner.Listener run
+69188    01:52:32 /usr/bin/dockerd -H fd:// --containerd=/run/containerd/containerd.sock
+68804    01:39:25 /opt/hostedtoolcache/sccache/0.19.0/x64/sccache
+49784    01:52:33 php-fpm: master process (/etc/php/8.3/fpm/php-fpm.conf)
+43716    01:52:42 /sbin/multipathd -d -s
+42716    01:52:33 /usr/bin/containerd
+--- df -h / ---
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/root       145G   67G   78G  47% /
+
+=== sample 100 at 2026-10-29T00:50:07Z (t+100min) ===
+               total        used        free      shared  buff/cache   available
+Mem:           15983        3565        7943          51        4873       12418
+Swap:           3071           0        3071
+--- top 10 by RSS ---
+  RSS     ELAPSED CMD
+2093168     00:11 /usr/local/cuda-12.8/bin/cudafe++ --c++17 --gnu_version=130300 --display_error_number --orig_src_file_name /home/runner/work/NATTEN/NATTEN/csrc/autogen/src/cuda/hopper_fna/source_8.cu --orig_src_path_name /home/runner/work/NATTEN/NATTEN/csrc/autogen/src/cuda/hopper_fna/source_8.cu --allow_managed --context_limit=0 --extended-lambda --relaxed_constexpr --m64 --parse_templates --gen_module_id_file --gen_c_file_name x_0.cudafe1.cpp --stub_file_name x_0.cudafe1.stub.c --module_id_file_name /home/runner/work/_temp/sccache_nvccwMdxgV/source_8.module_id x_0.cpp4.ii
+637252   01:40:28 /opt/hostedtoolcache/Python/3.11.17/x64/bin/python /opt/hostedtoolcache/Python/3.11.17/x64/lib/python3.11/site-packages/pyproject_hooks/_in_process/_in_process.py build_wheel /home/runner/work/_temp/tmp39mg_fru
+140272   01:53:28 /tmp/provjobd3396557577
+136716   01:52:21 /home/runner/actions-runner/cached/2.338.0/bin/Runner.Worker spawnclient 142 145
+108420   01:52:23 /home/runner/actions-runner/cached/2.338.0/bin/Runner.Listener run
+69188    01:53:32 /usr/bin/dockerd -H fd:// --containerd=/run/containerd/containerd.sock
+68072    01:40:25 /opt/hostedtoolcache/sccache/0.19.0/x64/sccache
+49784    01:53:33 php-fpm: master process (/etc/php/8.3/fpm/php-fpm.conf)
+43716    01:53:42 /sbin/multipathd -d -s
+42716    01:53:33 /usr/bin/containerd
+--- df -h / ---
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/root       145G   67G   78G  47% /
+
