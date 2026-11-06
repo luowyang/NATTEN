@@ -3298,3 +3298,43 @@ Swap:           3071           0        3071
 Filesystem      Size  Used Avail Use% Mounted on
 /dev/root       145G   67G   78G  47% /
 
+=== sample 166 at 2026-11-06T02:52:24Z (t+166min) ===
+               total        used        free      shared  buff/cache   available
+Mem:           15983        4397        8014          52        3971       11586
+Swap:           3071           0        3071
+--- top 10 by RSS ---
+  RSS     ELAPSED CMD
+3114904     00:15 /usr/local/cuda-12.8/bin/../nvvm/bin/cicc --c++17 --gnu_version=130300 --display_error_number --orig_src_file_name /home/runner/work/NATTEN/NATTEN/csrc/src/token_unpermute.cu --orig_src_path_name /home/runner/work/NATTEN/NATTEN/csrc/src/token_unpermute.cu --allow_managed --context_limit=0 --extended-lambda --relaxed_constexpr -arch compute_90a -m64 --no-version-ident -ftz=1 -prec_div=0 -prec_sqrt=0 -fmad=1 -fast-math --gen_div_approx_ftz --include_file_name token_unpermute.fatbin.c -tused --module_id_file_name token_unpermute.module_id --gen_c_file_name x_0.cudafe1.c --stub_file_name x_0.cudafe1.stub.c --gen_device_file_name token_unpermute.cudafe1.gpu x_0.cpp1.ii -o /home/runner/work/_temp/sccache_nvccZAZysn/token_unpermute.ptx
+599336   02:46:55 /opt/hostedtoolcache/Python/3.11.18/x64/bin/python /opt/hostedtoolcache/Python/3.11.18/x64/lib/python3.11/site-packages/pyproject_hooks/_in_process/_in_process.py build_wheel /home/runner/work/_temp/tmpmun_p0wc
+151824   02:54:52 /home/runner/actions-runner/cached/2.338.2/bin/Runner.Worker spawnclient 142 145
+141688   02:55:57 /tmp/provjobd3434423667
+111756   02:54:54 /home/runner/actions-runner/cached/2.338.2/bin/Runner.Listener run
+69144    02:56:00 /usr/bin/dockerd -H fd:// --containerd=/run/containerd/containerd.sock
+59524    02:46:52 /opt/hostedtoolcache/sccache/0.19.0/x64/sccache
+48716    02:56:00 php-fpm: master process (/etc/php/8.3/fpm/php-fpm.conf)
+43716    02:56:09 /sbin/multipathd -d -s
+41504    02:56:00 /usr/bin/containerd
+--- df -h / ---
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/root       145G   67G   78G  47% /
+
+=== sample 167 at 2026-11-06T02:53:24Z (t+167min) ===
+               total        used        free      shared  buff/cache   available
+Mem:           15983        1055       11356          52        3970       14928
+Swap:           3071           0        3071
+--- top 10 by RSS ---
+  RSS     ELAPSED CMD
+151844   02:55:52 /home/runner/actions-runner/cached/2.338.2/bin/Runner.Worker spawnclient 142 145
+141856   02:56:57 /tmp/provjobd3434423667
+111756   02:55:54 /home/runner/actions-runner/cached/2.338.2/bin/Runner.Listener run
+69144    02:57:00 /usr/bin/dockerd -H fd:// --containerd=/run/containerd/containerd.sock
+48716    02:57:00 php-fpm: master process (/etc/php/8.3/fpm/php-fpm.conf)
+43716    02:57:09 /sbin/multipathd -d -s
+41504    02:57:00 /usr/bin/containerd
+37744    02:56:56 /usr/bin/python3 -u bin/WALinuxAgent-2.16.0.3-py3.12.egg -run-exthandlers
+30676    02:57:00 /usr/bin/python3 -u /usr/sbin/waagent -daemon
+20900    02:57:00 /usr/bin/python3 /usr/bin/networkd-dispatcher --run-startup-triggers
+--- df -h / ---
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/root       145G   67G   78G  46% /
+
