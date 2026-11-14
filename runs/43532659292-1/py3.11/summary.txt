@@ -1,0 +1,51 @@
+wheel.yml run 43532659292 attempt 1, build py3.11
+Ref built    : dev
+Built commit : 
+Workflow sha : f52d656106c8f181d0735777dbf218b1591a9ff1
+Channel      : nightly (publish=true, published=)
+Workflow run : https://github.com/luowyang/NATTEN/actions/runs/43532659292
+warm job result : skipped
+gate decision   : warm_needed=false fingerprint=ea54c13ca57240669f32a7c16868568e8876219c6b522c55669b26ec54834bca marker_key=natten-warm-ea54c13ca57240669f32a7c16868568e8876219c6b522c55669b26ec54834bca
+
+Step outcomes:
+  Prepare build environment          : failure
+  Push started.txt                   : success
+  Stamp nightly version              : skipped
+  Build wheel                        : skipped
+  Install wheel + import smoke test  : skipped
+  Save warm marker                   : skipped
+  Decide publication                 : skipped
+  Build manifest                     : skipped
+  Upload artifact                    : skipped
+  Create or update GitHub Release    : skipped
+  Publish nightly pre-release        : skipped
+  Prune nightly pre-releases         : skipped
+
+--- df -h ---
+Filesystem       Size  Used Avail Use% Mounted on
+/dev/root        145G   47G   98G  33% /
+tmpfs            7.9G     0  7.9G   0% /dev/shm
+tmpfs            3.2G  1.1M  3.2G   1% /run
+none             1.0M     0  1.0M   0% /run/credentials/systemd-journald.service
+none             1.0M     0  1.0M   0% /run/credentials/systemd-resolved.service
+/dev/nvme0n1p13  989M   80M  842M   9% /boot
+/dev/nvme0n1p15  105M  6.3M   99M   7% /boot/efi
+none             1.0M     0  1.0M   0% /run/credentials/systemd-networkd.service
+tmpfs            1.6G  8.0K  1.6G   1% /run/user/1001
+none             1.0M     0  1.0M   0% /run/credentials/getty@tty1.service
+none             1.0M     0  1.0M   0% /run/credentials/serial-getty@ttyS0.service
+
+--- free -m ---
+               total        used        free      shared  buff/cache   available
+Mem:           15983        1017        9802          47        5555       14965
+Swap:           3071           0        3071
+
+--- nproc ---
+4
+
+--- sccache --show-stats ---
+/home/runner/work/_temp/702c8ee9-a25b-4f85-86d3-2862891b7b68.sh: line 73: sccache: command not found
+(unavailable)
+
+--- build manifest ---
+(no manifest -- Build manifest step likely never ran)
