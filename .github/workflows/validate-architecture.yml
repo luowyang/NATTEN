@@ -1,0 +1,25 @@
+name: validate-architecture-dispatch
+on:
+  push:
+    branches: [codex/build-release-architecture-20261126]
+    paths: [.github/workflows/validate-architecture.yml]
+permissions:
+  actions: write
+jobs:
+  dispatch:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Start CPU checks and nonpublishing wheel validation
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RECIPE_BRANCH: ${{ github.ref_name }}
+          RECIPE_SHA: ${{ github.sha }}
+          REQUEST_ID: architecture-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          gh workflow run ci.yml --repo luowyang/NATTEN --ref "$RECIPE_BRANCH"
+          gh workflow run wheel.yml --repo luowyang/NATTEN --ref "$RECIPE_BRANCH" \
+            -f ref=cce6abce19653b7fb26885c3461fe80a945196bf -f channel=warm \
+            -f "request_id=$REQUEST_ID" -f "expected_recipe_sha=$RECIPE_SHA"
+
