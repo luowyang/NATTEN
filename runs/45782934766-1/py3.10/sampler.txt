@@ -198,3 +198,103 @@ Swap:           3071           0        3071
 Filesystem            Size  Used Avail Use% Mounted on
 /dev/mapper/cow-root  145G   64G   81G  45% /
 
+=== sample 11 at 2026-11-26T08:42:41Z (t+11min) ===
+               total        used        free      shared  buff/cache   available
+Mem:           15701        1629        4877          50        9580       14072
+Swap:           3071           0        3071
+--- top 10 by RSS ---
+  RSS     ELAPSED CMD
+712940      11:03 /opt/hostedtoolcache/Python/3.10.22/x64/bin/python /opt/hostedtoolcache/Python/3.10.22/x64/lib/python3.10/site-packages/pyproject_hooks/_in_process/_in_process.py build_wheel /home/runner/work/_temp/tmp2p7n0kzs
+378220      00:01 /usr/local/cuda-12.8/bin/ptxas -arch sm_90a -m64 source_116.ptx -o /home/runner/work/_temp/sccache_nvccVO8jGI/source_116.cubin
+170688      17:44 /home/runner/actions-runner/cached/2.338.2/bin/Runner.Worker spawnclient 142 145
+115724      25:06 /tmp/provjobd1725626417
+99924       17:46 /home/runner/actions-runner/cached/2.338.2/bin/Runner.Listener run
+70068       25:19 /usr/bin/dockerd -H fd:// --containerd=/run/containerd/containerd.sock
+48772       25:22 php-fpm: master process (/etc/php/8.3/fpm/php-fpm.conf)
+44588       25:21 /usr/bin/containerd
+43752       25:32 /sbin/multipathd -d -s
+41620       25:22 /usr/lib/snapd/snapd
+--- df -h / ---
+Filesystem            Size  Used Avail Use% Mounted on
+/dev/mapper/cow-root  145G   64G   81G  45% /
+
+=== sample 12 at 2026-11-26T08:43:41Z (t+12min) ===
+               total        used        free      shared  buff/cache   available
+Mem:           15701        1712        4799          50        9575       13989
+Swap:           3071           0        3071
+--- top 10 by RSS ---
+  RSS     ELAPSED CMD
+712940      12:03 /opt/hostedtoolcache/Python/3.10.22/x64/bin/python /opt/hostedtoolcache/Python/3.10.22/x64/lib/python3.10/site-packages/pyproject_hooks/_in_process/_in_process.py build_wheel /home/runner/work/_temp/tmp2p7n0kzs
+329136      00:29 /usr/local/cuda-12.8/bin/../nvvm/bin/cicc --c++17 --gnu_version=130300 --display_error_number --orig_src_file_name /home/runner/work/NATTEN/NATTEN/csrc/autogen/src/cuda/fna/source_117.cu --orig_src_path_name /home/runner/work/NATTEN/NATTEN/csrc/autogen/src/cuda/fna/source_117.cu --allow_managed --context_limit=0 --extended-lambda --relaxed_constexpr -arch compute_90a -m64 --no-version-ident -ftz=1 -prec_div=0 -prec_sqrt=0 -fmad=1 -fast-math --gen_div_approx_ftz --include_file_name source_117.fatbin.c -tused --module_id_file_name source_117.module_id --gen_c_file_name x_0.cudafe1.c --stub_file_name x_0.cudafe1.stub.c --gen_device_file_name source_117.cudafe1.gpu x_0.cpp1.ii -o /home/runner/work/_temp/sccache_nvcczA48kM/source_117.ptx
+170688      18:44 /home/runner/actions-runner/cached/2.338.2/bin/Runner.Worker spawnclient 142 145
+115768      26:06 /tmp/provjobd1725626417
+98688       18:46 /home/runner/actions-runner/cached/2.338.2/bin/Runner.Listener run
+70068       26:19 /usr/bin/dockerd -H fd:// --containerd=/run/containerd/containerd.sock
+48772       26:22 php-fpm: master process (/etc/php/8.3/fpm/php-fpm.conf)
+44588       26:21 /usr/bin/containerd
+43752       26:32 /sbin/multipathd -d -s
+41620       26:22 /usr/lib/snapd/snapd
+--- df -h / ---
+Filesystem            Size  Used Avail Use% Mounted on
+/dev/mapper/cow-root  145G   64G   81G  45% /
+
+=== sample 13 at 2026-11-26T08:44:41Z (t+13min) ===
+               total        used        free      shared  buff/cache   available
+Mem:           15701        2501        4045          50        9541       13200
+Swap:           3071           0        3071
+--- top 10 by RSS ---
+  RSS     ELAPSED CMD
+907512      00:01 /usr/local/cuda-12.8/bin/cudafe++ --c++17 --gnu_version=130300 --display_error_number --orig_src_file_name /home/runner/work/NATTEN/NATTEN/csrc/autogen/src/cuda/fna/source_118.cu --orig_src_path_name /home/runner/work/NATTEN/NATTEN/csrc/autogen/src/cuda/fna/source_118.cu --allow_managed --context_limit=0 --extended-lambda --relaxed_constexpr --m64 --parse_templates --gen_module_id_file --gen_c_file_name x_0.cudafe1.cpp --stub_file_name x_0.cudafe1.stub.c --module_id_file_name /home/runner/work/_temp/sccache_nvccX1adfV/source_118.module_id x_0.cpp4.ii
+712940      13:03 /opt/hostedtoolcache/Python/3.10.22/x64/bin/python /opt/hostedtoolcache/Python/3.10.22/x64/lib/python3.10/site-packages/pyproject_hooks/_in_process/_in_process.py build_wheel /home/runner/work/_temp/tmp2p7n0kzs
+170692      19:44 /home/runner/actions-runner/cached/2.338.2/bin/Runner.Worker spawnclient 142 145
+114772      27:06 /tmp/provjobd1725626417
+98736       19:46 /home/runner/actions-runner/cached/2.338.2/bin/Runner.Listener run
+70068       27:19 /usr/bin/dockerd -H fd:// --containerd=/run/containerd/containerd.sock
+48772       27:22 php-fpm: master process (/etc/php/8.3/fpm/php-fpm.conf)
+44628       27:22 /usr/bin/containerd
+43752       27:32 /sbin/multipathd -d -s
+41620       27:22 /usr/lib/snapd/snapd
+--- df -h / ---
+Filesystem            Size  Used Avail Use% Mounted on
+/dev/mapper/cow-root  145G   64G   81G  45% /
+
+=== sample 14 at 2026-11-26T08:45:41Z (t+14min) ===
+               total        used        free      shared  buff/cache   available
+Mem:           15701        1472        5032          50        9582       14228
+Swap:           3071           0        3071
+--- top 10 by RSS ---
+  RSS     ELAPSED CMD
+712940      14:04 /opt/hostedtoolcache/Python/3.10.22/x64/bin/python /opt/hostedtoolcache/Python/3.10.22/x64/lib/python3.10/site-packages/pyproject_hooks/_in_process/_in_process.py build_wheel /home/runner/work/_temp/tmp2p7n0kzs
+217808      00:03 /usr/local/cuda-12.8/bin/ptxas -arch sm_90a -m64 source_118.ptx -o /home/runner/work/_temp/sccache_nvccX1adfV/source_118.cubin
+170688      20:44 /home/runner/actions-runner/cached/2.338.2/bin/Runner.Worker spawnclient 142 145
+115796      28:06 /tmp/provjobd1725626417
+98916       20:46 /home/runner/actions-runner/cached/2.338.2/bin/Runner.Listener run
+70068       28:19 /usr/bin/dockerd -H fd:// --containerd=/run/containerd/containerd.sock
+48772       28:22 php-fpm: master process (/etc/php/8.3/fpm/php-fpm.conf)
+44628       28:22 /usr/bin/containerd
+43752       28:32 /sbin/multipathd -d -s
+41620       28:22 /usr/lib/snapd/snapd
+--- df -h / ---
+Filesystem            Size  Used Avail Use% Mounted on
+/dev/mapper/cow-root  145G   64G   81G  45% /
+
+=== sample 15 at 2026-11-26T08:46:41Z (t+15min) ===
+               total        used        free      shared  buff/cache   available
+Mem:           15701        1581        4925          50        9580       14119
+Swap:           3071           0        3071
+--- top 10 by RSS ---
+  RSS     ELAPSED CMD
+712940      15:04 /opt/hostedtoolcache/Python/3.10.22/x64/bin/python /opt/hostedtoolcache/Python/3.10.22/x64/lib/python3.10/site-packages/pyproject_hooks/_in_process/_in_process.py build_wheel /home/runner/work/_temp/tmp2p7n0kzs
+327016      00:42 /usr/local/cuda-12.8/bin/../nvvm/bin/cicc --c++17 --gnu_version=130300 --display_error_number --orig_src_file_name /home/runner/work/NATTEN/NATTEN/csrc/autogen/src/cuda/fna/source_119.cu --orig_src_path_name /home/runner/work/NATTEN/NATTEN/csrc/autogen/src/cuda/fna/source_119.cu --allow_managed --context_limit=0 --extended-lambda --relaxed_constexpr -arch compute_90a -m64 --no-version-ident -ftz=1 -prec_div=0 -prec_sqrt=0 -fmad=1 -fast-math --gen_div_approx_ftz --include_file_name source_119.fatbin.c -tused --module_id_file_name source_119.module_id --gen_c_file_name x_0.cudafe1.c --stub_file_name x_0.cudafe1.stub.c --gen_device_file_name source_119.cudafe1.gpu x_0.cpp1.ii -o /home/runner/work/_temp/sccache_nvccxKepNA/source_119.ptx
+170688      21:44 /home/runner/actions-runner/cached/2.338.2/bin/Runner.Worker spawnclient 142 145
+115684      29:06 /tmp/provjobd1725626417
+99200       21:46 /home/runner/actions-runner/cached/2.338.2/bin/Runner.Listener run
+70068       29:19 /usr/bin/dockerd -H fd:// --containerd=/run/containerd/containerd.sock
+48772       29:22 php-fpm: master process (/etc/php/8.3/fpm/php-fpm.conf)
+44628       29:22 /usr/bin/containerd
+43752       29:32 /sbin/multipathd -d -s
+41620       29:22 /usr/lib/snapd/snapd
+--- df -h / ---
+Filesystem            Size  Used Avail Use% Mounted on
+/dev/mapper/cow-root  145G   64G   81G  45% /
+
