@@ -517,12 +517,16 @@ def error_metrics(actual, expected):
     return {
         "exact": torch.equal(a, b),
         "nonfinite": nonfinite,
-        "max_abs": float(diff.abs().max())
-        if a.numel() and finite
-        else (0.0 if not a.numel() else None),
-        "rms": float(diff.square().mean().sqrt())
-        if a.numel() and finite
-        else (0.0 if not a.numel() else None),
+        "max_abs": (
+            float(diff.abs().max())
+            if a.numel() and finite
+            else (0.0 if not a.numel() else None)
+        ),
+        "rms": (
+            float(diff.square().mean().sqrt())
+            if a.numel() and finite
+            else (0.0 if not a.numel() else None)
+        ),
         "reference_rms": (
             float(b.square().mean().sqrt())
             if b.numel() and bool(torch.isfinite(b).all())
@@ -688,7 +692,9 @@ def singleton_kernel_checks(result, data, grad, case, row, key):
     for head in range(case.heads):
         kv_head = head // repeats
         bound = single_key_scalar_bound(upstream[row, head], v[key, kv_head], dtype)
-        fitted, stored = rank_one_scalar(result["dq"][row, head], k[key, kv_head], dtype)
+        fitted, stored = rank_one_scalar(
+            result["dq"][row, head], k[key, kv_head], dtype
+        )
         heads.append(
             {
                 "head": head,

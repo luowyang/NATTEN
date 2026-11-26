@@ -38,6 +38,15 @@ sys.path.insert(0, str(REPO))
 GPU_IDENTITY = None
 
 import natten  # noqa: E402
+from tests.mixed_batch_properties import (  # noqa: E402
+    connectivity,
+    forward_backward_consistency,
+    generated_graphs,
+    graph_coverage,
+    random_vjp_support,
+    representability,
+    vjp_linearity,
+)
 from tests.mixed_batch_utils import (  # noqa: E402
     capability_cases,
     checks_pass,
@@ -49,15 +58,6 @@ from tests.mixed_batch_utils import (  # noqa: E402
     MixedCase,
     reference,
     structural_checks,
-)
-from tests.mixed_batch_properties import (  # noqa: E402
-    connectivity,
-    forward_backward_consistency,
-    generated_graphs,
-    graph_coverage,
-    representability,
-    random_vjp_support,
-    vjp_linearity,
 )
 from tests.varlen_numerics import dtype_spacing  # noqa: E402
 
@@ -169,9 +169,9 @@ def nondeterministic_parity(packed, split):
     cross = max(v["dq"]["max_ulp"] for k, v in rows.items() if k.startswith("cross"))
     stable_bitwise = all(rows[name][t]["bitwise"] for name in rows for t in stable)
     return {
-        "correctness_status": "PASS"
-        if stable_bitwise and cross <= noise + 1
-        else "REVIEW",
+        "correctness_status": (
+            "PASS" if stable_bitwise and cross <= noise + 1 else "REVIEW"
+        ),
         "stable_tensors_bitwise": stable_bitwise,
         "dq_aa_max_ulp": noise,
         "dq_cross_max_ulp": cross,
@@ -483,11 +483,11 @@ def pytest_group(name, paths, output):
                 }
             )
     return {
-        "status": "PASS"
-        if proc.returncode == 0 and cases
-        else "ERROR"
-        if not cases
-        else "FAIL",
+        "status": (
+            "PASS"
+            if proc.returncode == 0 and cases
+            else "ERROR" if not cases else "FAIL"
+        ),
         "returncode": proc.returncode,
         "command": command,
         "environment_overrides": overrides,

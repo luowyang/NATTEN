@@ -831,9 +831,7 @@ class VarlenDegenerateAxesIdentityTests(unittest.TestCase):
         layouts: Tuple[DimensionType, ...] = (
             ((3,), (5,))
             if rank == 1
-            else ((2, 3), (3, 2))
-            if rank == 2
-            else ((2, 2, 3), (1, 3, 2))
+            else ((2, 3), (3, 2)) if rank == 2 else ((2, 2, 3), (1, 3, 2))
         )
         kernel_size = (1,) * rank
         total = sum(_prod(s) for s in layouts)

@@ -196,9 +196,7 @@ class TorchCompileTests(unittest.TestCase):
     def test_dynamic_compile_self_attention_fallback(self):
         _reset_everything()
 
-        query = torch.randn(
-            (1, 8, 8, 1, 64), device="cuda", dtype=torch.float16
-        )
+        query = torch.randn((1, 8, 8, 1, 64), device="cuda", dtype=torch.float16)
 
         def self_attention_fallback(query):
             return neighborhood_attention_generic(

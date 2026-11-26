@@ -7,12 +7,12 @@ from dataclasses import replace
 import torch
 
 from .mixed_batch_utils import (
-    MixedCase,
     coordinate_mask,
     dense_attention,
     dense_backward_3xtf32,
     error_metrics,
     make_inputs,
+    MixedCase,
     reference,
     single_key_scalar_bound,
 )
@@ -309,7 +309,10 @@ def vjp_linearity(case, evaluate_fn):
     ref = reference(data, grad, case)
     magnitude = max(
         [float(grad.abs().max()) if grad.numel() else 0.0]
-        + [float(ref[n].abs().max()) if ref[n].numel() else 0.0 for n in ("dq", "dk", "dv")]
+        + [
+            float(ref[n].abs().max()) if ref[n].numel() else 0.0
+            for n in ("dq", "dk", "dv")
+        ]
     )
     mask = coordinate_mask(case)
     scores = cotangent_scores(data, grad, case, mask)
@@ -355,21 +358,23 @@ def vjp_linearity(case, evaluate_fn):
             ),
         }
     return {
-        "status": "PASS"
-        if all(
-            all(
-                c[k]
-                for k in (
-                    "zero_cotangent",
-                    "opposite_cotangent",
-                    "power_of_two_cotangent",
-                    "structural_zero_bound",
-                    "finite",
+        "status": (
+            "PASS"
+            if all(
+                all(
+                    c[k]
+                    for k in (
+                        "zero_cotangent",
+                        "opposite_cotangent",
+                        "power_of_two_cotangent",
+                        "structural_zero_bound",
+                        "finite",
+                    )
                 )
+                for c in rows.values()
             )
-            for c in rows.values()
-        )
-        else "FAIL",
+            else "FAIL"
+        ),
         **record,
         "checks": rows,
     }
@@ -421,9 +426,11 @@ def rounded_scaling_check(original, doubled, include=None):
         "bitwise": torch.equal(doubled, original * 2),
         "compared_entries": int(difference.numel()),
         "outside_rounding_intervals": int(failed.sum()),
-        "max_abs": float(difference.max())
-        if difference.numel() and torch.isfinite(difference).all()
-        else None,
+        "max_abs": (
+            float(difference.max())
+            if difference.numel() and torch.isfinite(difference).all()
+            else None
+        ),
         "first_outside": failed.nonzero()[:12].tolist(),
     }
 
@@ -551,9 +558,11 @@ def representability(case, evaluate_fn):
             }
         )
     return {
-        "status": "PASS"
-        if all(r["finite"] and r["expected_dv_representable"] for r in rows)
-        else "FAIL",
+        "status": (
+            "PASS"
+            if all(r["finite"] and r["expected_dv_representable"] for r in rows)
+            else "FAIL"
+        ),
         "scales": rows,
         "scope": "Finite representable constant-value attention; algebraic cancellation residuals are reported, not treated as missing graph edges.",
     }

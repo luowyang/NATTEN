@@ -4,7 +4,6 @@ import json
 from dataclasses import replace
 
 import torch
-
 from scripts.bench_mixed_batch import performance_adjudication
 
 from .mixed_batch_utils import (
@@ -497,9 +496,8 @@ def test_paired_timing_statistics_known_effects():
 
 
 def test_virtual_gpu_client_identity_and_competition():
-    from scripts.bench_mixed_batch import identify_client, parse_clients
-
     import pytest
+    from scripts.bench_mixed_batch import identify_client, parse_clients
 
     assert identify_client(set(), {87}, 87) == 87
     assert identify_client({51}, {51, 92}, 87) == 92
@@ -568,7 +566,7 @@ def test_scaling_law_accounts_for_final_subnormal_rounding():
 
 
 def test_derivative_interval_on_independent_fp32_and_wrong_backward():
-    from .mixed_batch_properties import generated_graphs, forward_backward_consistency
+    from .mixed_batch_properties import forward_backward_consistency, generated_graphs
 
     def fp32_evaluate(data, grad, case):
         return reference(data, grad, case, dtype=torch.float32)
