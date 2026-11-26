@@ -381,7 +381,7 @@ jobs:
       fail-fast: false
       matrix:
         shard: [0, 1, 2, 3, 4, 5, 6, 7]   # Must have exactly SHARD_COUNT (8) entries, see env above.
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 180
     steps:
       - name: Checkout
@@ -555,7 +555,7 @@ jobs:
                                     # itself the first time a tree builds.
     env:
       LEG: py${{ matrix.python }}   # this leg's ci-logs subdirectory
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 360   # a cold, uncached CUDA compile on a 4-vCPU hosted
                             # runner is far slower than the 39-worker dev-
                             # machine builds this fork's tooling was timed
@@ -912,7 +912,7 @@ jobs:
             echo "Workflow run       : ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
             echo
             echo "Toolchain:"
-            echo "  Runner           : GitHub-hosted ubuntu-latest (no GPU/driver)"
+            echo "  Runner           : GitHub-hosted ubuntu-24.04 (no GPU/driver)"
             echo "  Python           : $(python --version 2>&1)"
             echo "  torch            : $(python -c 'import torch; print(torch.__version__)')"
             echo "  torch CUDA       : $(python -c 'import torch; print(torch.version.cuda)')"
@@ -922,7 +922,7 @@ jobs:
             echo "  NATTEN_AUTOGEN_POLICY : $NATTEN_AUTOGEN_POLICY"
             echo
             echo "GPU kernel tests: NOT run in this workflow (no GPU on"
-            echo "ubuntu-latest). Only the CPU-only import smoke test above"
+            echo "ubuntu-24.04). Only the CPU-only import smoke test above"
             echo "ran. GPU correctness validation happens on the dev"
             echo "machines via integration/build_wheel.sh and friends --"
             echo "see .github/README-fork-ci.md."
