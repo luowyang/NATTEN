@@ -1,0 +1,18 @@
+name: validate-wheel-runner
+on:
+  push:
+    branches: [codex/validate-wheel-ubuntu2404-20261126]
+    paths: [.github/workflows/validate-wheel-runner.yml]
+permissions:
+  actions: write
+jobs:
+  dispatch:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Validate both Python wheels without publishing
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh workflow run wheel.yml --repo luowyang/NATTEN --ref fork-ci \
+            -f ref=c570a7501a7d0d757a28277dbd0db578b1bd137f -f channel=warm
