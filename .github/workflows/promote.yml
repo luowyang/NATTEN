@@ -1,0 +1,60 @@
+name: promote-release
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_run_id:
+        description: Successful release-channel wheel run ID
+        required: true
+      build_attempt:
+        description: Attempt that produced the validated artifacts
+        required: true
+        default: '1'
+      gpu_attestation:
+        description: JSON GPU attestation covering both exact wheel hashes
+        required: true
+
+permissions:
+  contents: write
+  actions: read
+
+defaults:
+  run:
+    shell: bash
+
+concurrency:
+  group: natten-release-promotion-${{ inputs.build_run_id }}-${{ inputs.build_attempt }}
+  cancel-in-progress: false
+
+jobs:
+  promote:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: fork-ci
+          persist-credentials: false
+      - name: Fetch and verify the producing run
+        id: candidate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BUILD_RUN_ID: ${{ inputs.build_run_id }}
+          BUILD_ATTEMPT: ${{ inputs.build_attempt }}
+          GPU_ATTESTATION: ${{ inputs.gpu_attestation }}
+        run: |
+          python .github/scripts/prepare_promotion.py --repository "$GITHUB_REPOSITORY" \
+            --run-id "$BUILD_RUN_ID" --attempt "$BUILD_ATTEMPT"
+      - name: Checkout the candidate recipe
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ steps.candidate.outputs.recipe_sha }}
+          path: .ci-tools
+          persist-credentials: false
+      - name: Publish the exact GPU-validated artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python .ci-tools/.github/scripts/finish_build.py publish \
+            --plan plan/build-plan.json --artifacts artifacts \
+            --repository "$GITHUB_REPOSITORY" --gpu-attestation gpu-attestation.json

@@ -1,0 +1,24 @@
+# Required topics, in merge order. A missing topic stops assembly.
+# If local and origin differ, choose refs/heads/NAME or refs/remotes/origin/NAME.
+# The assembler records exact SHAs and reuses them for --continue.
+#
+# This file is a durable project asset (unlike the throwaway `dev` branch
+# it drives) -- keep it in merge order as topic branches land and merge
+# upstream via normal PRs.
+
+fix-compile-self-attention-log
+fix-test-global-state
+varlen-degenerate-axes
+mixed-batch-bench
+varlen-single-key-dv-bound
+fixed-degenerate-axes
+fix-fixed-fna-grid-z
+fix-self-attention-backend-hint
+varlen-compile-opaque-op
+fork-ci
+
+# Merged last on purpose: this branch carries the '### Known issues'
+# subsection of CHANGELOG.md, and the union merge appends every later
+# branch's bullets after the earlier ones, so whatever carries that
+# subsection must come last or the later bullets nest under it.
+fix-compute-delta-precision

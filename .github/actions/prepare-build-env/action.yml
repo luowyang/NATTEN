@@ -86,7 +86,11 @@ runs:
     - name: Set sccache cache namespace
       if: ${{ inputs.cache_namespace != '' }}
       shell: bash
-      run: echo "SCCACHE_GHA_VERSION=${{ inputs.cache_namespace }}" >> "$GITHUB_ENV"
+      env:
+        CACHE_NAMESPACE: ${{ inputs.cache_namespace }}
+      run: |
+        [[ "$CACHE_NAMESPACE" =~ ^[A-Za-z0-9._-]+$ ]] || { echo 'Invalid cache namespace' >&2; exit 1; }
+        printf 'SCCACHE_GHA_VERSION=%s\n' "$CACHE_NAMESPACE" >> "$GITHUB_ENV"
       # The action below starts the server, which inherits its namespace
       # only at startup. `warm` and `build` receive the same input.
 
@@ -115,6 +119,8 @@ runs:
 
     - name: Install sccache compiler wrappers
       shell: bash
+      env:
+        ACTION_ROOT: ${{ github.action_path }}
       run: |
         set -euo pipefail
         # --- sccache compiler masquerade (no setup.py/CMakeLists.txt changes) ---
@@ -139,7 +145,7 @@ runs:
         REAL_NVCC="$(command -v nvcc)"
         REAL_CXX="$(command -v c++)"
         mkdir -p /tmp/sccache-wrappers
-        cp .github/scripts/nvcc-wrapper.sh /tmp/sccache-wrappers/nvcc
+        cp "$ACTION_ROOT/../../scripts/nvcc-wrapper.sh" /tmp/sccache-wrappers/nvcc
         printf '#!/bin/sh\nexec sccache "%s" "$@"\n' "$REAL_CXX"  > /tmp/sccache-wrappers/c++
         chmod +x /tmp/sccache-wrappers/nvcc /tmp/sccache-wrappers/c++
         {

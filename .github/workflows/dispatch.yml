@@ -1,0 +1,87 @@
+name: dispatch-and-await-wheel
+
+on:
+  workflow_call:
+    inputs:
+      source_ref:
+        required: true
+        type: string
+      channel:
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  actions: write
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  dispatch:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      run_id: ${{ steps.dispatch.outputs.run_id }}
+      recipe_sha: ${{ steps.dispatch.outputs.recipe_sha }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: fork-ci
+          persist-credentials: false
+      - name: Dispatch and identify exactly one run
+        id: dispatch
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_REF: ${{ inputs.source_ref }}
+          CHANNEL: ${{ inputs.channel }}
+          REQUEST_ID: ${{ inputs.channel }}-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          python .github/scripts/dispatch_wheel.py dispatch --repository "$GITHUB_REPOSITORY" \
+            --source-ref "$SOURCE_REF" --channel "$CHANNEL" --request-id "$REQUEST_ID" \
+            --recipe-sha "$(git rev-parse HEAD)"
+          echo 'The child run ID and recipe are pinned; following jobs propagate its final result.' >> "$GITHUB_STEP_SUMMARY"
+
+  wait-first:
+    needs: dispatch
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    outputs:
+      completed: ${{ steps.wait.outputs.completed }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.dispatch.outputs.recipe_sha }}
+          persist-credentials: false
+      - name: Await child (first budget)
+        id: wait
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CHILD_RUN: ${{ needs.dispatch.outputs.run_id }}
+          RECIPE_SHA: ${{ needs.dispatch.outputs.recipe_sha }}
+        run: |
+          python .github/scripts/dispatch_wheel.py wait --repository "$GITHUB_REPOSITORY" \
+            --run-id "$CHILD_RUN" --recipe-sha "$RECIPE_SHA"
+
+  wait-final:
+    needs: [dispatch, wait-first]
+    if: needs.wait-first.outputs.completed != 'true'
+    # A cold warm+build can exceed the hosted six-hour per-job limit.
+    # Only the first waiter may hand off a still-running child. This one
+    # must observe success or fail, including on timeout.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.dispatch.outputs.recipe_sha }}
+          persist-credentials: false
+      - name: Await child (final budget)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CHILD_RUN: ${{ needs.dispatch.outputs.run_id }}
+          RECIPE_SHA: ${{ needs.dispatch.outputs.recipe_sha }}
+        run: |
+          python .github/scripts/dispatch_wheel.py wait --final --repository "$GITHUB_REPOSITORY" \
+            --run-id "$CHILD_RUN" --recipe-sha "$RECIPE_SHA"

@@ -1,0 +1,17 @@
+name: nightly
+
+on:
+  schedule:
+    - cron: '0 19 * * *'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  build-nightly:
+    uses: luowyang/NATTEN/.github/workflows/dispatch.yml@fork-ci
+    with:
+      source_ref: dev
+      channel: nightly
