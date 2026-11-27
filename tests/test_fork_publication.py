@@ -261,6 +261,70 @@ class PublicationTests(unittest.TestCase):
             publisher.prune_nightlies(self.gh, {"draft": True}, 14)
         self.assertEqual(self.gh.events, [])
 
+    def add_expired_nightlies(self):
+        # Both old releases have the same source as today's build (#92).
+        for index, day in enumerate(("20261023", "20261024"), start=99):
+            tag = f"nightly/{day}"
+            self.gh.tags[tag] = self.identity["source_sha"]
+            self.gh.items[tag] = {
+                "id": index,
+                "tag_name": tag,
+                "target_commitish": self.identity["source_sha"],
+                "draft": False,
+                "prerelease": True,
+                "assets": [
+                    {"name": f"natten-old-{python_tag}-{python_tag}-linux_x86_64.whl"}
+                    for python_tag in ("cp310", "cp311")
+                ],
+            }
+
+    def test_unchanged_source_keeps_downloadable_replacement_before_retention(self):
+        self.add_expired_nightlies()
+        downloaded = set()
+        api = self.gh.api
+        download = self.gh.download
+
+        def tracked_download(tag, name, directory):
+            download(tag, name, directory)
+            if not self.gh.items[tag]["draft"]:
+                downloaded.add(name)
+
+        def checked_api(endpoint, *, method="GET", data=None):
+            if method == "DELETE":
+                expected, _ = self.bundle()
+                self.assertEqual(downloaded, set(expected))
+            return api(endpoint, method=method, data=data)
+
+        with (
+            mock.patch.object(sys, "argv", self.cli_args()),
+            mock.patch.object(publisher, "GitHub", return_value=self.gh),
+            mock.patch.object(self.gh, "api", side_effect=checked_api),
+            mock.patch.object(self.gh, "download", side_effect=tracked_download),
+        ):
+            publisher.main()
+        self.assertEqual(set(self.gh.items), {self.tag})
+        self.assertFalse(self.gh.items[self.tag]["draft"])
+
+    def test_failed_public_download_preserves_previous_nightlies(self):
+        self.add_expired_nightlies()
+        download = self.gh.download
+
+        def fail_public_download(tag, name, directory):
+            if not self.gh.items[tag]["draft"] and "-cp311-" in name:
+                raise RuntimeError("Public wheel download failed")
+            download(tag, name, directory)
+
+        with (
+            mock.patch.object(sys, "argv", self.cli_args()),
+            mock.patch.object(publisher, "GitHub", return_value=self.gh),
+            mock.patch.object(self.gh, "download", side_effect=fail_public_download),
+            self.assertRaisesRegex(RuntimeError, "Public wheel download failed"),
+        ):
+            publisher.main()
+        self.assertIn("nightly/20261023", self.gh.items)
+        self.assertIn("nightly/20261024", self.gh.items)
+        self.assertFalse(any(event[0] == "DELETE" for event in self.gh.events))
+
     def test_gpu_attestation_requires_exact_checksums_for_both_legs(self):
         _, wheels = self.bundle()
         evidence = {

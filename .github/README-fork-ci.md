@@ -74,7 +74,8 @@ makes the release public. A failed upload leaves a draft for an identical retry;
 it cannot expose a partial public release.
 
 Nightlies explicitly state that they passed host checks and have no GPU kernel
-validation. After a complete nightly becomes public, retention removes old
+validation. After a complete nightly becomes public, the publisher downloads
+its assets again and checks their hashes. Only then does retention remove old
 nightlies while protecting that release and the newest complete nightly. Formal
 fork releases are never part of retention. Source-only deduplication was removed:
 updated build recipes need their own artifacts even when source is unchanged.

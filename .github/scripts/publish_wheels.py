@@ -306,6 +306,8 @@ def publish(github, assets, identity, tag):
     result = github.release(tag)
     if result["draft"]:
         raise ValueError("Release did not become public")
+    # Retention may start only after the public release is downloadable too.
+    verify_remote_assets(github, result, assets)
     return result
 
 
