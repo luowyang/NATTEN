@@ -176,7 +176,15 @@ class GitHub:
         return json.loads(output) if output.strip() else None
 
     def release(self, tag):
-        return self.api(f"releases/tags/{quote(tag, safe='')}", missing_ok=True)
+        release = self.api(f"releases/tags/{quote(tag, safe='')}", missing_ok=True)
+        if release is not None:
+            return release
+        # The tag endpoint only returns published releases. Authenticated
+        # listings include drafts, including an upload interrupted earlier.
+        matches = [item for item in self.releases() if item["tag_name"] == tag]
+        if len(matches) > 1:
+            raise ValueError("Multiple releases use the requested tag")
+        return matches[0] if matches else None
 
     def tag_sha(self, tag):
         value = self.api(f"git/ref/tags/{quote(tag, safe='')}", missing_ok=True)

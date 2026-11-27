@@ -592,8 +592,43 @@ class PublicationTests(unittest.TestCase):
         error = subprocess.CalledProcessError(
             1, "gh", stderr="gh: Not Found (HTTP 404)"
         )
-        with mock.patch.object(github, "command", side_effect=error):
+        with mock.patch.object(github, "command", side_effect=[error, "[[]]"]):
             self.assertIsNone(github.release("tag"))
+
+    def test_draft_lookup_uses_paginated_listing_after_tag_404(self):
+        github = publisher.GitHub("owner/repo")
+        error = subprocess.CalledProcessError(
+            1, "gh", stderr="gh: Not Found (HTTP 404)"
+        )
+        draft = {"id": 1, "tag_name": "nightly/tag", "draft": True}
+        pages = [[{"tag_name": "unrelated"}], [draft]]
+        with mock.patch.object(
+            github, "command", side_effect=[error, json.dumps(pages)]
+        ) as command:
+            self.assertEqual(github.release("nightly/tag"), draft)
+        self.assertIn("--paginate", command.call_args.args[0])
+        self.assertIn("--slurp", command.call_args.args[0])
+
+    def test_draft_listing_failure_is_not_an_absent_release(self):
+        github = publisher.GitHub("owner/repo")
+        missing = subprocess.CalledProcessError(
+            1, "gh", stderr="gh: Not Found (HTTP 404)"
+        )
+        denied = subprocess.CalledProcessError(
+            1, "gh", stderr="gh: Forbidden (HTTP 403)"
+        )
+        with mock.patch.object(github, "command", side_effect=[missing, denied]):
+            with self.assertRaises(subprocess.CalledProcessError):
+                github.release("tag")
+
+    def test_published_lookup_does_not_require_listing(self):
+        github = publisher.GitHub("owner/repo")
+        release = {"tag_name": "tag", "draft": False}
+        with mock.patch.object(
+            github, "command", return_value=json.dumps(release)
+        ) as command:
+            self.assertEqual(github.release("tag"), release)
+        command.assert_called_once()
 
     def test_annotated_tag_is_resolved_to_commit(self):
         github = publisher.GitHub("owner/repo")
