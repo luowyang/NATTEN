@@ -1,0 +1,59 @@
+name: recover-nightly-92
+
+# One-time restoration of original artifacts; removed after public verification.
+on:
+  push:
+    branches: [fork-ci]
+    paths:
+      - '.github/workflows/recover-nightly-92.yml'
+      - '.github/scripts/recover_legacy.py'
+
+permissions:
+  contents: write
+  actions: read
+
+concurrency:
+  group: natten-nightly-publication
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  recover:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+      - name: Install verification dependency
+        run: python -m pip install packaging PyYAML
+      - name: Publication mechanism regressions
+        run: python -m unittest discover -s tests -p 'test_fork_*.py' -v
+      - name: Download both original wheels and text manifests
+        uses: actions/download-artifact@v7
+        with:
+          github-token: ${{ github.token }}
+          run-id: '45926076910'
+          pattern: natten-wheel-45926076910-py*
+          path: artifacts
+      - name: Verify provenance and restore complete nightly
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python .github/scripts/recover_legacy.py \
+            --artifacts artifacts --repository "$GITHUB_REPOSITORY" \
+            --run-id 45926076910
+          find artifacts -type f -exec sha256sum {} +
+      - name: Verify idempotent recovery without overwriting assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python .github/scripts/recover_legacy.py \
+            --artifacts artifacts --repository "$GITHUB_REPOSITORY" \
+            --run-id 45926076910
