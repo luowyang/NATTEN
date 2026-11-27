@@ -1,0 +1,16 @@
+name: dev-wheel
+
+on:
+  push:
+    branches: [dev]
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  build-dev:
+    uses: luowyang/NATTEN/.github/workflows/dispatch.yml@fork-ci
+    with:
+      source_ref: ${{ github.sha }}
+      channel: warm
